@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
 
 jobs:
   test:
@@ -30,7 +30,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Type check
-        run: pnpm exec tsc --noEmit
+        run: pnpm typecheck
 
       - name: Run tests
         run: pnpm test
@@ -42,7 +42,7 @@ jobs:
     name: Publish to npm
     needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && startsWith(github.event.head_commit.message, 'release:')
+    if: github.ref == 'refs/heads/master' && startsWith(github.event.head_commit.message, 'release:')
 
     steps:
       - uses: actions/checkout@v4

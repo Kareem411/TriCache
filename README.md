@@ -1,6 +1,14 @@
-# tricache
+# tricache ⚡
 
-**Three-tier Node.js cache with adaptive eviction, disk spill, Redis/Valkey L2, AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, thundering-herd prevention, and Prometheus metrics.**
+[![CI](https://github.com/Kareem411/tricache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/tricache/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Node.js ≥ 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue)](https://www.typescriptlang.org)
+
+**Stop paying for slow.** tricache is a three-tier Node.js cache that serves **1.4 million reads/second** from RAM, spills cold entries to NVMe instead of dropping them on the floor, and fans out invalidations across your entire fleet in real time — all behind a single `npm install`.
+
+Built for production from day one: adaptive LFU×LRU×priority eviction, AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, thundering-herd prevention, OOM guard, cold-start snapshots, and Prometheus metrics. Zero required configuration.
 
 ```
 Request
@@ -20,7 +28,7 @@ fetchFn()               (your database / API call — fires exactly once per key
 
 ---
 
-## Features
+## ✨ Features
 
 | Feature | Detail |
 |---|---|
@@ -39,7 +47,7 @@ fetchFn()               (your database / API call — fires exactly once per key
 
 ---
 
-## Install
+## 📦 Install
 
 ```bash
 npm install tricache
@@ -49,7 +57,7 @@ pnpm add tricache
 
 ---
 
-## Quick start
+## 🚀 Quick start
 
 ```typescript
 import { CacheService, CachePriority } from 'tricache';
@@ -93,7 +101,7 @@ console.log(CacheService.toPrometheusText(snap));
 
 ---
 
-## Configuration
+## ⚙️ Configuration
 
 All options are optional — sensible defaults apply.
 
@@ -165,7 +173,7 @@ CacheService.create({
 
 ---
 
-## API reference
+## 📖 API reference
 
 ### `CacheService.create(options?)` → `CacheService`
 
@@ -227,7 +235,7 @@ Closes the Redis connection, unsubscribes the backplane, and stops all backgroun
 
 ---
 
-## Priority levels
+## 🎯 Priority levels
 
 ```typescript
 import { CachePriority } from 'tricache';
@@ -249,7 +257,7 @@ Priority is **auto-inferred** from the key when not specified:
 
 ---
 
-## Eviction algorithm
+## 🧠 Eviction algorithm
 
 L1 eviction uses **reservoir sampling** — an O(n) single pass samples 16 candidates, then sorts only those 16 (O(1)). Each candidate is scored:
 
@@ -263,7 +271,9 @@ score = priority × 1000 + min(hits, 100) × 10 + ttlRemaining/60s − age/60s
 
 ---
 
-## Pluggable logger
+## 🪵 Pluggable logger
+
+Bring your own structured logger — tricache doesn't care if it's `pino`, `winston`, or `console`.
 
 ```typescript
 import pino from 'pino';
@@ -281,7 +291,7 @@ CacheService.create({
 
 ---
 
-## Encryption
+## 🔐 Encryption
 
 AES-256-GCM for L2 (Redis) values, disk spill files, and cold-start snapshots. Three modes are available via `encryptionMode`:
 
@@ -332,7 +342,7 @@ Existing plaintext values are read transparently during key rotation.
 
 ---
 
-## WASM Bloom filter
+## ⚡ WASM Bloom filter
 
 A 100,000-bit filter with k=7 hash probes:
 
@@ -348,7 +358,7 @@ The 562-byte WASM binary is inlined as Base64 — zero filesystem access at runt
 
 ---
 
-## Performance
+## 📊 Performance
 
 Measured on a single Node.js thread (no `await` on synchronous paths):
 
@@ -402,6 +412,27 @@ Run `pnpm bench` for a full breakdown including bloom filter cost, compression t
 
 ---
 
-## License
+## 🤝 Contributing
+
+Bug reports and pull requests are welcome!
+
+1. Fork the repo and create a feature branch
+2. Run `pnpm test` — all tests must pass
+3. Run `pnpm bench` if you touch a hot path and include before/after numbers in your PR
+4. Open your PR against `master`
+
+> New to the codebase? Start with [src/cache-service.ts](src/cache-service.ts) for the public API and [src/smart-memory-cache.ts](src/smart-memory-cache.ts) for the L1 engine.
+
+---
+
+## 🛡️ Security
+
+Found a vulnerability? **Please don't open a public issue.** Report it privately via [GitHub Security Advisories](https://github.com/Kareem411/tricache/security/advisories/new) so it can be patched before disclosure.
+
+For encryption key generation and rotation best practices, see the [Encryption](#-encryption) section.
+
+---
+
+## 📄 License
 
 MIT
