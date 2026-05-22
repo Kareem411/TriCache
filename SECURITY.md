@@ -10,7 +10,7 @@
 
 **Please do not open a public GitHub issue for security vulnerabilities.**
 
-Report security issues privately via [GitHub Security Advisories](https://github.com/Kareem411/tricache/security/advisories/new). This lets us triage and patch before public disclosure.
+Report security issues privately via [GitHub Security Advisories](https://github.com/Kareem411/TriCache/security/advisories/new). This lets us triage and patch before public disclosure.
 
 Include as much detail as possible:
 - A description of the vulnerability and its potential impact

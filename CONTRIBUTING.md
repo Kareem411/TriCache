@@ -5,7 +5,7 @@ Thank you for your interest in contributing! Here's everything you need to get s
 ## Development setup
 
 ```bash
-git clone https://github.com/Kareem411/tricache.git
+git clone https://github.com/Kareem411/TriCache.git
 cd tricache
 pnpm install
 ```
@@ -51,7 +51,7 @@ If your change touches a hot path (L1 get/set, eviction, serialization), include
 
 ## Reporting bugs
 
-Open a [GitHub Issue](https://github.com/Kareem411/tricache/issues) with:
+Open a [GitHub Issue](https://github.com/Kareem411/TriCache/issues) with:
 - Node.js version and OS
 - A minimal reproduction
 - Expected vs actual behaviour

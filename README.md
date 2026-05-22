@@ -1,6 +1,6 @@
-# tricache ⚡
+# TriCache ⚡
 
-[![CI](https://github.com/Kareem411/tricache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/tricache/actions/workflows/ci.yml)
+[![CI](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
 [![npm downloads](https://img.shields.io/npm/dm/tricache.svg)](https://www.npmjs.com/package/tricache)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -11,7 +11,7 @@
 
 Built for production from day one: adaptive LFU×LRU×priority eviction, AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, thundering-herd prevention, OOM guard, cold-start snapshots, and Prometheus metrics. Zero required configuration.
 
-<img src="https://raw.githubusercontent.com/Kareem411/tricache/master/public/SmartMemoryCache_DiskTier.jpeg" width="600" alt="tricache architecture" />
+<img src="https://raw.githubusercontent.com/Kareem411/TriCache/master/public/SmartMemoryCache_DiskTier.jpeg" width="600" alt="tricache architecture" />
 
 ---
 
@@ -414,7 +414,7 @@ Bug reports and pull requests are welcome!
 
 ## 🛡️ Security
 
-Found a vulnerability? **Please don't open a public issue.** Report it privately via [GitHub Security Advisories](https://github.com/Kareem411/tricache/security/advisories/new) so it can be patched before disclosure.
+Found a vulnerability? **Please don't open a public issue.** Report it privately via [GitHub Security Advisories](https://github.com/Kareem411/TriCache/security/advisories/new) so it can be patched before disclosure.
 
 For encryption key generation and rotation best practices, see the [Encryption](#-encryption) section.
 
