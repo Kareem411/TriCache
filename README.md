@@ -201,7 +201,7 @@ Redis `INCR` — atomically increments a counter, setting TTL on first write. Re
 
 ### `cache.metrics()` → `CacheMetrics`
 
-Returns a full metrics snapshot including hit rates, bloom filter stats, compression savings, backplane counters, OOM eviction history, and tier sizes.
+Returns a full metrics snapshot including hit rates, bloom filter stats, backplane counters, OOM eviction history, and tier sizes.
 
 ### `CacheService.toPrometheusText(metrics, prefix?)` → `string`
 
