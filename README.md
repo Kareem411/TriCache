@@ -11,7 +11,7 @@
 
 Built for production from day one: adaptive LFU×LRU×priority eviction, AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, thundering-herd prevention, OOM guard, cold-start snapshots, and Prometheus metrics. Zero required configuration.
 
-![tricache architecture](public/SmartMemoryCache_DiskTier.jpeg)
+<img src="public/SmartMemoryCache_DiskTier.jpeg" width="600" alt="tricache architecture" />
 
 ---
 
