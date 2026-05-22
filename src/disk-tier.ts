@@ -52,6 +52,7 @@ export class DiskTier {
   private dirReady          = false;
   private diskUsageBytes    = 0;
   private usageCounted      = false;
+  private fileCount         = 0;   // maintained in-memory; avoids walkCacheFiles() in stats
 
   constructor(opts: DiskTierOptions) {
     this.opts = opts;
@@ -75,11 +76,13 @@ export class DiskTier {
     try {
       this.ensureDir();
       let total = 0;
-      for (const filePath of this.walkCacheFiles()) {
+      const files = this.walkCacheFiles();
+      this.fileCount = files.length;
+      for (const filePath of files) {
         try { total += fs.statSync(filePath).size; } catch { /* ok */ }
       }
       this.diskUsageBytes = total;
-    } catch { this.diskUsageBytes = 0; }
+    } catch { this.diskUsageBytes = 0; this.fileCount = 0; }
   }
 
   /**
@@ -195,6 +198,7 @@ export class DiskTier {
     // ── Async phase: mkdir + write (does not block the event loop) ────────
     const filePath = this.keyToPath(key);
     this.diskUsageBytes += final.length; // optimistic — rolled back on error
+    this.fileCount++;
 
     try {
       await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
@@ -202,6 +206,7 @@ export class DiskTier {
       this.opts.logger.debug('DiskTier: entry saved', { key: key.slice(0, 50), bytes: final.length });
     } catch (err) {
       this.diskUsageBytes -= Math.min(this.diskUsageBytes, final.length); // rollback
+      this.fileCount = Math.max(0, this.fileCount - 1);
       this.opts.logger.debug('DiskTier: save failed', { key: key.slice(0, 50), error: (err as Error).message });
     }
   }
@@ -225,7 +230,7 @@ export class DiskTier {
 
       const raw = fs.readFileSync(filePath);
       // Delete immediately — entry will be promoted back to L1
-      try { fs.unlinkSync(filePath); this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size); } catch { /* ok */ }
+      try { fs.unlinkSync(filePath); this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size); this.fileCount = Math.max(0, this.fileCount - 1); } catch { /* ok */ }
 
       let decrypted: Buffer;
       try { decrypted = this.decrypt(raw); } catch { return null; }
@@ -253,6 +258,7 @@ export class DiskTier {
         const stat = fs.statSync(filePath);
         fs.unlinkSync(filePath);
         this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
+        this.fileCount = Math.max(0, this.fileCount - 1);
       }
     } catch { /* ok */ }
   }
@@ -268,16 +274,18 @@ export class DiskTier {
         if (stat.size > this.opts.entryMaxBytes) {
           fs.unlinkSync(filePath);
           this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
+          this.fileCount = Math.max(0, this.fileCount - 1);
           purged++;
           continue;
         }
         const raw = fs.readFileSync(filePath);
         let dec: Buffer;
-        try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); purged++; continue; }
+        try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); this.fileCount = Math.max(0, this.fileCount - 1); purged++; continue; }
         const payload = unpack(dec) as DiskPayload;
         if (!payload || payload.version !== DISK_TIER_VERSION || payload.entry.expiresAt <= Date.now()) {
           fs.unlinkSync(filePath);
           this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
+          this.fileCount = Math.max(0, this.fileCount - 1);
           purged++;
         }
       } catch { /* skip locked/gone */ }
@@ -286,11 +294,7 @@ export class DiskTier {
   }
 
   get stats(): { files: number; sizeKB: number; maxKB: number } {
-    try {
-      const files = this.dirReady ? this.walkCacheFiles().length : 0;
-      return { files, sizeKB: Math.round(this.diskUsageBytes / 1024), maxKB: Math.round(this.opts.maxBytes / 1024) };
-    } catch {
-      return { files: 0, sizeKB: 0, maxKB: Math.round(this.opts.maxBytes / 1024) };
-    }
+    // fileCount is maintained in-memory — O(1), no filesystem scan.
+    return { files: this.fileCount, sizeKB: Math.round(this.diskUsageBytes / 1024), maxKB: Math.round(this.opts.maxBytes / 1024) };
   }
 }
