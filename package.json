@@ -1,0 +1,63 @@
+{
+  "name": "tricache",
+  "version": "0.1.0",
+  "description": "Three-tier Node.js cache: L1 smart RAM (adaptive LFU/LRU) → L1.5 NVMe disk spill → L2 Redis/Valkey. Includes AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, and thundering-herd prevention.",
+  "keywords": [
+    "cache",
+    "redis",
+    "valkey",
+    "lru",
+    "lfu",
+    "bloom-filter",
+    "swr",
+    "stale-while-revalidate",
+    "msgpack",
+    "aes-256-gcm",
+    "nextjs",
+    "nodejs"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build":      "tsup src/index.ts --format esm,cjs --dts --clean",
+    "dev":        "tsup src/index.ts --format esm,cjs --dts --watch",
+    "typecheck":  "tsc --noEmit",
+    "test":       "vitest run",
+    "test:watch": "vitest",
+    "bench":      "node --import tsx/esm bench/benchmark.ts"
+  },
+  "dependencies": {
+    "ioredis": "^5.3.2",
+    "msgpackr": "^1.10.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.22.3",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.7"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YOUR_USERNAME/tricache.git"
+  }
+}
