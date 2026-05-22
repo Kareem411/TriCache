@@ -11,21 +11,7 @@
 
 Built for production from day one: adaptive LFU×LRU×priority eviction, AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, thundering-herd prevention, OOM guard, cold-start snapshots, and Prometheus metrics. Zero required configuration.
 
-```
-Request
-  │
-  ▼
-L1 — SmartMemoryCache   (in-process RAM, 200 MB default, adaptive LFU×LRU×priority eviction)
-  │ miss
-  ▼
-L1.5 — DiskTier         (NVMe spill, 500 MB default, 2–100 µs, holds evicted L1 entries)
-  │ miss
-  ▼
-L2 — Redis / Valkey     (distributed, production-only by default, pub/sub invalidation)
-  │ miss
-  ▼
-fetchFn()               (your database / API call — fires exactly once per key under load)
-```
+![tricache architecture](public/SmartMemoryCache_DiskTier.jpeg)
 
 ---
 
