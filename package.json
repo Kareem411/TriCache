@@ -17,6 +17,7 @@
     "nodejs"
   ],
   "license": "MIT",
+  "packageManager": "pnpm@11.0.9",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -47,17 +48,17 @@
     "msgpackr": "^1.10.1"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^24.0.0",
     "tsup": "^8.0.0",
     "tsx": "^4.22.3",
-    "typescript": "^5.4.0",
+    "typescript": "^6.0.3",
     "vitest": "^4.1.7"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/YOUR_USERNAME/tricache.git"
+    "url": "https://github.com/Kareem411/tricache.git"
   }
 }
