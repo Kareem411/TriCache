@@ -14,6 +14,10 @@
 
 import { pack, unpack } from 'msgpackr';
 import type { CacheHit, CachePriority, CategoryLimit, SmartCacheEntry, ILogger, EvictionReason } from './types';
+
+// Reusable return object for get() — eliminates one heap allocation per hot read.
+// Safe because JS is single-threaded: callers consume all fields before the next get().
+const _hit: CacheHit = { value: undefined, isStale: false, expiresAt: 0, ttlMs: undefined, delta: undefined };
 import { WasmBloomFilter } from './wasm/bloom-filter-wasm';
 
 
@@ -391,8 +395,12 @@ export class SmartMemoryCache {
     // value is cached at write time — hot reads return the live object directly,
     // skipping unpack. Falls back to decode for entries restored from disk/snapshot.
     const value = entry.value !== undefined ? entry.value : unpack(entry.data as Buffer);
-    const isStale = entry.staleAt !== undefined && now > entry.staleAt;
-    return { value, isStale, expiresAt: entry.expiresAt, ttlMs: entry.ttlMs, delta: entry.delta };
+    _hit.value    = value;
+    _hit.isStale  = entry.staleAt !== undefined && now > entry.staleAt;
+    _hit.expiresAt = entry.expiresAt;
+    _hit.ttlMs    = entry.ttlMs;
+    _hit.delta    = entry.delta;
+    return _hit;
   }
 
   set(

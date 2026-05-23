@@ -674,7 +674,6 @@ export class CacheService {
           const now       = Date.now();
           const remaining = l1Hit.expiresAt - now;
           const entryTtl  = l1Hit.ttlMs ?? ttlSeconds * 1_000;
-          const priority  = opts.priority ?? inferPriority(cacheKey);
 
           const shouldRefreshAhead = opts.refreshAhead != null && opts.refreshAhead > 0
             ? remaining <= entryTtl * (1 - opts.refreshAhead)
@@ -687,6 +686,9 @@ export class CacheService {
             : false;
 
           if (shouldRefreshAhead || shouldXFetch) {
+            // Defer inferPriority until we actually need it — avoids 3× string.includes()
+            // scans on every warm hit when the threshold check is false (the common case).
+            const priority = opts.priority ?? inferPriority(cacheKey);
             this.revalidating.add(k);
             void this._revalidate(k, fetchFn, entryTtl, (opts.swr ?? 0) * 1_000, priority);
             this.counters.swrRevalidations++;

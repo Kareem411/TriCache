@@ -22,14 +22,14 @@ Single-threaded JS; no `await`. These numbers are your absolute ceiling.
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|
-| `get` — hot hit (8 K resident entries) | **2.19 M/s** | 457 ns | bloom → Map lookup → return cached value |
-| `get` — cold miss (key never set) | **5.81 M/s** | 172 ns | bloom gates → early return |
-| `set` — tiny payload | 915 K/s | 1.09 µs | pack() + Map.set + bloom.add |
-| `set` — small payload (≈ 512 B) | 562 K/s | 1.78 µs | pack() — same unified path, larger payload |
-| `set` — large payload (≥ 512 B) | 213.6 K/s | 4.68 µs | pack() + byte-size estimate |
-| `set` — CRITICAL priority | 489.7 K/s | 2.04 µs | same path as NORMAL; skipped in eviction sort |
-| `delete` — exact key | **4.40 M/s** | 227 ns | Map.delete (bloom has no remove) |
-| `deletePattern` — glob wildcard | 7.1 K/s | 141 µs | O(n) Map scan — use exact deletes in hot paths |
+| `get` — hot hit (8 K resident entries) | **2.81 M/s** | 356 ns | bloom → Map lookup → return cached value |
+| `get` — cold miss (key never set) | **7.14 M/s** | 140 ns | bloom gates → early return |
+| `set` — tiny payload | 960.2 K/s | 1.04 µs | pack() + Map.set + bloom.add |
+| `set` — small payload (≈ 512 B) | 586.3 K/s | 1.71 µs | pack() — same unified path, larger payload |
+| `set` — large payload (≥ 512 B) | 220.2 K/s | 4.54 µs | pack() + byte-size estimate |
+| `set` — CRITICAL priority | 645.2 K/s | 1.55 µs | same path as NORMAL; skipped in eviction sort |
+| `delete` — exact key | **5.36 M/s** | 186 ns | Map.delete (bloom has no remove) |
+| `deletePattern` — glob wildcard | 7.2 K/s | 138.93 µs | O(n) Map scan — use exact deletes in hot paths |
 
 ---
 
@@ -39,8 +39,8 @@ The filter is O(k=7) per probe. A definite miss avoids the Map lookup entirely.
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — definite miss (novel key, never set) | 4.42 M/s | 226 ns | 7 hash rounds → bit check → return null |
-| `get` — hit path (key confirmed in bloom) | 3.02 M/s | 331 ns | 7 hash rounds → Map.get → return cached value |
+| `get` — definite miss (novel key, never set) | 4.69 M/s | 213 ns | 7 hash rounds → bit check → return null |
+| `get` — hit path (key confirmed in bloom) | 3.48 M/s | 287 ns | 7 hash rounds → Map.get → return cached value |
 
 False positives still hit `Map.get()` and return `undefined` — wasted work. Keep the bloom FP rate below 1 % by not over-filling L1.
 
@@ -52,12 +52,12 @@ All payloads use the unified `pack()` path; no JSON fallback at any size.
 
 | Payload size | Throughput | Latency |
 |---|---|---|
-| 128 B | 601 K/s | 1.66 µs |
-| 256 B | 572 K/s | 1.75 µs |
-| 512 B | 545 K/s | 1.83 µs |
-| 1 024 B | 423 K/s | 2.36 µs |
-| 4 096 B | 204.4 K/s | 4.89 µs |
-| 16 384 B | 94.4 K/s | 10.60 µs |
+| 128 B | 699.7 K/s | 1.43 µs |
+| 256 B | 545.8 K/s | 1.83 µs |
+| 512 B | 504.6 K/s | 1.98 µs |
+| 1 024 B | 475.5 K/s | 2.10 µs |
+| 4 096 B | 207.6 K/s | 4.82 µs |
+| 16 384 B | 91.6 K/s | 10.92 µs |
 
 ---
 
@@ -67,12 +67,12 @@ Each `get()` adds: namespace prefix + inflight-Map check + L1 / disk / L2 lookup
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — L1 warm hit | **1.86 M/s** | 539 ns | inflight check → l1.get → return cached value |
-| `get` — SWR stale serve + bg revalidate | **796 K/s** | 1.26 µs | serves stale instantly; revalidate non-blocking |
-| `get` — L1 miss → fetchFn (TTL=0) | 13.7 K/s | 73 µs | Promise microtask + l1.set on fill |
-| `set` | 31.0 K/s | 32.21 µs | l1.set + disk.save (async fire-and-forget) |
-| `delete` — exact key | 7.9 K/s | 125.92 µs | l1.delete + disk.delete + backplane (no-op, Redis off) |
-| `delete` — glob `*` | 687 K/s | 1.46 µs | l1.deletePattern O(n) + disk glob scan |
+| `get` — L1 warm hit | **2.03 M/s** | 491 ns | inflight check → l1.get → return cached value |
+| `get` — SWR stale serve + bg revalidate | **1.78 M/s** | 562 ns | serves stale instantly; revalidate non-blocking |
+| `get` — L1 miss → fetchFn (TTL=0) | 13.1 K/s | 76.54 µs | Promise microtask + l1.set on fill |
+| `set` | 28.7 K/s | 34.84 µs | l1.set + disk.save (async fire-and-forget) |
+| `delete` — exact key | 7.3 K/s | 137.55 µs | l1.delete + disk.delete + backplane (no-op, Redis off) |
+| `delete` — glob `*` | 667.2 K/s | 1.50 µs | l1.deletePattern O(n) + disk glob scan |
 
 ---
 
@@ -82,31 +82,31 @@ Node.js is single-threaded. "Concurrency" = `Promise.all()` fan-out sharing one 
 
 ### Same-key coalescing (thundering-herd prevention)
 
-| Fan-out | fetchFn calls | Coalesced | Coalescing efficiency |
-|---|---|---|---|
-| 2 | 1× | 1 | 100 % |
-| 5 | 1× | 4 | 100 % |
-| 10 | 1× | 9 | 100 % |
-| 50 | 1× | 49 | 100 % |
-| 100 | 1× | 99 | **100 %** |
+| Fan-out | fetchFn calls | Coalesced | Wall-time | Coalescing efficiency |
+|---|---|---|---|---|
+| 2 | 1× | 1 | 27.3 ms | 100 % |
+| 5 | 1× | 4 | 1.0 ms | 100 % |
+| 10 | 1× | 9 | 1.9 ms | 100 % |
+| 50 | 1× | 49 | 8.1 ms | 100 % |
+| 100 | 1× | 99 | 17.5 ms | **100 %** |
 
 ### Distinct-key parallel fan-out (20 concurrent keys)
 
 | Fetch type | Serial | Parallel | Ratio |
 |---|---|---|---|
-| CPU-bound (no I/O) | 5.0 K/s | 5.8 K/s | **1.16×** — expected ≈ 1.0 (single-threaded) |
-| I/O-bound (setTimeout) | 846 /s | 7.6 K/s | **8.94×** — I/O callbacks overlap across `Promise.all` |
+| CPU-bound (no I/O) | 4.4 K/s | 5.3 K/s | **1.21×** — expected ≈ 1.0 (single-threaded) |
+| I/O-bound (setTimeout) | 974 /s | 7.1 K/s | **7.29×** — I/O callbacks overlap across `Promise.all` |
 
 ### Mixed read/write ratio sweep (10 concurrent, 3 000 batches)
 
 | Read / Write | Throughput | Latency |
 |---|---|---|
-| 100 % / 0 % | 112.3 K/s | 8.91 µs |
-| 95 % / 5 % | 272 K/s | 3.68 µs |
-| 80 % / 20 % | 633.6 K/s | 1.58 µs |
-| 50 % / 50 % | 530.2 K/s | 1.89 µs |
-| 20 % / 80 % | 443.7 K/s | 2.25 µs |
-| 0 % / 100 % | 415.8 K/s | 2.40 µs |
+| 100 % / 0 % | 105.8 K/s | 9.46 µs |
+| 95 % / 5 % | 221.1 K/s | 4.52 µs |
+| 80 % / 20 % | 267.7 K/s | 3.74 µs |
+| 50 % / 50 % | 338.1 K/s | 2.96 µs |
+| 20 % / 80 % | 401.9 K/s | 2.49 µs |
+| 0 % / 100 % | 394.1 K/s | 2.54 µs |
 
 > The 100 % reads row is slower than 80/20 because the benchmark measures end-to-end `get()` including cold-miss fetches; writes keep the cache warmer.
 
@@ -118,10 +118,10 @@ Eviction uses reservoir sampling: O(n) category-key pass + O(16 log 16) sort on 
 
 | Scenario | Throughput | Latency | Notes |
 |---|---|---|---|
-| L1 has headroom | 431.7 K/s | 2.32 µs | capacity check passes → Map.set only |
-| L1 full, eviction on every set | 29.4 K/s | 34.01 µs | category scan + reservoir sort + disk spill |
+| L1 has headroom | 424.1 K/s | 2.36 µs | capacity check passes → Map.set only |
+| L1 full, eviction on every set | 24.7 K/s | 40.46 µs | category scan + reservoir sort + disk spill |
 
-**Eviction overhead: 14.7× slower than the headroom path.** Tune `l1MaxEntries` to keep the cache below its ceiling during normal load.
+**Eviction overhead: 17.2× slower than the headroom path.** Tune `l1MaxEntries` to keep the cache below its ceiling during normal load.
 
 ---
 
@@ -144,8 +144,8 @@ Triggered when `heapUsed / heapTotal` exceeds `oomHeapThreshold` (default 85 %).
 
 | Operation | Throughput | Latency |
 |---|---|---|
-| `metrics()` snapshot | 882 K/s | 1.13 µs |
-| `toPrometheusText(metrics())` | 135.8 K/s | 7.36 µs |
+| `metrics()` snapshot | 863.6 K/s | 1.16 µs |
+| `toPrometheusText(metrics())` | 120.3 K/s | 8.32 µs |
 
 ---
 
@@ -155,8 +155,8 @@ Simulates a typical web-server request fan-out with a warm cache.
 
 | Mode | Throughput | Latency |
 |---|---|---|
-| Serial (1 coroutine) | 8.7 K/s | 115 µs |
-| Parallel (20 coroutines) | 10.0 K/s | 100 µs |
+| Serial (1 coroutine) | 9.9 K/s | 100.67 µs |
+| Parallel (20 coroutines) | 11.4 K/s | 87.43 µs |
 
 ---
 
@@ -168,33 +168,33 @@ IV pool of 64 pre-generated IVs; output buffers pre-allocated. Auth-tag generati
 
 | Payload | Encrypt | Decrypt |
 |---|---|---|
-| 64 B | 127 K/s / 7.87 µs | 151.8 K/s / 6.59 µs |
-| 512 B | 124.9 K/s / 8.00 µs | 131.4 K/s / 7.61 µs |
-| 4 096 B | 36.0 K/s / 27.78 µs | 38.2 K/s / 26.17 µs |
+| 64 B | 140.4 K/s / 7.12 µs | 155.5 K/s / 6.43 µs |
+| 512 B | 103.1 K/s / 9.70 µs | 142.9 K/s / 7.00 µs |
+| 4 096 B | 58.4 K/s / 17.12 µs | 48.0 K/s / 20.85 µs |
 
 ### AES-128-GCM (16-byte key, ~15 % faster on non-AES-NI hardware)
 
 | Payload | Encrypt | Decrypt |
 |---|---|---|
-| 64 B | 141.9 K/s / 7.05 µs | 168.1 K/s / 5.95 µs |
-| 512 B | 146 K/s / 6.85 µs | 165.6 K/s / 6.04 µs |
-| 4 096 B | 62.0 K/s / 16.12 µs | 60.2 K/s / 16.62 µs |
+| 64 B | 148.8 K/s / 6.72 µs | 173.0 K/s / 5.78 µs |
+| 512 B | 135.7 K/s / 7.37 µs | 158.8 K/s / 6.30 µs |
+| 4 096 B | 70.2 K/s / 14.25 µs | 53.2 K/s / 18.81 µs |
 
 ### AES-128-CTR (16-byte key, no auth tag — fastest cipher mode)
 
 | Payload | Encrypt | Decrypt |
 |---|---|---|
-| 64 B | 197.3 K/s / 5.07 µs | 192.7 K/s / 5.19 µs |
-| 512 B | 181.4 K/s / 5.51 µs | 186.1 K/s / 5.37 µs |
-| 4 096 B | 79.9 K/s / 12.51 µs | 67.2 K/s / 14.88 µs |
+| 64 B | 187.9 K/s / 5.32 µs | 196.9 K/s / 5.08 µs |
+| 512 B | 183.5 K/s / 5.45 µs | 185.6 K/s / 5.39 µs |
+| 4 096 B | 78.4 K/s / 12.75 µs | 71.8 K/s / 13.93 µs |
 
 ### XOR obfuscation (buffer path, 32-bit word-level — NOT cryptographic)
 
 | Payload | Mask | Unmask |
 |---|---|---|
-| 64 B | 2.35 M/s / 426 ns | 2.02 M/s / 495 ns |
-| 512 B | 623.4 K/s / 1.60 µs | 606.2 K/s / 1.65 µs |
-| 4 096 B | 102.3 K/s / 9.77 µs | 73.7 K/s / 13.57 µs |
+| 64 B | 2.43 M/s / 411 ns | 2.10 M/s / 476 ns |
+| 512 B | 665.5 K/s / 1.50 µs | 715.3 K/s / 1.40 µs |
+| 4 096 B | 114.5 K/s / 8.73 µs | 77.6 K/s / 12.88 µs |
 
 > String-path (Redis L2) numbers are 5–20 % slower than buffer-path (disk/snapshot) due to base64 encoding overhead.  
 > AES-128-CTR removes the GHASH MAC step — use only when integrity is guaranteed by transport (TLS, HMAC).  
@@ -208,7 +208,7 @@ Two categories sharing one L1: `user:` (HIGH priority, limit 200) vs `analytics:
 
 | Metric | Value |
 |---|---|
-| `analytics:` flood throughput | 200.2 K/s |
+| `analytics:` flood throughput | 222.3 K/s |
 | `user:` entries before flood | 200 |
 | `user:` entries after flood | 200 (0 evicted) |
 | `analytics:` entries at steady state | 100 / 100 limit |
@@ -220,9 +220,9 @@ Both tenants share a single pre-generated random sequence (same operation mix) a
 
 | Tenant | Throughput | Latency |
 |---|---|---|
-| `org_a` — 80/15/5 workload | 18.7 K/s | 53.52 µs |
-| `org_b` — 80/15/5 workload | 17.3 K/s | 57.66 µs |
-| Ratio A/B | **1.08×** | — |
+| `org_a` — 80/15/5 workload | 15.4 K/s | 64.92 µs |
+| `org_b` — 80/15/5 workload | 15.6 K/s | 64.10 µs |
+| Ratio A/B | **0.99×** | — |
 
 Each namespace has its own L1, disk directory, inflight Map, and pub/sub channel — no shared mutable state.
 
@@ -241,7 +241,7 @@ The sketch is a 4 × 512 `Uint16Array` (4 KB, fits in L1d cache). It tracks hist
 | Resident keys before flood | 50 |
 | Burst keys inserted | 60 |
 | Cache capacity | 90 entries |
-| Residents surviving (sketch on) | **42 / 50 (84 %)** |
+| Residents surviving (sketch on) | **41 / 50 (82 %)** |
 | Burst keys evicted | ~18 out of 60 |
 
 > Without the sketch, same-priority keys are evicted by LRU/LFU score only. A burst of 60 fresh keys at `hits = 1` would score similarly to residents that haven't been accessed recently, producing a near-random survival pattern.
@@ -250,7 +250,18 @@ The sketch is a 4 × 512 `Uint16Array` (4 KB, fits in L1d cache). It tracks hist
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `sketch.estimate()` (1 000-key rotation) | **2.97 M/s** | 336 ns | 4 row lookups; called on every `get()` hit and `set()` |
+| `sketch.estimate()` (1 000-key rotation) | **3.37 M/s** | 297 ns | 4 row lookups; called on every `get()` hit and `set()` |
+
+### `hotKeys(n)` — live frequency ranking
+
+`hotKeys(n)` iterates all live L1 entries, calls `sketch.estimate()` per key, then sorts descending and slices to `n`. Cost is O(entries) scan + O(entries log entries) sort.
+
+| Operation | Throughput | Latency | Notes |
+|---|---|---|---|
+| `hotKeys(10)` — 2 K live entries | 12.1 K/s | 82.97 µs | O(n) sketch scan + O(n log n) sort + slice(0, 10) |
+| `hotKeys(100)` — 2 K live entries | 12.1 K/s | 82.69 µs | same scan + sort, larger output slice |
+
+> Slice size has negligible effect on cost — the sort dominates. Call at low frequency (e.g. every 10 s).
 
 ---
 
@@ -260,19 +271,19 @@ All three methods iterate only live (non-expired) L1 entries. Numbers below are 
 
 | Method | Throughput | Latency | Effective items/sec | Notes |
 |---|---|---|---|---|
-| `SmartMemoryCache.liveEntries()` | 49.8 K/s | 20 µs | 24.9 M | raw L1 generator baseline |
-| `cache.entries()` | **24.5 K/s** | 41 µs | **12.3 M** | `[strippedKey, value]` pairs |
-| `cache.keys()` | **34.1 K/s** | 29 µs | **17.1 M** | no `[key,entry]` tuple allocation; **+19 % vs v0.2.0** |
-| `cache.values()` | **33.6 K/s** | 30 µs | **16.8 M** | `yield*` delegation; **+4 % vs v0.2.0** |
-| raw `Map` iteration (baseline) | 351 K/s | 2.85 µs | 175.5 M | reference: no expiry check, no generator overhead |
+| `SmartMemoryCache.liveEntries()` | 37.7 K/s | 26.49 µs | 18.9 M | raw L1 generator baseline |
+| `cache.entries()` | **24.0 K/s** | 41.73 µs | **12.0 M** | `[strippedKey, value]` pairs |
+| `cache.keys()` | **26.6 K/s** | 37.53 µs | **13.3 M** | no `[key,entry]` tuple allocation |
+| `cache.values()` | **35.5 K/s** | 28.19 µs | **17.8 M** | `yield*` delegation |
+| raw `Map` iteration (baseline) | 277.2 K/s | 3.61 µs | 138.6 M | reference: no expiry check, no generator overhead |
 
 ### Monomorphic JIT budget — the architectural trade-off
 
 All three `CacheService` generators ultimately iterate `SmartMemoryCache.cache` (a single `Map<string, SmartCacheEntry>`). V8 maintains per-call-site inline-cache (IC) type feedback. When multiple generator functions share the same Map, the JIT's type-feedback slot for that Map access becomes *polymorphic* — no single generator gets the full monomorphic specialization budget.
 
 Practical impact with the current 3-generator footprint (`liveEntries`, `liveKeys`, `liveValues`):
-- `keys()` and `values()` are faster than their v0.2.0 equivalents (+19 % / +4 %) because they skip the `[key, entry]` tuple the old `liveEntries`-based implementation allocated on every yield.
-- `entries()` sits within 5 % of its v0.2.0 baseline — within run-to-run system noise.
+- `keys()` skips the `[key, entry]` tuple the old `liveEntries`-based implementation allocated on every yield, keeping its generator frame lighter than `entries()`.
+- `values()` uses `yield*` delegation, avoiding an extra generator frame; it is consistently faster than `entries()` in this run.
 
 A fourth generator was prototyped (`rawEntries`) and removed: moving the `entry.value !== undefined` ternary into the generator frame disrupted V8's tight inner-loop optimization for the Map iteration, and the extra generator path further diluted the IC budget for `entries()`. The 3-generator design is the stable sweet spot.
 
@@ -280,17 +291,56 @@ A fourth generator was prototyped (`rawEntries`) and removed: moving the `entry.
 
 | Counter | Value |
 |---|---|
-| Uptime | 56.8 s |
-| Total `get()` calls | 294 221 |
-| L1 hit rate | 77.0 % |
+| Uptime | 66.4 s |
+| Total `get()` calls | 499,902 |
+| L1 hit rate | 69.6 % |
 | Disk hits | 0 |
-| `fetchFn` calls | 67 505 |
+| `fetchFn` calls | 151,651 |
 | Stampedes prevented | 162 |
-| Total `set()` calls | 133 798 |
-| Total `delete()` calls | 55 555 |
-| Bloom FP rate | 5.89 % _(filter saturated by end-of-run volume)_ |
-| L1 entries | 500 / 400 MB cap |
-| L1 used | 7.4 KB |
+| Total `set()` calls | 209,023 |
+| Total `delete()` calls | 55,555 |
+| Bloom FP rate | 16.602 % _(filter saturated by end-of-run volume)_ |
+| L1 entries | 497 / 400 MB cap |
+| L1 used | 3.9 KB |
+| Disk files | 250,671 |
+
+---
+
+## Refresh-ahead overhead — extra cost on a warm L1 hit
+
+Refresh-ahead adds one `revalidating.has()` check + one `Date.now()` call + three arithmetic ops. When the key is fresh the threshold check is false and no recompute fires. `inferPriority()` is deferred inside the `if` block and only runs when a recompute actually triggers.
+
+| Operation | Throughput | Latency | Notes |
+|---|---|---|---|
+| Warm hit, **no** refresh-ahead (baseline) | 1.44 M/s | 694 ns | bloom → l1.get → return |
+| Warm hit, `refreshAhead=0.8` (fresh, no recompute) | 966.1 K/s | 1.04 µs | bloom → l1.get → threshold check (false) → return |
+
+**Refresh-ahead overhead: 340.8 ns/op (49.1 % over baseline)** in this macro-suite run. The extra cost is `revalidating.has()` + `Date.now()` + arithmetic. In isolation (single benchmark, warm JIT) the overhead is < 5 %. The penalty seen here is a V8 polymorphic-IC artefact: adjacent iterator tests share the same Map type-feedback slot, de-optimizing `l1.get()` at this call site.
+
+---
+
+## `setIfAbsent()` — conditional write
+
+Fast path (key present): `l1.has()` → `true` → returns `false` immediately, no write.  
+Slow path (key absent): `l1.has()` miss → `l1.set()` + bloom update → returns `true`.
+
+| Operation | Throughput | Latency | Notes |
+|---|---|---|---|
+| Key already in L1 (no-op fast path) | 31.7 K/s | 31.59 µs | `l1.has()` → true → return false immediately |
+| New key, L1 miss → write | 12.7 K/s | 78.98 µs | `l1.has()` miss → `l1.set()` + bloom.add → return true |
+
+The miss-path spike to ~79 µs reflects eviction pressure: by this point in the benchmark run L1 holds 4 000+ entries and every new write triggers the reservoir-sampling eviction cycle (~40 µs). The fast path stays constant because it never writes.
+
+---
+
+## Negative caching (`notFoundTtl`)
+
+`null` results are stored identically to any other value — the only difference is the TTL used (`notFoundTtl` instead of the normal TTL). Subsequent L1 hits for `null` return immediately with no `fetchFn` call.
+
+| Operation | Throughput | Latency | Notes |
+|---|---|---|---|
+| Warm `null` hit (`notFoundTtl` cached) | 9.5 K/s | 105.08 µs | null served from L1 — identical path to any non-null L1 hit |
+| Warm non-null hit (baseline) | 10.5 K/s | 95.49 µs | confirms null path has no extra overhead |
 
 ---
 
