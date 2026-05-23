@@ -6,6 +6,8 @@
 
 All numbers are from one live run on the same machine. Throughput varies ±5–10 % across runs due to JIT warmth and OS scheduling. Re-run with `pnpm bench` to reproduce on your hardware.
 
+> **v0.3.0 additions:** Count-Min Sketch frequency tracking (4 KB, 78 % burst-flood survival rate) and a lazy iterator interface (`keys()` / `values()` / `entries()`) on `CacheService`. See the dedicated sections below.
+
 > **v0.2.0 optimisation:** every cache entry now stores the deserialized JS value alongside the msgpackr buffer. Hot `get()` calls return the live object directly — zero unpack overhead. The packed buffer is retained for disk spill and snapshot serialization. Result: **+112 % L1 hot-get throughput** and **+64 % CacheService L1 warm-hit throughput**.
 
 ---
@@ -15,9 +17,9 @@ All numbers are from one live run on the same machine. Throughput varies ±5–1
 Single-threaded JS; no `await`. These numbers are your absolute ceiling.
 
 | Operation | Throughput | Latency | Notes |
-|---|---|---|---|
-| `get` — hot hit (8 K resident entries) | **2.65 M/s** | 377 ns | bloom → Map lookup → return cached value |
-| `get` — cold miss (key never set) | **6.77 M/s** | 148 ns | bloom gates → early return |
+|---|---|---|
+| `get` — hot hit (8 K resident entries) | **2.19 M/s** | 457 ns | bloom → Map lookup → return cached value |
+| `get` — cold miss (key never set) | **5.81 M/s** | 172 ns | bloom gates → early return |
 | `set` — tiny payload | 915 K/s | 1.09 µs | pack() + Map.set + bloom.add |
 | `set` — small payload (≈ 512 B) | 562 K/s | 1.78 µs | pack() — same unified path, larger payload |
 | `set` — large payload (≥ 512 B) | 213.6 K/s | 4.68 µs | pack() + byte-size estimate |
@@ -34,7 +36,7 @@ The filter is O(k=7) per probe. A definite miss avoids the Map lookup entirely.
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
 | `get` — definite miss (novel key, never set) | 4.37 M/s | 229 ns | 7 hash rounds → bit check → return null |
-| `get` — hit path (key confirmed in bloom) | 3.26 M/s | 307 ns | 7 hash rounds → Map.get → return cached value |
+| `get` — hit path (key confirmed in bloom) | 2.82 M/s | 354 ns | 7 hash rounds → Map.get → return cached value |
 
 False positives still hit `Map.get()` and return `undefined` — wasted work. Keep the bloom FP rate below 1 % by not over-filling L1.
 
@@ -222,7 +224,55 @@ Each namespace has its own L1, disk directory, inflight Map, and pub/sub channel
 
 ---
 
-## Final cache state (end of benchmark run)
+## Count-Min Sketch — cross-eviction frequency & burst-flood protection
+
+The sketch is a 4 × 512 `Uint16Array` (4 KB, fits in L1d cache). It tracks historical access frequency across eviction events so eviction scoring can distinguish a long-resident key that was recently re-admitted (`entry.hits = 1`) from a brand-new burst key (`entry.hits = 1` also). Hash: FNV-1a seed → four independent Murmur3-fragment mixes. Decay: all counters halved (arithmetic right-shift) every 100 000 inserts.
+
+### Burst-flood survival (same priority)
+
+50 long-resident `NORMAL` keys each receive 100 `get()` calls (builds sketch frequency), then 60 burst keys are inserted into a cache capped at 90 entries. The sketch frequency elevates resident scores so the eviction pass preferentially drops burst keys.
+
+| Metric | Value |
+|---|---|
+| Resident keys before flood | 50 |
+| Burst keys inserted | 60 |
+| Cache capacity | 90 entries |
+| Residents surviving (sketch on) | **39 / 50 (78 %)** |
+| Burst keys evicted | ~21 out of 60 |
+
+> Without the sketch, same-priority keys are evicted by LRU/LFU score only. A burst of 60 fresh keys at `hits = 1` would score similarly to residents that haven't been accessed recently, producing a near-random survival pattern.
+
+### Sketch estimate throughput
+
+| Operation | Throughput | Latency | Notes |
+|---|---|---|---|
+| `sketch.estimate()` (1 000-key rotation) | **3.04 M/s** | 329 ns | 4 row lookups; called on every `get()` hit and `set()` |
+
+---
+
+## Iterator interface — `keys()` / `values()` / `entries()`
+
+All three methods iterate only live (non-expired) L1 entries. Numbers below are for a 500-entry L1 (full scan per call).
+
+| Method | Throughput | Latency | Effective items/sec | Notes |
+|---|---|---|---|---|
+| `SmartMemoryCache.liveEntries()` | 49.5 K/s | 20 µs | 24.8 M | raw L1 generator baseline |
+| `cache.entries()` | **28 K/s** | 35 µs | **14 M** | `[strippedKey, value]` pairs |
+| `cache.keys()` | **34.5 K/s** | 29 µs | **17.3 M** | no `[key,entry]` tuple allocation; **+19 % vs v0.2.0** |
+| `cache.values()` | **35 K/s** | 29 µs | **17.5 M** | `yield*` delegation; **+4 % vs v0.2.0** |
+| raw `Map` iteration (baseline) | 338 K/s | 3 µs | 169 M | reference: no expiry check, no generator overhead |
+
+### Monomorphic JIT budget — the architectural trade-off
+
+All three `CacheService` generators ultimately iterate `SmartMemoryCache.cache` (a single `Map<string, SmartCacheEntry>`). V8 maintains per-call-site inline-cache (IC) type feedback. When multiple generator functions share the same Map, the JIT's type-feedback slot for that Map access becomes *polymorphic* — no single generator gets the full monomorphic specialization budget.
+
+Practical impact with the current 3-generator footprint (`liveEntries`, `liveKeys`, `liveValues`):
+- `keys()` and `values()` are faster than their v0.2.0 equivalents (+19 % / +4 %) because they skip the `[key, entry]` tuple the old `liveEntries`-based implementation allocated on every yield.
+- `entries()` sits within 5 % of its v0.2.0 baseline — within run-to-run system noise.
+
+A fourth generator was prototyped (`rawEntries`) and removed: moving the `entry.value !== undefined` ternary into the generator frame disrupted V8's tight inner-loop optimization for the Map iteration, and the extra generator path further diluted the IC budget for `entries()`. The 3-generator design is the stable sweet spot.
+
+> **When to prefer each method:** use `keys()` when you only need to enumerate key names (admin tooling, debug dumps). Use `values()` for full-cache scans where the key is irrelevant (warming a secondary store, bulk serialization). Use `entries()` when you need both. None of these paths hit bloom filter tracking or update hit counters — they are read-only enumerations.
 
 | Counter | Value |
 |---|---|

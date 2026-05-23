@@ -257,3 +257,136 @@ describe('OOM guard', () => {
     }
   });
 });
+
+// ── Feature: Iterator interface ───────────────────────────────────────────────
+
+describe('Iterator interface (keys / values / entries)', () => {
+  it('keys() yields namespace-stripped keys for live entries', async () => {
+    const nsSvc = CacheService.reset({
+      disableRedis: true,
+      namespace:    'app',
+      l1MaxEntries: 100,
+      l1MaxBytes:   10 * 1024 * 1024,
+      diskCacheDir: tempDir(),
+    });
+    try {
+      await nsSvc.set('alpha', 1, 60);
+      await nsSvc.set('beta', 2, 60);
+      await nsSvc.set('gamma', 3, 60);
+      const ks = [...nsSvc.keys()].sort();
+      expect(ks).toEqual(['alpha', 'beta', 'gamma']);
+    } finally {
+      await nsSvc.destroy();
+    }
+  });
+
+  it('values() yields deserialized values for live entries', async () => {
+    await svc.set('v1', { n: 10 }, 60);
+    await svc.set('v2', { n: 20 }, 60);
+    const vals = [...svc.values<{ n: number }>()].map(v => v.n).sort((a, b) => a - b);
+    expect(vals).toEqual([10, 20]);
+  });
+
+  it('entries() yields [key, value] pairs with namespace stripped', async () => {
+    const nsSvc = CacheService.reset({
+      disableRedis: true,
+      namespace:    'ns',
+      l1MaxEntries: 100,
+      l1MaxBytes:   10 * 1024 * 1024,
+      diskCacheDir: tempDir(),
+    });
+    try {
+      await nsSvc.set('x', 42, 60);
+      await nsSvc.set('y', 99, 60);
+      const pairs = [...nsSvc.entries<number>()].sort(([a], [b]) => a.localeCompare(b));
+      expect(pairs).toEqual([['x', 42], ['y', 99]]);
+    } finally {
+      await nsSvc.destroy();
+    }
+  });
+
+  it('iterators skip expired entries', async () => {
+    await svc.set('fresh', 'yes', 60);
+    await svc.set('stale', 'no', 0.001); // ~1 ms TTL
+    await new Promise(r => setTimeout(r, 20));
+    const ks = [...svc.keys()];
+    expect(ks).toContain('fresh');
+    expect(ks).not.toContain('stale');
+  });
+
+  it('keys() returns empty iterator when cache is empty', () => {
+    expect([...svc.keys()]).toHaveLength(0);
+  });
+});
+
+// ── Feature: Invalidation backplane message handler ───────────────────────────
+
+describe('Invalidation backplane (_handleBackplaneMessage)', () => {
+  const PEER_ID = 'peer-instance-xyz';
+
+  it('del message evicts the key from L1 immediately', async () => {
+    await svc.set('user:1', { name: 'Alice' }, 60);
+    expect(svc.has('user:1')).toBe(true);
+
+    (svc as unknown as { _handleBackplaneMessage(m: string): void })
+      ._handleBackplaneMessage(JSON.stringify({ op: 'del', key: 'user:1', src: PEER_ID }));
+
+    expect(svc.has('user:1')).toBe(false);
+  });
+
+  it('del message is a no-op for keys not in L1', () => {
+    expect(() => {
+      (svc as unknown as { _handleBackplaneMessage(m: string): void })
+        ._handleBackplaneMessage(JSON.stringify({ op: 'del', key: 'nonexistent', src: PEER_ID }));
+    }).not.toThrow();
+  });
+
+  it('del-glob message evicts all matching L1 keys', async () => {
+    await svc.set('session:a', 1, 60);
+    await svc.set('session:b', 2, 60);
+    await svc.set('other:c', 3, 60);
+
+    (svc as unknown as { _handleBackplaneMessage(m: string): void })
+      ._handleBackplaneMessage(JSON.stringify({ op: 'del-glob', key: 'session:*', src: PEER_ID }));
+
+    expect(svc.has('session:a')).toBe(false);
+    expect(svc.has('session:b')).toBe(false);
+    expect(svc.has('other:c')).toBe(true);
+  });
+
+  it('own messages (same instanceId) are skipped without eviction', async () => {
+    await svc.set('product:1', { price: 99 }, 60);
+    const ownId = (svc as unknown as { instanceId: string }).instanceId;
+
+    (svc as unknown as { _handleBackplaneMessage(m: string): void })
+      ._handleBackplaneMessage(JSON.stringify({ op: 'del', key: 'product:1', src: ownId }));
+
+    // should still be present — own messages are ignored
+    expect(svc.has('product:1')).toBe(true);
+  });
+
+  it('malformed JSON messages are silently ignored', () => {
+    expect(() => {
+      (svc as unknown as { _handleBackplaneMessage(m: string): void })
+        ._handleBackplaneMessage('not-json{{');
+    }).not.toThrow();
+  });
+
+  it('disk.delete is deferred via setImmediate (does not block the event loop)', async () => {
+    await svc.set('k', 42, 60);
+    const diskSpy = vi.spyOn(
+      (svc as unknown as { disk: { delete(k: string): void } }).disk,
+      'delete',
+    );
+
+    (svc as unknown as { _handleBackplaneMessage(m: string): void })
+      ._handleBackplaneMessage(JSON.stringify({ op: 'del', key: 'k', src: PEER_ID }));
+
+    // disk.delete must NOT have been called synchronously
+    expect(diskSpy).not.toHaveBeenCalled();
+
+    // after yielding to the event loop it fires
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(diskSpy).toHaveBeenCalledWith('k');
+  });
+});

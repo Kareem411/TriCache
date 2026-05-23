@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-23
+
+### Added
+
+- **Count-Min Sketch frequency tracking** — A 4 × 512 `Uint16Array` (4 KB, fits in L1d cache) now records historical access frequency for every key in L1. The per-entry `hits` counter resets to 1 whenever a key is re-admitted after eviction; the sketch retains the cross-eviction frequency so a key that was accessed 80 times before being evicted scores far above a burst key whose `hits = 1`. Benchmark: **76 % of long-resident keys survive a same-priority burst flood** of 60 new keys against 50 established residents.
+
+  - Hash: four independent Murmur3-fragment mixes derived from one FNV-1a seed — all computed inline from a single string scan.
+  - Decay: all counters halved (right-shift) every 100 000 inserts — frequency-ages old counts so a past burst cannot protect a key indefinitely.
+  - Zero external dependencies; 4 KB fixed footprint regardless of cache size.
+
+- **Iterator interface on `CacheService`** — Three lazy generator methods that skip expired entries without allocating intermediate arrays:
+
+  | Method | Returns | Notes |
+  |---|---|---|
+  | `cache.keys()` | `Generator<string>` | Namespace prefix stripped per yield; no `[key, entry]` tuple allocated |
+  | `cache.values<T>()` | `Generator<T>` | `yield*` delegation — no intermediate generator frame |
+  | `cache.entries<T>()` | `Generator<[string, T]>` | Yields `[strippedKey, value]` pairs |
+
+  All three iterate only live (non-expired) L1 entries and silently skip entries whose TTL has elapsed since the last background cleanup sweep.
+
+  ```typescript
+  for (const key of cache.keys()) console.log(key);
+  for (const value of cache.values<User>()) process(value);
+  for (const [key, user] of cache.entries<User>()) sync(key, user);
+  ```
+
+### Performance
+
+- **`keys()` +19 % throughput** (29.0 K/s → 34.5 K/s) — `liveKeys()` on `SmartMemoryCache` yields the key string directly from the Map iteration without constructing an intermediate `[key, entry]` tuple.
+- **`values()` +4 % throughput** (33.7 K/s → 35.1 K/s) — `liveValues()` uses `yield*` delegation from `CacheService.values()`, collapsing one generator frame. Iterates `Map.values()` directly so the key is never loaded into the yielded code path.
+
+### Internal
+
+- **Removed dead `rawEntries()` generator** — An intermediate `[key, resolvedValue]` generator was explored as an optimization path for `entries()` but proved slower due to V8 inline-cache (IC) type-feedback sharing: placing the `entry.value !== undefined` ternary inside the generator frame disrupted the tight-loop optimization that V8 applies to `liveEntries()`. Removing it reduced the generator count on `SmartMemoryCache.cache` from 4 → 3, which recovered the `entries()` monomorphic JIT budget (see BENCHMARKS.md — Iterator interface trade-offs).
+- **8 new tests** (141 total): 3 Count-Min Sketch tests (`liveEntries()` expiry, empty cache, sketch burst-flood survival) + 5 iterator tests on `CacheService` (`keys()` namespace stripping, `values()` deserialization, `entries()` pairs, expiry skip, empty iterator).
+
 ## [0.2.0] — 2026-05-23
 
 ### Performance

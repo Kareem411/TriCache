@@ -19,7 +19,8 @@ tricache is an extremely fast three-tier Node.js cache library. It serves warm r
 
 | Feature | Detail |
 |---|---|
-| **Adaptive eviction** | LFU × LRU × priority score; reservoir-sampled O(1) hot path; category limits prevent any prefix monopolising RAM |
+| **Adaptive eviction** | LFU × LRU × priority score + Count-Min Sketch cross-eviction frequency; reservoir-sampled O(1) hot path; category limits prevent any prefix monopolising RAM |
+| **Count-Min Sketch** | 4 × 512 `Uint16Array` (4 KB) tracks historical access frequency across eviction boundaries — same-priority burst keys cannot displace long-resident entries; **78 % survival rate** in benchmark flood tests |
 | **WASM Bloom filter** | 562-byte binary inlined as Base64 — O(k=7) guaranteed-miss detection, no filesystem access, pure-JS fallback |
 | **msgpackr serialization** | All entries packed with msgpackr — uniform binary format, no JSON at any payload size |
 | **Stale-While-Revalidate** | Serve stale instantly, revalidate in background — zero added latency on cache hit |
@@ -371,6 +372,32 @@ process.on('SIGTERM', async () => {
 });
 ```
 
+### `cache.keys()` → `Generator<string>`
+
+Lazily yields the key for every live (non-expired) L1 entry. Namespace prefix is stripped automatically. Uses a dedicated generator that skips intermediate tuple allocation.
+
+```typescript
+for (const key of cache.keys()) console.log(key);
+```
+
+### `cache.values<T>()` → `Generator<T>`
+
+Lazily yields the cached value for every live L1 entry. Returns the live deserialized object (same reference semantics as `get()`). Uses `yield*` delegation — no intermediate generator frame.
+
+```typescript
+for (const session of cache.values<Session>()) evict(session);
+```
+
+### `cache.entries<T>()` → `Generator<[string, T]>`
+
+Lazily yields `[key, value]` pairs for every live L1 entry. Key has namespace prefix stripped.
+
+```typescript
+for (const [key, user] of cache.entries<User>()) sync(key, user);
+```
+
+> **JIT note:** all three generators iterate `SmartMemoryCache.cache` (a single `Map`). V8 maintains per-call-site type feedback; having three generator functions share the same Map means no single one gets the full monomorphic specialization budget. In practice the throughput impact is ≤5 % relative to each running in isolation. See [BENCHMARKS.md](BENCHMARKS.md) for numbers.
+
 ### `cache.destroy()` → `Promise<void>`
 
 Closes the Redis connection, unsubscribes the backplane, and stops all background timers.
@@ -520,14 +547,24 @@ Measured on a single Node.js thread (no `await` on synchronous paths):
 
 | Operation | Throughput | Latency | Notes |
 |---|---|---|---|
-| `get` — hot hit (8K entries) | **2.65 M/s** | 377 ns | bloom → Map lookup → return cached value |
-| `get` — cold miss | **6.77 M/s** | 148 ns | bloom gates → early return |
+| `get` — hot hit (8K entries) | **2.19 M/s** | 457 ns | bloom → Map lookup → return cached value |
+| `get` — cold miss | **5.81 M/s** | 172 ns | bloom gates → early return |
 | `set` — tiny payload | 915 K/s | 1.09 µs | pack() + Map.set + bloom.add |
 | `set` — small payload (≈ 512 B) | 562 K/s | 1.78 µs | pack() same unified path, larger payload |
 | `set` — large payload (≥ 512 B) | 213.6 K/s | 4.68 µs | pack() larger payload |
 | `set` — CRITICAL priority | 489.7 K/s | 2.04 µs | same set path; skipped in eviction sort |
 | `delete` — exact key | **4.40 M/s** | 227 ns | Map.delete |
 | `deletePattern` — glob wildcard | 7.1 K/s | 141 µs | O(n) Map scan |
+| Count-Min Sketch estimate | **3.04 M/s** | 329 ns | 4 row lookups — called on every `get()` hit and `set()` |
+
+**Iterator interface (L1 live entries, 500 entries)**
+
+| Method | Throughput | Latency | Notes |
+|---|---|---|---|
+| `cache.keys()` | 34.5 K/s | 29 µs | no `[key,entry]` tuple allocation — +19 % vs v0.2.0 |
+| `cache.values()` | 35 K/s | 29 µs | `yield*` delegation — +4 % vs v0.2.0 |
+| `cache.entries()` | 28 K/s | 35 µs | `[strippedKey, value]` pairs |
+| raw `Map` iteration (baseline) | 338 K/s | 3 µs | no expiry check, no generator overhead |
 
 **CacheService (end-to-end)**
 

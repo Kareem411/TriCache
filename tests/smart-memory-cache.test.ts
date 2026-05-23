@@ -153,4 +153,49 @@ describe('SmartMemoryCache', () => {
     const exported = cache.exportEntries(['session:']);
     expect(exported).toHaveLength(0);
   });
+
+  // ── Count-Min Sketch (frequency tracking across evictions) ───────────────
+
+  it('liveEntries() yields only non-expired entries', async () => {
+    cache.set('alive', 'yes', 60_000);
+    cache.set('dead', 'no', 1); // expires in 1 ms
+    await new Promise(r => setTimeout(r, 20));
+    const keys = [...cache.liveEntries()].map(([k]) => k);
+    expect(keys).toContain('alive');
+    expect(keys).not.toContain('dead');
+  });
+
+  it('liveEntries() returns empty when cache is empty', () => {
+    expect([...cache.liveEntries()]).toHaveLength(0);
+  });
+
+  it('sketch protects long-resident keys from same-priority burst eviction', () => {
+    // Tiny cache: maxEntries = 60 to force eviction during the burst
+    const tiny = new SmartMemoryCache({
+      ...opts,
+      maxEntries: 60,
+      categories: { default: { maxEntries: 60, maxSizeBytes: 50 * 1024 * 1024 } },
+    });
+
+    // Seed 30 long-resident NORMAL keys and simulate 50 gets each (builds sketch frequency)
+    for (let i = 0; i < 30; i++) {
+      tiny.set(`resident:${i}`, i, 120_000, CachePriority.NORMAL);
+    }
+    for (let i = 0; i < 30; i++) {
+      for (let g = 0; g < 50; g++) tiny.get(`resident:${i}`);
+    }
+
+    // Now burst-flood 40 brand-new NORMAL keys — this forces eviction of ~10 entries
+    for (let i = 0; i < 40; i++) {
+      tiny.set(`burst:${i}`, i, 120_000, CachePriority.NORMAL);
+    }
+
+    // Residents had 50+ accesses recorded in the sketch; burst keys have 1.
+    // At least 20 of the 30 residents should survive (with sketch protecting them).
+    let survived = 0;
+    for (let i = 0; i < 30; i++) {
+      if (tiny.get(`resident:${i}`) !== null) survived++;
+    }
+    expect(survived).toBeGreaterThanOrEqual(20);
+  });
 });

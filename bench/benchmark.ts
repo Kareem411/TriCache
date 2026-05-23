@@ -953,6 +953,131 @@ console.log(`  ${C.dim}• parallel >> serial (I/O) → I/O overlap via Promise.
 console.log(`  ${C.dim}• eviction >>10× headroom  → cache is over-full; increase l1MaxEntries.${C.reset}`);
 console.log('');
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  13. Count-Min Sketch — burst-flood protection
+// ─────────────────────────────────────────────────────────────────────────────
+
+header('Count-Min Sketch — burst-flood protection');
+note('50 long-resident NORMAL keys each receive 100 gets (builds sketch frequency).');
+note('A burst of 60 brand-new NORMAL keys is then set, forcing eviction.');
+note('Survivor count shows how many residents the sketch saved vs a baseline without it.');
+
+{
+  const RESIDENTS = 50;
+  const BURST     = 60;
+  const GETS_EACH = 100;
+  const CAP       = 90; // force eviction during burst
+
+  const sketchL1 = new SmartMemoryCache({
+    maxBytes:   50 * 1024 * 1024,
+    maxEntries: CAP,
+    categories: { default: { maxEntries: CAP, maxSizeBytes: 50 * 1024 * 1024 } },
+    logger:     consoleLogger,
+  });
+
+  // Seed residents and warm the sketch
+  for (let i = 0; i < RESIDENTS; i++) sketchL1.set(`res:${i}`, i, 120_000, CachePriority.NORMAL);
+  for (let i = 0; i < RESIDENTS; i++) {
+    for (let g = 0; g < GETS_EACH; g++) sketchL1.get(`res:${i}`);
+  }
+
+  // Burst-flood — triggers eviction
+  for (let i = 0; i < BURST; i++) sketchL1.set(`burst:${i}`, i, 120_000, CachePriority.NORMAL);
+
+  let survived = 0;
+  for (let i = 0; i < RESIDENTS; i++) { if (sketchL1.get(`res:${i}`) !== null) survived++; }
+
+  const survivedPct = ((survived / RESIDENTS) * 100).toFixed(0);
+  console.log(`  ${'resident survival (sketch on)'.padEnd(COL_LABEL)}${C.cyan}${String(`${survived}/${RESIDENTS}  (${survivedPct}%)`).padStart(COL_OPS)}${C.reset}`);
+
+  // Throughput: sketch estimate cost
+  const keys = Array.from({ length: 1000 }, (_, i) => `res:${i % RESIDENTS}`);
+  let ki = 0;
+  await bench(
+    'sketch estimate (1 000-key rotation)',
+    () => { sketchL1.get(keys[ki++ % keys.length]); },
+    200_000, 5_000,
+    'L1 get with CountMinSketch.estimate() in score()',
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  14. Iterator interface — keys() / values() / entries() throughput
+// ─────────────────────────────────────────────────────────────────────────────
+
+header('Iterator interface — keys() / values() / entries()');
+note('L1 populated with 500 entries. Measures full-scan generator throughput vs raw Map iteration.');
+
+{
+  const iterL1 = new SmartMemoryCache({
+    maxBytes:   50 * 1024 * 1024,
+    maxEntries: 500,
+    categories: { default: { maxEntries: 500, maxSizeBytes: 50 * 1024 * 1024 } },
+    logger:     consoleLogger,
+  });
+  for (let i = 0; i < 500; i++) iterL1.set(`iter:${i}`, { n: i }, 120_000);
+
+  const iterSvc = CacheService.reset({
+    disableRedis: true,
+    namespace:    'bmark',
+    l1MaxEntries: 500,
+    l1MaxBytes:   50 * 1024 * 1024,
+    diskCacheDir: mkdtempSync(path.join(os.tmpdir(), 'tricache-iter-')),
+  });
+  for (let i = 0; i < 500; i++) await iterSvc.set(`key:${i}`, { n: i }, 120);
+
+  // Warm the liveEntries path before measuring any generators.
+  // NOTE: keys() and values() each use dedicated generators (liveKeys/liveValues) that
+  // avoid [key,entry] tuple allocation; they show best numbers when measured after warmup
+  // via their own path. entries() uses liveEntries and benefits most from this warm.
+  // Because all generators iterate the same underlying Map, V8 JIT budget is shared:
+  // numbers for any single method are best-case when that method dominates call traffic.
+  for (let w = 0; w < 200; w++) {
+    for (const _ of iterL1.liveEntries()) {}
+    for (const _ of iterSvc.entries()) {}
+  }
+
+  await bench(
+    'L1 liveEntries() full scan (500 entries)',
+    () => { for (const _ of iterL1.liveEntries()) {} },
+    10_000, 500,
+    'generator yields [key, SmartCacheEntry] for each non-expired entry',
+  );
+
+  await bench(
+    'CacheService.entries() full scan (500 entries)',
+    () => { for (const _ of iterSvc.entries()) {} },
+    10_000, 500,
+    'yields [strippedKey, value] pairs',
+  );
+
+  await bench(
+    'CacheService.keys() full scan (500 entries)',
+    () => { for (const _ of iterSvc.keys()) {} },
+    10_000, 500,
+    'namespace prefix stripped per yield — no [key,entry] tuple allocation',
+  );
+
+  await bench(
+    'CacheService.values() full scan (500 entries)',
+    () => { for (const _ of iterSvc.values()) {} },
+    10_000, 500,
+    'yield* delegation — no intermediate generator frame',
+  );
+
+  // Raw Map baseline for comparison
+  const rawMap = new Map<string, number>();
+  for (let i = 0; i < 500; i++) rawMap.set(`iter:${i}`, i);
+  await bench(
+    'raw Map iteration baseline (500 entries)',
+    () => { for (const _ of rawMap) {} },
+    10_000, 500,
+    'reference: no expiry check, no generator overhead',
+  );
+
+  await iterSvc.destroy();
+}
+
 await svc.destroy();
 cleanup(benchDir, evictDir, oomDir, nsADir, nsBDir);
 process.exit(0);

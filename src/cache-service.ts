@@ -348,23 +348,7 @@ export class CacheService {
       this.logger.debug('Backplane subscriber error', { error: e.message }));
 
     sub.on('message', (_channel: string, message: string) => {
-      try {
-        const msg = JSON.parse(message) as { op: 'del' | 'del-glob'; key: string; src: string };
-        if (msg.src === this.instanceId) {
-          this.counters.invSkipped++;
-          return; // own message — our L1 is already current
-        }
-        this.counters.invReceived++;
-        if (msg.op === 'del') {
-          this.l1.delete(msg.key);
-          this.disk.delete(msg.key);
-        } else if (msg.op === 'del-glob') {
-          this.l1.deletePattern(msg.key);
-        }
-        this.logger.debug('Backplane: peer invalidation applied', {
-          op: msg.op, key: msg.key.slice(0, 60),
-        });
-      } catch { /* malformed message — ignore */ }
+      this._handleBackplaneMessage(message);
     });
 
     sub.subscribe(this.backplaneChannel)
@@ -376,6 +360,32 @@ export class CacheService {
       }));
 
     this.subClient = sub;
+  }
+
+  /** @internal Exposed for testing. Applies a raw backplane JSON message to local state. */
+  _handleBackplaneMessage(message: string): void {
+    try {
+      const msg = JSON.parse(message) as { op: 'del' | 'del-glob'; key: string; src: string };
+      if (msg.src === this.instanceId) {
+        this.counters.invSkipped++;
+        return; // own message — our L1 is already current
+      }
+      this.counters.invReceived++;
+      if (msg.op === 'del') {
+        // L1 eviction is synchronous and O(1); disk delete is deferred via
+        // setImmediate so the event-loop tick that processes this pub/sub
+        // message returns immediately without blocking hot get() calls.
+        this.l1.delete(msg.key);
+        setImmediate(() => this.disk.delete(msg.key));
+      } else if (msg.op === 'del-glob') {
+        // Glob patterns clean L1 only — disk entries expire naturally via
+        // the background purge timer or are bypassed on the next L1 miss.
+        this.l1.deletePattern(msg.key);
+      }
+      this.logger.debug('Backplane: peer invalidation applied', {
+        op: msg.op, key: msg.key.slice(0, 60),
+      });
+    } catch { /* malformed message — ignore */ }
   }
 
   private async publishInvalidation(op: 'del' | 'del-glob', key: string): Promise<void> {
@@ -860,6 +870,48 @@ export class CacheService {
    */
   has(cacheKey: string): boolean {
     return this.l1.has(this.nk(cacheKey));
+  }
+
+  // ── Iteration ─────────────────────────────────────────────────────────────
+
+  /**
+   * Lazily yield every non-expired L1 key, stripped of its namespace prefix.
+   *
+   * @example
+   * for (const key of cache.keys()) console.log(key);
+   */
+  *keys(): Generator<string> {
+    const prefixLen = this._namespace ? this._namespace.length + 1 : 0;
+    for (const key of this.l1.liveKeys()) {
+      yield prefixLen > 0 ? key.slice(prefixLen) : key;
+    }
+  }
+
+  /**
+   * Lazily yield every non-expired L1 value.
+   * Each value is the cached (pre-deserialized) JS object — no unpack overhead.
+   *
+   * @example
+   * for (const val of cache.values<User>()) console.log(val.id);
+   */
+  *values<T = unknown>(): Generator<T> {
+    // yield* delegates directly into liveValues(), collapsing one generator frame.
+    yield* this.l1.liveValues() as Generator<T>;
+  }
+
+  /**
+   * Lazily yield every non-expired L1 [key, value] pair.
+   * Keys are stripped of their namespace prefix.
+   *
+   * @example
+   * for (const [key, val] of cache.entries<User>()) console.log(key, val.id);
+   */
+  *entries<T = unknown>(): Generator<[string, T]> {
+    const prefixLen = this._namespace ? this._namespace.length + 1 : 0;
+    for (const [key, entry] of this.l1.liveEntries()) {
+      const k = prefixLen > 0 ? key.slice(prefixLen) : key;
+      yield [k, (entry.value !== undefined ? entry.value : entry.data) as T];
+    }
   }
 
   /**

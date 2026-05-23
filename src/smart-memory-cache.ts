@@ -100,6 +100,79 @@ function createBloomFilter(logger: ILogger): AnyBloomFilter {
   }
 }
 
+// ─── Count-Min Sketch ─────────────────────────────────────────────────────────
+//
+// Estimates historical access frequency across eviction boundaries — a per-entry
+// `hits` counter resets to 1 whenever a key is re-admitted after eviction, but
+// the sketch remembers the key's frequency in a fixed-size typed array that
+// survives evictions. This closes the same-priority burst-flood gap: a key that
+// has been accessed 80 times over the last hour but was evicted 5 minutes ago
+// will score far above a brand-new burst key whose hits = 1.
+//
+// Dimensions: 4 rows × 512 counters (Uint16Array) — 4 KB total, fits in L1d.
+// Hash: four independent Murmur3-fragment mixes of the key's FNV-1a digest.
+// Decay: all counters halved when total insertions cross SKETCH_DECAY_THRESHOLD
+//        (frequency-ageing prevents indefinitely growing hot-key counts).
+
+const SKETCH_ROWS  = 4;
+const SKETCH_WIDTH = 512;          // must be power of two
+const SKETCH_MASK  = SKETCH_WIDTH - 1;
+const SKETCH_DECAY_THRESHOLD = 100_000;
+
+class CountMinSketch {
+  private readonly table = new Uint16Array(SKETCH_ROWS * SKETCH_WIDTH);
+  private inserts = 0;
+
+  /** Inline FNV-1a for a string key → 32-bit unsigned integer. */
+  private fnv32(key: string): number {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < key.length; i++) {
+      h ^= key.charCodeAt(i);
+      h = (Math.imul(h, 0x01000193) >>> 0);
+    }
+    return h;
+  }
+
+  /** Four independent bit-mixes from one FNV-1a seed. */
+  private hashes(key: string): [number, number, number, number] {
+    const h = this.fnv32(key);
+    const h1 = (h ^ (h >>> 16)) >>> 0;
+    const h2 = (Math.imul(h1, 0x45d9f3b) ^ (h1 >>> 16)) >>> 0;
+    const h3 = (Math.imul(h2, 0x7fb9b7a1) ^ (h2 >>> 16)) >>> 0;
+    const h4 = (Math.imul(h3, 0x1b873593) ^ (h3 >>> 16)) >>> 0;
+    return [h1, h2, h3, h4];
+  }
+
+  /** Record one access. Decays all counters when the insertion threshold is crossed. */
+  increment(key: string): void {
+    const [h1, h2, h3, h4] = this.hashes(key);
+    const t = this.table;
+    t[0 * SKETCH_WIDTH + (h1 & SKETCH_MASK)] = Math.min(0xffff, (t[0 * SKETCH_WIDTH + (h1 & SKETCH_MASK)] + 1));
+    t[1 * SKETCH_WIDTH + (h2 & SKETCH_MASK)] = Math.min(0xffff, (t[1 * SKETCH_WIDTH + (h2 & SKETCH_MASK)] + 1));
+    t[2 * SKETCH_WIDTH + (h3 & SKETCH_MASK)] = Math.min(0xffff, (t[2 * SKETCH_WIDTH + (h3 & SKETCH_MASK)] + 1));
+    t[3 * SKETCH_WIDTH + (h4 & SKETCH_MASK)] = Math.min(0xffff, (t[3 * SKETCH_WIDTH + (h4 & SKETCH_MASK)] + 1));
+    if (++this.inserts >= SKETCH_DECAY_THRESHOLD) this.decay();
+  }
+
+  /** Minimum-across-rows frequency estimate. */
+  estimate(key: string): number {
+    const [h1, h2, h3, h4] = this.hashes(key);
+    const t = this.table;
+    return Math.min(
+      t[0 * SKETCH_WIDTH + (h1 & SKETCH_MASK)],
+      t[1 * SKETCH_WIDTH + (h2 & SKETCH_MASK)],
+      t[2 * SKETCH_WIDTH + (h3 & SKETCH_MASK)],
+      t[3 * SKETCH_WIDTH + (h4 & SKETCH_MASK)],
+    );
+  }
+
+  /** Halve all counters — ages out old frequency so bursts don't hold indefinitely. */
+  private decay(): void {
+    for (let i = 0; i < this.table.length; i++) this.table[i] >>>= 1;
+    this.inserts = 0;
+  }
+}
+
 // ─── SmartMemoryCache ─────────────────────────────────────────────────────────
 
 export interface SmartMemoryCacheOptions {
@@ -117,6 +190,8 @@ export class SmartMemoryCache {
   private bloom:                     AnyBloomFilter;
   /** Non-default category prefixes pre-extracted to avoid Object.keys() allocation on every call. */
   private readonly categoryPrefixes: string[];
+  /** Historical frequency sketch — survives eviction, closes same-priority burst-flood gap. */
+  private readonly sketch = new CountMinSketch();
   private totalSize                  = 0;
   private categoryCount              = new Map<string, number>();
   private categorySize               = new Map<string, number>();
@@ -197,10 +272,13 @@ export class SmartMemoryCache {
     this.smartEvict(category, catOvf);
   }
 
-  private score(entry: SmartCacheEntry, catBonus: number, now: number): number {
+  private score(entry: SmartCacheEntry, catBonus: number, now: number, key: string): number {
     const age  = now - entry.lastAccess;
     const ttl  = Math.max(0, entry.expiresAt - now);
-    const freq = Math.min(entry.hits, 100);
+    // Use the sketch's cross-eviction frequency estimate when it exceeds the
+    // entry's current-tenure hit count — protects long-resident keys that were
+    // recently re-admitted (hits reset to 1) from same-priority burst floods.
+    const freq = Math.min(Math.max(entry.hits, this.sketch.estimate(key)), 100);
     return entry.priority * 1000 + freq * 10 + ttl / 60000 - age / 60000 - catBonus;
   }
 
@@ -250,7 +328,7 @@ export class SmartMemoryCache {
           const entry = this.cache.get(key);
           if (!entry || (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now)) continue;
           catSeen++;
-          const s = this.score(entry, 100, now);
+          const s = this.score(entry, 100, now, key);
           if (pool.length < EVICT) {
             pool.push({ key, score: s });
           } else {
@@ -273,7 +351,7 @@ export class SmartMemoryCache {
         if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
         if (catOvf && this.getCategory(key) === targetCat) continue; // already sampled above
         globalSeen++;
-        const s = this.score(entry, 0, now);
+        const s = this.score(entry, 0, now, key);
         if (globalPool.length < remaining) {
           globalPool.push({ key, score: s });
         } else {
@@ -306,6 +384,7 @@ export class SmartMemoryCache {
     if (entry.expiresAt < now) { this._delete(key, 'ttl'); return null; }
     entry.hits++;
     entry.lastAccess = now;
+    this.sketch.increment(key);
     const cat = this.getCategory(key);
     this.categoryHits.set(cat, (this.categoryHits.get(cat) ?? 0) + 1);
     // value is cached at write time — hot reads return the live object directly,
@@ -327,6 +406,7 @@ export class SmartMemoryCache {
     const packed = pack(data);
     const size   = packed.byteLength;
     this.compressions++;
+    this.sketch.increment(key);
 
     const cat = this.getCategory(key);
     const lim = this.getCategoryLimit(cat);
@@ -418,7 +498,7 @@ export class SmartMemoryCache {
         const entry = this.cache.get(key);
         if (!entry) continue;
         if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
-        candidates.push({ key, score: this.score(entry, 0, now) });
+        candidates.push({ key, score: this.score(entry, 0, now, key) });
       }
       candidates.sort((a, b) => a.score - b.score);
 
@@ -470,7 +550,7 @@ export class SmartMemoryCache {
     const candidates: Array<{ key: string; score: number }> = [];
     for (const [key, entry] of this.cache) {
       if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
-      candidates.push({ key, score: this.score(entry, 0, now) });
+      candidates.push({ key, score: this.score(entry, 0, now, key) });
     }
     candidates.sort((a, b) => a.score - b.score);
     const count = Math.max(1, Math.ceil(candidates.length * pct));
@@ -528,6 +608,45 @@ export class SmartMemoryCache {
     }
     this.recalculateStats();
     return loaded;
+  }
+
+  // ── Iterators ─────────────────────────────────────────────────────────────
+
+  /**
+   * Lazily yields every [key, entry] pair whose TTL has not yet expired.
+   * Expired entries that are still in the Map (awaiting background cleanup)
+   * are silently skipped.
+   */
+  *liveEntries(): Generator<[string, SmartCacheEntry]> {
+    const now = Date.now();
+    for (const [key, entry] of this.cache) {
+      if (entry.expiresAt > now) yield [key, entry];
+    }
+  }
+
+  /**
+   * Yields only the keys of live entries — no intermediate tuple allocation.
+   * Use this instead of liveEntries() when you only need keys.
+   */
+  *liveKeys(): Generator<string> {
+    const now = Date.now();
+    for (const [key, entry] of this.cache) {
+      if (entry.expiresAt > now) yield key;
+    }
+  }
+
+  /**
+   * Yields only the resolved values of live entries.
+   * Iterates Map.values() so the key is never loaded into the yielded path.
+   * Returns the cached deserialized object when available (entry.value), otherwise
+   * the raw msgpackr Buffer — identical semantics to get() but without bloom/hit tracking.
+   */
+  *liveValues(): Generator<unknown> {
+    const now = Date.now();
+    for (const entry of this.cache.values()) {
+      if (entry.expiresAt > now)
+        yield entry.value !== undefined ? entry.value : entry.data;
+    }
   }
 
   // ── Stats ─────────────────────────────────────────────────────────────────
