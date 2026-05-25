@@ -33,7 +33,7 @@
  *   TRIC1XOR | key⊕data[N]               ← XOR
  */
 
-import { createCipheriv, createDecipheriv, randomFillSync } from 'crypto';
+import { createCipheriv, createDecipheriv, createSecretKey, randomFillSync, type KeyObject } from 'crypto';
 import type { ILogger } from './types';
 
 // ── Public type ───────────────────────────────────────────────────────────────
@@ -71,9 +71,11 @@ const PREFIX_CTR   = 'ctr:v1:'; // AES-128-CTR (no auth tag)
 const IV_POOL_COUNT = 64;
 
 export class CacheEncryption {
-  private _key: Buffer | null = null;
+  private _key:     Buffer    | null = null;  // raw bytes — used only for XOR
+  private _keyObj:  KeyObject | null = null;  // parsed KeyObject — used for all AES modes
   private readonly _mode: EncryptionMode;
-  private _prevKey:  Buffer | null = null;
+  private _prevKey:    Buffer    | null = null;
+  private _prevKeyObj: KeyObject | null = null;
   private _prevMode: EncryptionMode = 'aes-256-gcm';
 
   // Pre-allocated GCM IV pool — 12-byte IVs (96-bit, NIST recommended).
@@ -179,6 +181,19 @@ export class CacheEncryption {
         throw new Error('XOR key must be at least 1 byte');
       }
       this._key = buf;
+      if (mode !== 'xor') {
+        this._keyObj = createSecretKey(buf);
+        // Pre-warm OpenSSL's lazy key-schedule cache: first use of a KeyObject is slower
+        // because OpenSSL initialises internal state on demand. Paying that cost now
+        // (at construction) guarantees every production encrypt/decrypt call is fast.
+        const _wc = createCipheriv(
+          mode,
+          this._keyObj,
+          Buffer.alloc(mode === 'aes-128-ctr' ? CTR_IV_BYTES : IV_BYTES),
+        );
+        _wc.update(Buffer.alloc(0));
+        _wc.final();
+      }
       if (mode === 'xor') {
         logger.warn(
           'Cache obfuscation enabled (XOR). WARNING: XOR is NOT cryptographic — use only for dev or non-sensitive data.',
@@ -194,6 +209,16 @@ export class CacheEncryption {
       try {
         this._prevMode = previousMode ?? mode;
         this._prevKey  = Buffer.from(previousKeyBase64, 'base64');
+        if (this._prevMode !== 'xor') {
+          this._prevKeyObj = createSecretKey(this._prevKey);
+          const _wc = createCipheriv(
+            this._prevMode,
+            this._prevKeyObj,
+            Buffer.alloc(this._prevMode === 'aes-128-ctr' ? CTR_IV_BYTES : IV_BYTES),
+          );
+          _wc.update(Buffer.alloc(0));
+          _wc.final();
+        }
         logger.debug('Previous encryption key loaded for key rotation fallback');
       } catch (err) {
         logger.warn('Invalid previousEncryptionKey — rotation fallback disabled', { error: (err as Error).message });
@@ -219,7 +244,7 @@ export class CacheEncryption {
     }
     if (this._mode === 'aes-128-ctr') {
       const iv  = this._nextCtrIV();
-      const c   = createCipheriv('aes-128-ctr', this._key, iv);
+      const c   = createCipheriv('aes-128-ctr', this._keyObj!, iv);
       const enc = c.update(plaintext, 'utf8');
       const fin = c.final(); // CTR: almost always empty — captured defensively
       const out = Buffer.allocUnsafe(CTR_IV_BYTES + enc.length + fin.length);
@@ -231,7 +256,7 @@ export class CacheEncryption {
     const algo   = this._mode === 'aes-128-gcm' ? 'aes-128-gcm' : 'aes-256-gcm';
     const prefix = this._mode === 'aes-128-gcm' ? PREFIX_128 : PREFIX_256;
     const iv  = this._nextIV();
-    const c   = createCipheriv(algo, this._key, iv);
+    const c   = createCipheriv(algo, this._keyObj!, iv);
     const enc = c.update(plaintext, 'utf8'); // GCM: final() emits no bytes
     c.final();                               // finalise — makes auth tag available
     const out = Buffer.allocUnsafe(IV_BYTES + TAG_BYTES + enc.length);
@@ -248,18 +273,18 @@ export class CacheEncryption {
    */
   decrypt(value: string): string {
     try {
-      return this._decryptWithKey(value, this._key, this._mode);
+      return this._decryptWithKey(value, this._key, this._keyObj, this._mode);
     } catch (primaryErr) {
       if (this._prevKey) {
         try {
-          return this._decryptWithKey(value, this._prevKey, this._prevMode);
+          return this._decryptWithKey(value, this._prevKey, this._prevKeyObj, this._prevMode);
         } catch { /* ignore — fall through to re-throw primary */ }
       }
       throw primaryErr;
     }
   }
 
-  private _decryptWithKey(value: string, key: Buffer | null, mode: EncryptionMode): string {
+  private _decryptWithKey(value: string, key: Buffer | null, keyObj: KeyObject | null, mode: EncryptionMode): string {
     if (value.startsWith(PREFIX_XOR)) {
       if (!key) throw new Error('Cannot decrypt: encryption key is not set');
       // WARNING: XOR is NOT cryptographic — obfuscation only.
@@ -272,11 +297,11 @@ export class CacheEncryption {
       return out.toString('utf8');
     }
     if (value.startsWith(PREFIX_CTR)) {
-      if (!key) throw new Error('Cannot decrypt: encryption key is not set');
+      if (!keyObj) throw new Error('Cannot decrypt: encryption key is not set');
       const combined = Buffer.from(value.slice(PREFIX_CTR.length), 'base64');
       const iv = combined.subarray(0, CTR_IV_BYTES);
       const ct = combined.subarray(CTR_IV_BYTES);
-      const d  = createDecipheriv('aes-128-ctr', key, iv);
+      const d  = createDecipheriv('aes-128-ctr', keyObj, iv);
       const plain = d.update(ct);
       const fin   = d.final(); // CTR: almost always empty — concat before UTF-8 decode to avoid split-sequence corruption
       return (fin.length > 0 ? Buffer.concat([plain, fin]) : plain).toString('utf8');
@@ -284,19 +309,19 @@ export class CacheEncryption {
     const is256 = value.startsWith(PREFIX_256);
     const is128 = value.startsWith(PREFIX_128);
     if (!is256 && !is128) return value;
-    if (!key) throw new Error('Cannot decrypt: encryption key is not set');
+    if (!keyObj) throw new Error('Cannot decrypt: encryption key is not set');
     const prefix = is128 ? PREFIX_128 : PREFIX_256;
     const algo   = is128 ? 'aes-128-gcm' : 'aes-256-gcm';
     const combined = Buffer.from(value.slice(prefix.length), 'base64');
     const iv  = combined.subarray(0, IV_BYTES);
     const tag = combined.subarray(IV_BYTES, IV_BYTES + TAG_BYTES);
     const ct  = combined.subarray(IV_BYTES + TAG_BYTES);
-    const d   = createDecipheriv(algo, key, iv);
+    const d   = createDecipheriv(algo, keyObj, iv);
     d.setAuthTag(tag);
     const plain = d.update(ct);  // GCM: final() emits no bytes
     d.final();                   // verifies auth tag — throws on tamper
     return plain.toString('utf8');
-    void mode; // mode is used implicitly via prefix detection
+    void mode; void key; // mode and raw key used implicitly (mode via prefix; key via keyObj for AES, directly for XOR)
   }
 
   // ── Buffer (disk / snapshot) ──────────────────────────────────────────────
@@ -314,7 +339,7 @@ export class CacheEncryption {
     }
     if (this._mode === 'aes-128-ctr') {
       const iv  = this._nextCtrIV();
-      const c   = createCipheriv('aes-128-ctr', this._key, iv);
+      const c   = createCipheriv('aes-128-ctr', this._keyObj!, iv);
       const enc = c.update(data);
       const fin = c.final(); // CTR: almost always empty — captured defensively
       // Single pre-allocated output buffer: magic(8) | iv(16) | ciphertext(N)
@@ -328,7 +353,7 @@ export class CacheEncryption {
     const magic = this._mode === 'aes-128-gcm' ? MAGIC_128 : MAGIC_256;
     const algo  = this._mode === 'aes-128-gcm' ? 'aes-128-gcm' : 'aes-256-gcm';
     const iv    = this._nextIV();
-    const c     = createCipheriv(algo, this._key, iv);
+    const c     = createCipheriv(algo, this._keyObj!, iv);
     const enc   = c.update(data); // GCM: final() emits no bytes
     c.final();                    // finalise — makes auth tag available
     // Single pre-allocated output buffer: magic(8) | iv(12) | tag(16) | ciphertext(N)
@@ -347,18 +372,18 @@ export class CacheEncryption {
    */
   decryptBuffer(data: Buffer): Buffer {
     try {
-      return this._decryptBufferWithKey(data, this._key);
+      return this._decryptBufferWithKey(data, this._key, this._keyObj);
     } catch (primaryErr) {
       if (this._prevKey) {
         try {
-          return this._decryptBufferWithKey(data, this._prevKey);
+          return this._decryptBufferWithKey(data, this._prevKey, this._prevKeyObj);
         } catch { /* ignore — re-throw primary */ }
       }
       throw primaryErr;
     }
   }
 
-  private _decryptBufferWithKey(data: Buffer, key: Buffer | null): Buffer {
+  private _decryptBufferWithKey(data: Buffer, key: Buffer | null, keyObj: KeyObject | null): Buffer {
     if (data.length < MAGIC_LEN) return data;
     const magic = data.subarray(0, MAGIC_LEN);
 
@@ -373,10 +398,10 @@ export class CacheEncryption {
     }
 
     if (magic.equals(MAGIC_CTR)) {
-      if (!key) throw new Error('Cannot decrypt buffer: encryption key is not set');
+      if (!keyObj) throw new Error('Cannot decrypt buffer: encryption key is not set');
       const iv = data.subarray(MAGIC_LEN, MAGIC_LEN + CTR_IV_BYTES);
       const ct = data.subarray(MAGIC_LEN + CTR_IV_BYTES);
-      const d  = createDecipheriv('aes-128-ctr', key, iv);
+      const d  = createDecipheriv('aes-128-ctr', keyObj, iv);
       const plain = d.update(ct);
       const fin   = d.final(); // CTR: almost always empty — captured defensively
       return fin.length > 0 ? Buffer.concat([plain, fin]) : plain;
@@ -384,12 +409,12 @@ export class CacheEncryption {
     const is256 = magic.equals(MAGIC_256);
     const is128 = magic.equals(MAGIC_128);
     if (!is256 && !is128) return data;
-    if (!key) throw new Error('Cannot decrypt buffer: encryption key is not set');
+    if (!keyObj) throw new Error('Cannot decrypt buffer: encryption key is not set');
     const algo = is128 ? 'aes-128-gcm' : 'aes-256-gcm';
     const iv  = data.subarray(MAGIC_LEN, MAGIC_LEN + IV_BYTES);
     const tag = data.subarray(MAGIC_LEN + IV_BYTES, MAGIC_LEN + IV_BYTES + TAG_BYTES);
     const ct  = data.subarray(MAGIC_LEN + IV_BYTES + TAG_BYTES);
-    const d   = createDecipheriv(algo, key, iv);
+    const d   = createDecipheriv(algo, keyObj, iv);
     d.setAuthTag(tag);
     const plain = d.update(ct);  // GCM: final() emits no bytes
     d.final();                   // verifies auth tag — throws on tamper

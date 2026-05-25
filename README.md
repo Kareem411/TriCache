@@ -46,6 +46,7 @@ tricache is an extremely fast three-tier Node.js cache library. It serves warm r
 | **`setIfAbsent()`** | Atomic "set if not cached" — L1 `has()` check → Redis `SET NX EX` → L1 set on success; returns `true` if written, `false` if already present |
 | **Refresh-ahead** | Proactively recompute an entry in the background when remaining TTL falls below a configured fraction — zero-latency freshness |
 | **XFetch probabilistic early expiry** | Probabilistic background recompute keyed to last fetch duration and `xfetchBeta` — optimal protection against expiry spikes under load |
+| **Adaptive TTL** | Tracks per-key fetch latency in a rolling ring buffer; once ≥ 5 samples are collected, automatically sets TTL = `p95LatencyMs × multiplier`. Expensive keys get cached longer; cheap keys stay close to their base TTL — no manual TTL tuning required |
 | **`hotKeys(n)`** | Returns top N keys by Count-Min Sketch access frequency with size — no full Map scan |
 | **`dependsOn` cascade invalidation** | Tag entries with parent keys; deleting a parent automatically evicts all declared dependents from L1 |
 | **`onHit` / `onMiss` callbacks** | Per-operation hit/miss hooks with tier info (`'l1'` \| `'disk'` \| `'l2'`) — no wait for the metrics interval |
@@ -170,6 +171,8 @@ CacheService.create({
   // ── L1 (in-memory) ───────────────────────────────────────────────────
   l1MaxBytes:   200 * 1024 * 1024,  // 200 MB total RAM cap (default)
   l1MaxEntries: 2_000,              // max entries in L1 (default)
+  l1EvictionWatermark: 0.9,         // proactive eviction fires at 90 % of l1MaxEntries / l1MaxBytes (default)
+                                    // lower to 0.8 to reduce GC pressure on heap-bound workloads
   categoryLimits: {
     // per-prefix limits — keys are matched by startsWith()
     'user:':      { maxEntries: 500,  maxSizeBytes: 50  * 1024 * 1024 },
@@ -228,6 +231,17 @@ CacheService.create({
   // Prevents mass-expiry stampedes ("thundering cliff").
   // Range [0, 1]; default 0 (no jitter).
   ttlJitterFactor: 0.15,  // ± 15 % spread
+
+  // ── Adaptive TTL ──────────────────────────────────────────────────────
+  // When true, tricache tracks per-key fetch latency in a rolling ring
+  // buffer and derives an optimal TTL from the p95 fetch duration:
+  //   adaptedTtl = clamp(p95LatencyMs × multiplier, min, max)
+  // The caller-supplied ttlSeconds is used until ≥ 5 samples are collected,
+  // then the library takes over TTL management autonomously.
+  adaptiveTtl:            true,
+  adaptiveTtlMin:         10,      // floor: never assign TTL below 10 s (default)
+  adaptiveTtlMax:         86400,   // ceiling: never exceed 24 h (default)
+  adaptiveTtlMultiplier:  20,      // p95Ms × 20 = TTL in seconds (default)
 
   // ── OpenTelemetry tracer ──────────────────────────────────────────────
   // Pass any @opentelemetry/api-compatible tracer. No peer dependency.

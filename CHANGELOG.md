@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-05-25
+
+### Added
+
+- **Adaptive TTL (`adaptiveTtl`)** — tricache now tracks per-key fetch latency in a pre-allocated `Float64Array` ring buffer (default 32 samples). Once a key has ≥ 5 recorded fetch durations the library automatically derives an optimal TTL:
+
+  ```
+  adaptedTtl = clamp(p95LatencyMs × adaptiveTtlMultiplier, adaptiveTtlMin, adaptiveTtlMax)
+  ```
+
+  The caller-supplied `ttlSeconds` is used until enough samples are collected, then the library takes over TTL management autonomously. Expensive keys (slow DB queries) are cached longer; fast keys stay close to their base TTL. Four new options control the behaviour:
+
+  | Option | Default | Description |
+  |---|---|---|
+  | `adaptiveTtl` | `false` | Enable adaptive TTL |
+  | `adaptiveTtlMultiplier` | `20` | `p95Ms × multiplier = TTL seconds` |
+  | `adaptiveTtlMin` | `10` | Floor TTL in seconds |
+  | `adaptiveTtlMax` | `86400` | Ceiling TTL in seconds (24 h) |
+
+  `metrics()` gains an `adaptiveTtl` sub-object when the feature is enabled, reporting `trackedKeys` and the top-20 slowest keys by p95 fetch latency with their currently adapted TTLs.
+
+- **`l1EvictionWatermark` option** — `SmartMemoryCache` now supports a configurable watermark (fraction `0–1`, default `0.9`) that controls when proactive eviction fires ahead of the hard capacity ceiling. Wired through `CacheOptions.l1EvictionWatermark`. Lower values (e.g. `0.8`) amortise eviction cost more aggressively at the expense of slightly more frequent eviction rounds; raise to `0.95` on workloads where eviction is extremely rare to squeeze a few extra percent of L1 utilisation.
+
+### Performance
+
+- **Zero-allocation `smartEvict()`** — The L1 eviction hot path previously allocated approximately 2.9 million short-lived heap objects per second at sustained eviction rates: two fresh `Array` instances, up to 16 `{key, score}` object literals, a spread operator for merging candidate pools, a comparator closure for `Array.sort()`, and a `slice()` call per eviction. All allocations are now eliminated:
+  - `_evictPool` / `_evictGPool` — two fixed-size pools of 16 `{key: '', score: 0}` slots allocated once at class construction and mutated in-place on every call.
+  - Manual merge loop replaces the spread operator.
+  - Hand-written insertion sort (N ≤ 16, max 256 comparisons) replaces `Array.sort()` — no comparator closure, no timsort start-up, no allocation.
+  - Index-based eviction loop replaces `slice(0, EVICT_COUNT)`.
+
+  Result: **0 heap allocations per `smartEvict()` call**. Eviction soak CV reduced from ~23 % to ~17 % under pathological 100 %-fill load. The remaining ~17 % is the irreducible V8 old-generation GC floor for entry objects and `pack()` Buffers — structurally unavoidable without moving storage off the JS heap.
+
+### Docs
+
+- **BENCHMARKS.md** — Added *"Eviction hot-path — zero-allocation design"* section documenting every allocation site that was removed, the pre-allocated pool design, and the before/after CV numbers with an explanation of the practical floor.
+- **BENCHMARKS.md** — Added *"What tricache is very good at"* section: a reference table mapping the nine problems tricache was engineered to solve (thundering herd, priority inversion under flood, write-pressure latency spikes, GC pressure from bloom probes, etc.) to the concrete mechanism and the benchmark row that proves it.
+
 ## [0.5.1] — 2026-05-25
 
 ### Added

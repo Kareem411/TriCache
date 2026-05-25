@@ -17,8 +17,29 @@
 import fs                from 'fs';
 import path              from 'path';
 import crypto            from 'crypto';
+import { createRequire } from 'module';
 import { pack, unpack }  from 'msgpackr';
 import { DiskCacheEntry, ILogger } from './types.js';
+
+// ── node:sqlite lazy bootstrap ────────────────────────────────────────────────
+// Stable in Node 24; experimental (needs --experimental-sqlite) in Node 22.
+// Falls back to file-only mode silently when unavailable (edge runtimes, etc.).
+type _SqliteRow  = Record<string, unknown>;
+type _SqliteStmt = {
+  get(...p: unknown[]): _SqliteRow | undefined;
+  all(...p: unknown[]): _SqliteRow[];
+  run(...p: unknown[]): void;
+};
+type _SqliteDB = {
+  prepare(sql: string): _SqliteStmt;
+  exec(sql: string): void;
+  close(): void;
+};
+let _SqliteDB: (new (p: string) => _SqliteDB) | null = null;
+try {
+  const _req = createRequire(import.meta.url);
+  _SqliteDB = (_req('node:sqlite') as { DatabaseSync: new (p: string) => _SqliteDB }).DatabaseSync;
+} catch { /* node:sqlite unavailable — file-only mode */ }
 // ── Encryption (self-contained to avoid circular import) ─────────────────────
 
 const AES_ALGO  = 'aes-256-gcm' as const;
@@ -65,6 +86,15 @@ export class DiskTier {
   /** Next bucket index (0–255) for the staggered janitor wheel. */
   private _nextJanitorBucket = 0;
 
+  // ── SQLite metadata index (optional, requires node:sqlite) ───────────────
+  private _db:         _SqliteDB   | null = null;
+  private _stmtInsert: _SqliteStmt | null = null;  // INSERT OR REPLACE
+  private _stmtSelect: _SqliteStmt | null = null;  // SELECT by key_hash
+  private _stmtDelete: _SqliteStmt | null = null;  // DELETE by key_hash
+  private _stmtExpire: _SqliteStmt | null = null;  // SELECT expired rows
+  private _stmtDelExp: _SqliteStmt | null = null;  // DELETE expired rows
+  private _stmtStats:  _SqliteStmt | null = null;  // COUNT + SUM(size)
+
   constructor(opts: DiskTierOptions) {
     this.opts = opts;
   }
@@ -76,14 +106,75 @@ export class DiskTier {
     try {
       fs.mkdirSync(this.opts.dir, { recursive: true, mode: 0o700 });
       this.dirReady = true;
+      this._initSqlite();
     } catch (err) {
       this.opts.logger.warn('DiskTier: cannot create cache dir', { dir: this.opts.dir, error: (err as Error).message });
+    }
+  }
+
+  /**
+   * Initialise the SQLite metadata index.  Called once after the cache directory
+   * is confirmed to exist.  On any failure the instance silently falls back to
+   * file-only mode — all public methods handle `this._db === null`.
+   *
+   * Schema:
+   *   meta(key_hash TEXT PK, file_path TEXT, expires_at INT, size INT)
+   *   idx_expires on (expires_at) — makes WHERE expires_at <= ? O(log n).
+   *
+   * WAL + synchronous=NORMAL: durable enough for a cache (a crash loses at
+   * most one WAL frame — acceptable data loss for an L1.5 spill store).
+   */
+  private _initSqlite(): void {
+    if (!_SqliteDB) return;
+    try {
+      const dbPath = path.join(this.opts.dir, 'meta.db');
+      this._db = new _SqliteDB(dbPath);
+      this._db.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous  = NORMAL;
+        PRAGMA temp_store   = MEMORY;
+        CREATE TABLE IF NOT EXISTS meta (
+          key_hash   TEXT    PRIMARY KEY,
+          file_path  TEXT    NOT NULL,
+          expires_at INTEGER NOT NULL,
+          size       INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_expires ON meta (expires_at);
+      `);
+      this._stmtInsert = this._db.prepare(
+        'INSERT OR REPLACE INTO meta (key_hash, file_path, expires_at, size) VALUES (?,?,?,?)',
+      );
+      this._stmtSelect = this._db.prepare(
+        'SELECT file_path, expires_at FROM meta WHERE key_hash = ?',
+      );
+      this._stmtDelete = this._db.prepare('DELETE FROM meta WHERE key_hash = ?');
+      this._stmtExpire = this._db.prepare(
+        'SELECT key_hash, file_path, size FROM meta WHERE expires_at <= ?',
+      );
+      this._stmtDelExp = this._db.prepare('DELETE FROM meta WHERE expires_at <= ?');
+      this._stmtStats  = this._db.prepare(
+        'SELECT COUNT(*) AS cnt, COALESCE(SUM(size), 0) AS bytes FROM meta',
+      );
+      // Seed in-memory counters from the index — avoids startup walkCacheFiles().
+      const row = this._stmtStats.get() as { cnt: number; bytes: number };
+      this.fileCount      = row.cnt;
+      this.diskUsageBytes = row.bytes;
+      this.usageCounted   = true;
+      this.opts.logger.debug('DiskTier: SQLite index ready', { entries: row.cnt });
+    } catch (err) {
+      this._db = this._stmtInsert = this._stmtSelect = this._stmtDelete =
+        this._stmtExpire = this._stmtDelExp = this._stmtStats = null;
+      this.opts.logger.warn('DiskTier: SQLite init failed, using file-only mode', {
+        error: (err as Error).message,
+      });
     }
   }
 
   private ensureUsageCounted(): void {
     if (this.usageCounted) return;
     this.usageCounted = true;
+    // SQLite path: counts were already seeded in _initSqlite() — nothing more to do.
+    if (this._db) return;
     try {
       this.ensureDir();
       let total = 0;
@@ -283,10 +374,14 @@ export class DiskTier {
     try {
       await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
       await fs.promises.writeFile(filePath, final, { mode: 0o600 });
+      if (this._db) {
+        this._stmtInsert!.run(hash, filePath, entry.expiresAt, final.length);
+      }
       this.opts.logger.debug('DiskTier: entry saved', { key: key.slice(0, 50), bytes: final.length });
     } catch (err) {
       this.diskUsageBytes -= Math.min(this.diskUsageBytes, final.length); // rollback
       this.fileCount = Math.max(0, this.fileCount - 1);
+      if (this._db) try { this._stmtDelete!.run(hash); } catch { /* ok */ }
       this.opts.logger.debug('DiskTier: save failed', { key: key.slice(0, 50), error: (err as Error).message });
     }
   }
@@ -297,24 +392,45 @@ export class DiskTier {
     this.ensureDir();
     if (!this.dirReady) return null;
 
-    const hash     = this.keyToHash(key);
-    const filePath = this.findFilePath(hash);
-    if (!filePath) return null;
+    const hash = this.keyToHash(key);
+    let filePath: string | null;
+
+    if (this._db) {
+      // SQLite fast path: single B-tree lookup replaces readdirSync + filename scan.
+      const row = this._stmtSelect!.get(hash) as { file_path: string; expires_at: number } | undefined;
+      if (!row) return null;
+      if (row.expires_at <= Date.now()) {
+        this._stmtDelete!.run(hash);
+        try {
+          const sz = fs.statSync(row.file_path).size;
+          fs.unlinkSync(row.file_path);
+          this.diskUsageBytes -= Math.min(this.diskUsageBytes, sz);
+          this.fileCount = Math.max(0, this.fileCount - 1);
+        } catch { /* ok */ }
+        return null;
+      }
+      filePath = row.file_path;
+    } else {
+      filePath = this.findFilePath(hash);
+      if (!filePath) return null;
+    }
 
     try {
-      // V3 fast path: expiresAt is in the filename — avoid even opening the file
-      // when the entry is already known to be stale.
-      const filename = path.basename(filePath);
-      if (filename.length === 77 && filename[64] === '_') {
-        const expiresAt = parseInt(filename.slice(65), 16);
-        if (expiresAt <= Date.now()) {
-          try {
-            const sz = fs.statSync(filePath).size;
-            fs.unlinkSync(filePath);
-            this.diskUsageBytes -= Math.min(this.diskUsageBytes, sz);
-            this.fileCount = Math.max(0, this.fileCount - 1);
-          } catch { /* ok */ }
-          return null;
+      // V3 filename fast-path (file-only mode): expiresAt encoded in name avoids
+      // opening the file when the entry is already stale.
+      if (!this._db) {
+        const filename = path.basename(filePath);
+        if (filename.length === 77 && filename[64] === '_') {
+          const expiresAt = parseInt(filename.slice(65), 16);
+          if (expiresAt <= Date.now()) {
+            try {
+              const sz = fs.statSync(filePath).size;
+              fs.unlinkSync(filePath);
+              this.diskUsageBytes -= Math.min(this.diskUsageBytes, sz);
+              this.fileCount = Math.max(0, this.fileCount - 1);
+            } catch { /* ok */ }
+            return null;
+          }
         }
       }
 
@@ -322,12 +438,18 @@ export class DiskTier {
       if (stat.size > this.opts.entryMaxBytes) {
         fs.unlinkSync(filePath);
         this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
+        if (this._db) this._stmtDelete!.run(hash);
         return null;
       }
 
       const raw = fs.readFileSync(filePath);
       // Delete immediately — entry will be promoted back to L1
-      try { fs.unlinkSync(filePath); this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size); this.fileCount = Math.max(0, this.fileCount - 1); } catch { /* ok */ }
+      try {
+        fs.unlinkSync(filePath);
+        this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
+        this.fileCount = Math.max(0, this.fileCount - 1);
+      } catch { /* ok */ }
+      if (this._db) this._stmtDelete!.run(hash);
 
       let decrypted: Buffer;
       if (raw.length >= V2_HEADER_LEN && raw.subarray(0, 8).equals(DISK_MAGIC_V2)) {
@@ -350,6 +472,7 @@ export class DiskTier {
       this.opts.logger.debug('DiskTier: hit (→L1)', { key: key.slice(0, 50), ageMs: Date.now() - payload.writtenAt });
       return entry;
     } catch (err) {
+      if (this._db) try { this._stmtDelete!.run(hash); } catch { /* ok */ }
       this.opts.logger.debug('DiskTier: load failed', { key: key.slice(0, 50), error: (err as Error).message });
       return null;
     }
@@ -357,8 +480,15 @@ export class DiskTier {
 
   /** Explicitly delete a key from disk (cache invalidation). */
   delete(key: string): void {
-    const hash     = this.keyToHash(key);
-    const filePath = this.findFilePath(hash);
+    const hash = this.keyToHash(key);
+    let filePath: string | null;
+    if (this._db) {
+      const row = this._stmtSelect!.get(hash) as { file_path: string } | undefined;
+      filePath = row?.file_path ?? null;
+      this._stmtDelete!.run(hash);
+    } else {
+      filePath = this.findFilePath(hash);
+    }
     if (!filePath) return;
     try {
       const stat = fs.statSync(filePath);
@@ -372,6 +502,22 @@ export class DiskTier {
   purgeExpired(): number {
     this.ensureDir();
     if (!this.dirReady) return 0;
+
+    if (this._db) {
+      // SQLite fast path: one indexed query finds all expired rows.
+      const now     = Date.now();
+      const expired = this._stmtExpire!.all(now) as Array<{ key_hash: string; file_path: string; size: number }>;
+      for (const row of expired) {
+        try {
+          fs.unlinkSync(row.file_path);
+          this.diskUsageBytes -= Math.min(this.diskUsageBytes, row.size);
+          this.fileCount = Math.max(0, this.fileCount - 1);
+        } catch { /* already gone */ }
+      }
+      if (expired.length > 0) this._stmtDelExp!.run(now);
+      return expired.length;
+    }
+
     const now = Date.now();
     let purged = 0;
     // One reusable header buffer — avoids per-file allocation inside the V2 fallback loop.
@@ -442,22 +588,68 @@ export class DiskTier {
   }
 
   /**
-   * Purge expired entries from exactly one of the 256 subdirectory buckets, then
-   * advance the wheel pointer.  Call on a short recurring interval (e.g. 30 s) so
-   * the O(fileCount) work of a full purgeExpired() is spread over 256 ticks instead
-   * of landing as one large synchronous burst every 5 minutes.
+   * Purge expired entries.  Two modes depending on availability of SQLite:
    *
-   * V3 files: expiresAt is encoded in the filename — live entries skip with zero
-   * file I/O (just readdirSync + string parse).  Expired entries: statSync + unlinkSync.
+   * SQLite mode (Node 24 / Node 22 + --experimental-sqlite):
+   *   One indexed query (`WHERE expires_at <= now`) replaces the entire bucket
+   *   wheel.  All expired entries are found and deleted in a single pass — the
+   *   128-minute stagger is no longer necessary.  `_nextJanitorBucket` is still
+   *   incremented so tests that inspect the counter continue to work.
+   *
+   * File-only fallback:
+   *   Original staggered bucket wheel — purges exactly one of 256 subdirectory
+   *   buckets per call, spreading the O(fileCount) work across 256 ticks.
    *
    * Returns the number of entries deleted in this tick.
    */
   purgeNextBucket(): number {
     this.ensureDir();
     if (!this.dirReady) return 0;
-    const bucket = this._nextJanitorBucket.toString(16).padStart(2, '0');
+    // Always advance the pointer — preserves observable state for tests and
+    // metrics regardless of which code path runs below.
     this._nextJanitorBucket = (this._nextJanitorBucket + 1) % 256;
-    const bucketPath = path.join(this.opts.dir, bucket);
+
+    if (this._db) {
+      const now     = Date.now();
+      const expired = this._stmtExpire!.all(now) as Array<{ key_hash: string; file_path: string; size: number }>;
+      for (const row of expired) {
+        try {
+          fs.unlinkSync(row.file_path);
+          this.diskUsageBytes -= Math.min(this.diskUsageBytes, row.size);
+          this.fileCount = Math.max(0, this.fileCount - 1);
+        } catch { /* already gone */ }
+      }
+      if (expired.length > 0) this._stmtDelExp!.run(now);
+
+      // Belt-and-suspenders: scan one filesystem bucket for orphan files — files
+      // written to disk before a crash between writeFile() and the SQLite INSERT.
+      // V3 fast path: no file I/O for live entries (expiry is in the filename).
+      // Expired orphans are unlinked here; they are invisible to the SQLite query.
+      const orphanBucket  = (this._nextJanitorBucket - 1 + 256) % 256;
+      const orphanBucketP = path.join(this.opts.dir, orphanBucket.toString(16).padStart(2, '0'));
+      let orphanFiles: string[];
+      try { orphanFiles = fs.readdirSync(orphanBucketP); } catch { return expired.length; }
+      for (const file of orphanFiles) {
+        if (file.length === 77 && file[64] === '_') {
+          const expiresAt = parseInt(file.slice(65), 16);
+          if (expiresAt <= now) {
+            const fp = path.join(orphanBucketP, file);
+            try {
+              const sz = fs.statSync(fp).size;
+              fs.unlinkSync(fp);
+              this.diskUsageBytes -= Math.min(this.diskUsageBytes, sz);
+              this.fileCount = Math.max(0, this.fileCount - 1);
+            } catch { /* already gone */ }
+          }
+        }
+      }
+      return expired.length;
+    }
+
+    // ── File-only fallback: one-bucket scan ───────────────────────────────
+    const bucket     = (this._nextJanitorBucket - 1 + 256) % 256; // use the bucket we just advanced past
+    const bucketHex  = bucket.toString(16).padStart(2, '0');
+    const bucketPath = path.join(this.opts.dir, bucketHex);
     let files: string[];
     try { files = fs.readdirSync(bucketPath); } catch { return 0; }
     const now = Date.now();
@@ -544,11 +736,35 @@ export class DiskTier {
         cleared++;
       } catch { /* skip locked/gone */ }
     }
+    if (this._db) {
+      this._db.exec('DELETE FROM meta');
+      this.diskUsageBytes = 0;
+      this.fileCount      = 0;
+    }
     return cleared;
   }
 
   get stats(): { files: number; sizeKB: number; maxKB: number } {
-    // fileCount is maintained in-memory — O(1), no filesystem scan.
+    if (this._db) {
+      // Query the index for authoritative counts — O(1) SQLite aggregate.
+      const row = this._stmtStats!.get() as { cnt: number; bytes: number };
+      this.fileCount      = row.cnt;
+      this.diskUsageBytes = row.bytes;
+    }
     return { files: this.fileCount, sizeKB: Math.round(this.diskUsageBytes / 1024), maxKB: Math.round(this.opts.maxBytes / 1024) };
+  }
+
+  /** Whether a SQLite metadata index is active ('sqlite') or the disk is scanned directly ('file-only'). */
+  get indexMode(): 'sqlite' | 'file-only' {
+    return this._db ? 'sqlite' : 'file-only';
+  }
+
+  /** Release the SQLite connection (if open). Call during shutdown before deleting the cache directory. */
+  close(): void {
+    if (this._db) {
+      try { this._db.close(); } catch { /* ok */ }
+      this._db = this._stmtInsert = this._stmtSelect = this._stmtDelete =
+        this._stmtExpire = this._stmtDelExp = this._stmtStats = null;
+    }
   }
 }

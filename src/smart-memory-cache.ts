@@ -24,6 +24,10 @@ import { WasmBloomFilter } from './wasm/bloom-filter-wasm';
 
 /** Fraction of candidates evicted in one pass when a limit is exceeded */
 const EVICTION_BATCH_PERCENT = 0.2;
+/** Reservoir sample window for smartEvict() — Redis-style. */
+const EVICTION_SAMPLE = 16;
+/** Number of lowest-scored candidates evicted per smartEvict() call. */
+const EVICT_COUNT = Math.max(1, Math.ceil(EVICTION_SAMPLE * EVICTION_BATCH_PERCENT)); // 4
 
 // ─── Pure-JS Bloom filter fallback ───────────────────────────────────────────
 
@@ -242,12 +246,14 @@ function globMatch(pattern: string, key: string): boolean {
 // ─── SmartMemoryCache ─────────────────────────────────────────────────────────
 
 export interface SmartMemoryCacheOptions {
-  maxBytes:    number;
-  maxEntries:  number;
-  categories:  Record<string, CategoryLimit>;
-  diskSpill?:  (key: string, entry: SmartCacheEntry) => void | Promise<void>;
-  onEviction?: (key: string, reason: EvictionReason) => void;
-  logger:      ILogger;
+  maxBytes:          number;
+  maxEntries:        number;
+  categories:        Record<string, CategoryLimit>;
+  diskSpill?:        (key: string, entry: SmartCacheEntry) => void | Promise<void>;
+  onEviction?:       (key: string, reason: EvictionReason) => void;
+  logger:            ILogger;
+  /** Fraction of maxEntries / maxBytes at which proactive eviction fires (default 0.9). */
+  evictionWatermark?: number;
 }
 
 export class SmartMemoryCache {
@@ -270,6 +276,18 @@ export class SmartMemoryCache {
   private compressions          = 0;  private categoryHits          = new Map<string, number>();
   /** Counts every _delete() call — used to trigger bloom rebuild from ALL deletion paths. */
   private _bloomDirtyCount      = 0;
+
+  /**
+   * Pre-allocated eviction candidate pools — reused across every smartEvict() call to
+   * eliminate per-call heap pressure.  Each slot holds a mutable {key, score} record
+   * that is overwritten in-place rather than replaced with a new object literal.
+   * Safe because JS is single-threaded: smartEvict() completes synchronously before
+   * any other code can observe the pool state.
+   */
+  private readonly _evictPool:  Array<{ key: string; score: number }> =
+    Array.from({ length: EVICTION_SAMPLE }, () => ({ key: '', score: 0 }));
+  private readonly _evictGPool: Array<{ key: string; score: number }> =
+    Array.from({ length: EVICTION_SAMPLE }, () => ({ key: '', score: 0 }));
 
   constructor(opts: SmartMemoryCacheOptions, existing?: Map<string, SmartCacheEntry>) {
     this.opts             = opts;
@@ -342,8 +360,9 @@ export class SmartMemoryCache {
       // capacity become uncommon. Both dimensions are guarded so that
       // large-payload workloads (where maxBytes is the binding constraint)
       // benefit equally alongside entry-count-bound workloads.
-      const entryWatermark = this.cache.size      >= Math.floor(this.opts.maxEntries * 0.9);
-      const byteWatermark  = this.totalSize + neededSize >= Math.floor(this.opts.maxBytes  * 0.9);
+      const wm = this.opts.evictionWatermark ?? 0.9;
+      const entryWatermark = this.cache.size      >= Math.floor(this.opts.maxEntries * wm);
+      const byteWatermark  = this.totalSize + neededSize >= Math.floor(this.opts.maxBytes  * wm);
       if (entryWatermark || byteWatermark) {
         this.smartEvict(category, false);
       }
@@ -396,16 +415,15 @@ export class SmartMemoryCache {
 
   private smartEvict(targetCat: string, catOvf: boolean): void {
     const now    = Date.now();
-    const SAMPLE = 16; // Redis-style sample window
-    const EVICT  = Math.max(1, Math.ceil(SAMPLE * EVICTION_BATCH_PERCENT)); // ~4
-
-    const pool: Array<{ key: string; score: number }> = [];
+    const pool   = this._evictPool;
+    const gPool  = this._evictGPool;
+    let   poolLen = 0;
 
     if (catOvf) {
       // Phase 1 — O(catSize) category-local reservoir sample.
       // Uses the categoryKeys index to iterate only the overflowing category's keys,
       // avoiding an O(N) scan of the entire cache. Guarantees at least
-      // min(catSize, EVICT) entries from the overflowing category in the pool so
+      // min(catSize, EVICT_COUNT) entries from the overflowing category in the pool so
       // the priority score ordering is always deterministic in practice.
       const catKeySet = this.categoryKeys.get(targetCat);
       if (catKeySet) {
@@ -415,44 +433,59 @@ export class SmartMemoryCache {
           if (!entry || (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now)) continue;
           catSeen++;
           const s = this.score(entry, 100, now, key);
-          if (pool.length < EVICT) {
-            pool.push({ key, score: s });
+          if (poolLen < EVICT_COUNT) {
+            pool[poolLen].key = key; pool[poolLen].score = s; poolLen++;
           } else {
             const j = Math.floor(Math.random() * catSeen);
-            if (j < EVICT) pool[j] = { key, score: s };
+            if (j < EVICT_COUNT) { pool[j].key = key; pool[j].score = s; }
           }
         }
       }
     }
 
-    // Phase 2 — global reservoir sample fills remaining SAMPLE-pool.length slots.
-    // Skipped entirely when Phase 1 already collected a full EVICT-sized pool
-    // (the common catOvf case — overflowing categories always have ≥ EVICT entries).
+    // Phase 2 — global reservoir sample fills remaining EVICTION_SAMPLE-poolLen slots.
+    // Skipped entirely when Phase 1 already collected a full EVICT_COUNT-sized pool
+    // (the common catOvf case — overflowing categories always have ≥ EVICT_COUNT entries).
     // Also the sole phase when !catOvf (global over-capacity, no preferred category).
-    if (pool.length < EVICT) {
-      const remaining = SAMPLE - pool.length;
+    if (poolLen < EVICT_COUNT) {
+      const remaining = EVICTION_SAMPLE - poolLen;
       let globalSeen  = 0;
-      const globalPool: Array<{ key: string; score: number }> = [];
+      let gLen        = 0;
       for (const [key, entry] of this.cache) {
         if (entry.priority === 4 /* CRITICAL */ && entry.expiresAt > now) continue;
         if (catOvf && this.getCategory(key) === targetCat) continue; // already sampled above
         globalSeen++;
         const s = this.score(entry, 0, now, key);
-        if (globalPool.length < remaining) {
-          globalPool.push({ key, score: s });
+        if (gLen < remaining) {
+          gPool[gLen].key = key; gPool[gLen].score = s; gLen++;
         } else {
           const j = Math.floor(Math.random() * globalSeen);
-          if (j < remaining) globalPool[j] = { key, score: s };
+          if (j < remaining) { gPool[j].key = key; gPool[j].score = s; }
         }
       }
-      pool.push(...globalPool);
+      // Manual merge — no spread, no new array
+      for (let i = 0; i < gLen; i++) {
+        pool[poolLen].key = gPool[i].key; pool[poolLen].score = gPool[i].score; poolLen++;
+      }
     }
 
-    if (pool.length === 0) return;
+    if (poolLen === 0) return;
 
-    // Sort only the tiny merged pool (O(SAMPLE * log(SAMPLE)) ≈ 64 comparisons)
-    pool.sort((a, b) => a.score - b.score);
-    for (const { key } of pool.slice(0, EVICT)) {
+    // Insertion sort — O(poolLen²) but poolLen ≤ EVICTION_SAMPLE=16 (max 256 comparisons).
+    // Faster than Array.sort() at this scale: no comparator closure call overhead,
+    // no timsort startup, no allocation. Sorts in-place within the pre-allocated pool.
+    for (let i = 1; i < poolLen; i++) {
+      const sk = pool[i].key, ss = pool[i].score;
+      let j = i - 1;
+      while (j >= 0 && pool[j].score > ss) {
+        pool[j + 1].key = pool[j].key; pool[j + 1].score = pool[j].score; j--;
+      }
+      pool[j + 1].key = sk; pool[j + 1].score = ss;
+    }
+
+    const toEvict = Math.min(EVICT_COUNT, poolLen);
+    for (let i = 0; i < toEvict; i++) {
+      const key   = pool[i].key;
       const entry = this.cache.get(key);
       if (entry && this.opts.diskSpill) this.opts.diskSpill(key, entry); // L1.5 spill
       this._delete(key, 'capacity');

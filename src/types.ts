@@ -222,6 +222,19 @@ export interface CacheMetrics {
 
   l1:   { entries: number; sizeBytes: number; maxBytes: number };
   disk: { files: number; sizeKB: number; maxKB: number };
+
+  /** Adaptive TTL statistics — present only when `adaptiveTtl` is enabled */
+  adaptiveTtl?: {
+    enabled: true;
+    /** Number of unique keys currently tracked in the latency ring buffers */
+    trackedKeys: number;
+    /**
+     * Top-20 slowest keys by p95 fetch latency, sorted descending.
+     * Keys are shown without the instance namespace prefix.
+     * Only keys with ≥ 5 recorded samples appear here.
+     */
+    slowestKeys: Array<{ key: string; p95Ms: number; adaptedTtlSec: number }>;
+  };
 }
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -249,6 +262,12 @@ export interface CacheOptions {
   l1MaxBytes?: number;
   /** Max total entries in L1. Default: 2000 */
   l1MaxEntries?: number;
+  /**
+   * Fraction of `l1MaxEntries` / `l1MaxBytes` at which proactive eviction fires
+   * before the hard limit is reached. Range: 0–1. Default: 0.9.
+   * Lower (e.g. 0.8) reduces GC pressure at the cost of slightly more eviction work.
+   */
+  l1EvictionWatermark?: number;
   /**
    * Per-category limits keyed by the key prefix (e.g. `'org:'`).
    * Merged over the built-in defaults.
@@ -515,4 +534,65 @@ export interface CacheOptions {
    * frozen: process.env.NODE_ENV !== 'production'
    */
   frozen?: boolean;
+
+  // ── Adaptive TTL ──────────────────────────────────────────────────────────
+
+  /**
+   * When `true`, tricache tracks per-key fetch latency in a rolling ring buffer
+   * and automatically derives an optimal TTL from the p95 fetch duration:
+   *
+   * ```
+   * adaptedTtl = clamp(p95LatencyMs × adaptiveTtlMultiplier, adaptiveTtlMin, adaptiveTtlMax)
+   * ```
+   *
+   * The caller-supplied `ttlSeconds` is used until at least 5 samples are collected
+   * for a key, then the library takes over TTL management autonomously.
+   *
+   * Expensive keys (slow DB queries) get cached longer; cheap keys stay close to
+   * their base TTL. Callers no longer need to reason about individual TTL values.
+   *
+   * Default: `false`.
+   */
+  adaptiveTtl?: boolean;
+
+  /**
+   * Minimum TTL (seconds) the adaptive tuner will ever assign.
+   * Guards against extremely fast fetches producing near-zero TTLs.
+   * Default: `10`.
+   */
+  adaptiveTtlMin?: number;
+
+  /**
+   * Maximum TTL (seconds) the adaptive tuner will ever assign.
+   * Guards against pathologically slow fetches producing indefinite caching.
+   * Default: `86400` (24 hours).
+   */
+  adaptiveTtlMax?: number;
+
+  /**
+   * `p95FetchLatencyMs × adaptiveTtlMultiplier = adaptedTtlSeconds`.
+   *
+   * Intuition: a 200 ms p95 fetch with the default multiplier of 20 yields a
+   * 4-second TTL. A 2 000 ms fetch yields 40 seconds. Increase the multiplier
+   * if you want the cache to absorb more upstream pressure.
+   *
+   * Default: `20`.
+   */
+  adaptiveTtlMultiplier?: number;
+
+  /**
+   * Number of fetch duration samples kept per key in the ring buffer.
+   * Larger values smooth out latency spikes but use slightly more memory
+   * (~8 bytes × samples per tracked key).
+   * Default: `32`.
+   */
+  adaptiveTtlSamples?: number;
+
+  /**
+   * Maximum number of distinct keys tracked by the adaptive TTL system.
+   * When the cap is reached, the oldest-tracked key is evicted from the
+   * ring-buffer store to make room for the new key.
+   * Default: `5000`.
+   */
+  adaptiveTtlMaxKeys?: number;
 }

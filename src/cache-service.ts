@@ -20,6 +20,7 @@ import { Redis as RedisClient } from 'ioredis';
 import { pack, unpack } from 'msgpackr';
 import crypto from 'crypto';
 import os    from 'os';
+import v8    from 'node:v8';
 import fs    from 'fs';
 import path  from 'path';
 
@@ -124,6 +125,125 @@ function deepFreeze<T>(obj: T): T {
   return obj;
 }
 
+// ─── Adaptive TTL latency tracker ────────────────────────────────────────────
+
+/**
+ * Lightweight per-key fetch-latency ring buffer.
+ *
+ * Each key gets a `Float64Array` of `samples` slots written in round-robin
+ * order.  A separate `{ head, count }` object tracks the write pointer and
+ * how many slots have been filled so far.  Once a key has ≥ 5 samples the
+ * p95 percentile can be read back with `.p95(key)`.
+ *
+ * Total memory per key: 8 × samples bytes (Float64Array) + one small object.
+ * With defaults (32 samples, 5 000 keys): ~1.3 MB worst-case.
+ *
+ * Key eviction: the internal Map preserves insertion order.  When `maxKeys`
+ * is reached the oldest-inserted key is removed before the new one is added —
+ * no extra LRU bookkeeping required.
+ */
+/** Per-key metadata stored alongside each ring buffer. */
+interface LatencyMeta {
+  head:  number;   // ring-buffer write pointer
+  count: number;   // filled slots (≤ samples)
+  p95:   number;   // cached p95 value (valid when !dirty && count ≥ 5)
+  dirty: boolean;  // true when a new sample was written since last p95 computation
+}
+
+class LatencyTracker {
+  private readonly samples: number;
+  private readonly maxKeys: number;
+  private readonly bufs    = new Map<string, Float64Array>();
+  private readonly meta    = new Map<string, LatencyMeta>();
+  /** Shared sort buffer — safe to reuse because JS is single-threaded. */
+  private readonly scratch: Float64Array;
+
+  constructor(samples: number, maxKeys: number) {
+    this.samples = samples;
+    this.maxKeys = maxKeys;
+    this.scratch = new Float64Array(samples);
+  }
+
+  record(key: string, deltaMs: number): void {
+    let buf = this.bufs.get(key);
+    let m   = this.meta.get(key);
+    if (buf === undefined) {
+      if (this.bufs.size >= this.maxKeys) {
+        // Evict oldest key (Map insertion order)
+        const oldest = this.bufs.keys().next().value as string;
+        this.bufs.delete(oldest);
+        this.meta.delete(oldest);
+      }
+      buf = new Float64Array(this.samples);
+      m   = { head: 0, count: 0, p95: 0, dirty: false };
+      this.bufs.set(key, buf);
+      this.meta.set(key, m);
+    }
+    buf[m!.head] = deltaMs;
+    m!.head  = (m!.head + 1) % this.samples;
+    if (m!.count < this.samples) m!.count++;
+    m!.dirty = true; // new sample → cached p95 is stale
+  }
+
+  /**
+   * Recomputes the p95 for the given key into `m.p95` and clears `m.dirty`.
+   * Uses the shared scratch buffer — no heap allocation.
+   */
+  private _computeP95(buf: Float64Array, m: LatencyMeta): void {
+    const n = m.count;
+    this.scratch.set(buf.subarray(0, n));
+    const view = this.scratch.subarray(0, n);
+    view.sort(); // TypedArray numeric sort — no comparator needed
+    m.p95   = view[Math.ceil(n * 0.95) - 1];
+    m.dirty = false;
+  }
+
+  /**
+   * Returns the p95 fetch latency for `key` in milliseconds, or `null` when
+   * fewer than 5 samples have been collected (not enough data yet).
+   * Uses a dirty-flag cache — sort only runs when a new sample was recorded.
+   */
+  p95(key: string): number | null {
+    const buf = this.bufs.get(key);
+    const m   = this.meta.get(key);
+    if (!buf || !m || m.count < 5) return null;
+    if (m.dirty) this._computeP95(buf, m);
+    return m.p95;
+  }
+
+  get trackedKeys(): number { return this.bufs.size; }
+
+  /**
+   * Top-20 slowest keys by p95, sorted descending.
+   * Keys with < 5 samples are excluded (not enough data for a reliable p95).
+   *
+   * Only dirty keys (those with new samples since the last call) pay the sort
+   * cost. Keys whose p95 is already cached are O(1) reads — so repeated
+   * metrics() calls with no intervening fetches are essentially free.
+   */
+  snapshot(
+    prefixLen: number,
+    multiplierSec: number,
+    minMs: number,
+    maxMs: number,
+  ): Array<{ key: string; p95Ms: number; adaptedTtlSec: number }> {
+    const out: Array<{ key: string; p95Ms: number; adaptedTtlSec: number }> = [];
+    for (const [key, buf] of this.bufs) {
+      const m = this.meta.get(key)!;
+      if (m.count < 5) continue;
+      if (m.dirty) this._computeP95(buf, m); // sort only when new sample arrived
+      const p95       = m.p95;
+      const adaptedMs = Math.max(minMs, Math.min(maxMs, Math.round(p95 * multiplierSec * 1_000)));
+      out.push({
+        key:           prefixLen > 0 ? key.slice(prefixLen) : key,
+        p95Ms:         Math.round(p95),
+        adaptedTtlSec: Math.round(adaptedMs / 1_000),
+      });
+    }
+    return out.sort((a, b) => b.p95Ms - a.p95Ms).slice(0, 20);
+  }
+}
+
 function inferPriority(cacheKey: string): CachePriority {
   if (cacheKey.includes('auth:') || cacheKey.includes('session:'))                                   return CachePriority.CRITICAL;
   if (cacheKey.includes('user:') || cacheKey.includes('org:') || cacheKey.includes('profile:'))      return CachePriority.HIGH;
@@ -159,6 +279,7 @@ export class CacheService {
     staleIfError: number;
     l2WriteMode: 'read-write' | 'read-only';
     instanceName: string;
+    l1EvictionWatermark: number;
     ttlJitterFactor: number;
     tracer: ICacheTracer | undefined;
     notFoundTtl: number;
@@ -166,6 +287,10 @@ export class CacheService {
     onHit: ((key: string, tier: 'l1' | 'disk' | 'l2') => void) | undefined;
     onMiss: ((key: string) => void) | undefined;
     frozen: boolean;
+    adaptiveTtl: boolean;
+    adaptiveTtlMinMs: number;
+    adaptiveTtlMaxMs: number;
+    adaptiveTtlMultiplier: number;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -191,6 +316,7 @@ export class CacheService {
   private oomInterval:         ReturnType<typeof setInterval> | null = null;
   private metricsInterval:     ReturnType<typeof setInterval> | null = null;
   private _shutdownHandler:    (() => void) | null = null;
+  private latencyTracker: LatencyTracker | null = null;
   private readonly instanceId:       string;
   private readonly backplaneChannel: string;
   private subClient:           RedisClient | null = null;
@@ -270,6 +396,7 @@ export class CacheService {
       staleIfError:             options.staleIfError       ?? 0,
       l2WriteMode:              options.l2WriteMode        ?? 'read-write',
       instanceName:             options.instanceName       ?? '',
+      l1EvictionWatermark:      Math.min(Math.max(options.l1EvictionWatermark ?? 0.9, 0), 1),
       ttlJitterFactor:          Math.min(Math.max(options.ttlJitterFactor ?? 0, 0), 1),
       tracer:                   options.tracer,
       notFoundTtl:              options.notFoundTtl ?? 0,
@@ -277,12 +404,23 @@ export class CacheService {
       onHit:                    options.onHit,
       onMiss:                   options.onMiss,
       frozen:                   options.frozen ?? false,
+      adaptiveTtl:              options.adaptiveTtl ?? false,
+      adaptiveTtlMinMs:         (options.adaptiveTtlMin ?? 10)     * 1_000,
+      adaptiveTtlMaxMs:         (options.adaptiveTtlMax ?? 86_400) * 1_000,
+      adaptiveTtlMultiplier:    options.adaptiveTtlMultiplier ?? 20,
     };
 
     // Circuit breaker for L2 Redis
     const cbThreshold  = options.l2CircuitBreakerThreshold  ?? 5;
     const cbCooldownMs = options.l2CircuitBreakerCooldownMs ?? 30_000;
     this.cb = new L2CircuitBreaker(cbThreshold, cbCooldownMs);
+
+    // Adaptive TTL latency tracker (only allocated when the feature is enabled)
+    if (this.opts.adaptiveTtl) {
+      const samples = options.adaptiveTtlSamples ?? 32;
+      const maxKeys = options.adaptiveTtlMaxKeys ?? 5_000;
+      this.latencyTracker = new LatencyTracker(samples, maxKeys);
+    }
 
     // L1.5 disk tier
     this.disk = new DiskTier({
@@ -302,6 +440,7 @@ export class CacheService {
       maxBytes:   this.opts.l1MaxBytes,
       maxEntries: this.opts.l1MaxEntries,
       categories: this.opts.categoryLimits,
+      evictionWatermark: this.opts.l1EvictionWatermark,
       diskSpill: (key: string, entry: SmartCacheEntry) => {
         // Defer disk.save() entirely to the next event-loop tick so the synchronous
         // preamble inside save() (SHA-256 keyToPath + msgpackr pack) does not block
@@ -345,8 +484,8 @@ export class CacheService {
     // OOM protection: evict coldest L1 entries when heap pressure rises
     if (this.opts.oomProtection) {
       this.oomInterval = setInterval(() => {
-        const mem  = process.memoryUsage();
-        const used = mem.heapUsed / mem.heapTotal;
+        const heap = v8.getHeapStatistics();
+        const used = heap.used_heap_size / heap.heap_size_limit;
         if (used >= this.opts.oomHeapThreshold) {
           const evicted = this.l1.evictPercentage(this.opts.oomEvictPercent);
           this.counters.oomEvictions++;
@@ -700,13 +839,25 @@ export class CacheService {
     const k = this.nk(cacheKey); // namespaced key used for all storage
     this.counters.gets++;
 
+    // Normalize all opts fields to plain locals once. Every opts.XXX read
+    // elsewhere in this function would hit a polymorphic IC when callers pass
+    // different option shapes: {}, { swr }, { refreshAhead }, { tags }, etc.
+    // Reading everything here collapses all downstream accesses to fast
+    // monomorphic local-variable reads regardless of call-site variety.
+    const optSwr          = opts.swr          ?? 0;
+    const optPriority     = opts.priority;
+    const optRefreshAhead = opts.refreshAhead;
+    const optXfetchBeta   = opts.xfetchBeta;
+    const optNotFoundTtl  = opts.notFoundTtl;
+    const optTags         = opts.tags;
+
     // L1: in-memory (fastest path)
     const l1Hit = this.l1.get(k);
     if (l1Hit !== null) {
       if (l1Hit.isStale) {
-        const swrGraceMs = (opts.swr ?? 0) * 1_000;
+        const swrGraceMs = optSwr * 1_000;
         if (swrGraceMs > 0 && !this.revalidating.has(k)) {
-          const priority = opts.priority ?? inferPriority(cacheKey);
+          const priority = optPriority ?? inferPriority(cacheKey);
           this.revalidating.add(k);
           void this._revalidate(k, fetchFn, ttlSeconds * 1_000, swrGraceMs, priority);
           this.counters.swrRevalidations++;
@@ -719,20 +870,21 @@ export class CacheService {
         // Refresh-ahead and XFetch: proactively recompute a fresh entry before it expires.
         // l1Hit already carries expiresAt/ttlMs/delta — no second Map lookup needed.
         // Check opts first — pointless work when neither feature is configured.
-        if (opts.refreshAhead || opts.xfetchBeta) {
+        // Local aliases for the opts fields already normalised at function entry.
+        const ra = optRefreshAhead;
+        const xb = optXfetchBeta;
+        if (ra || xb) {
           // Reuse the timestamp already captured by l1.get() — avoids a second Date.now() syscall.
           const now       = l1Hit.fetchedAt ?? Date.now();
           const remaining = l1Hit.expiresAt - now;
           const entryTtl  = l1Hit.ttlMs ?? ttlSeconds * 1_000;
 
-          const shouldRefreshAhead = !!opts.refreshAhead
-            ? remaining <= entryTtl * (1 - opts.refreshAhead)
-            : false;
+          const shouldRefreshAhead = ra ? remaining <= entryTtl * (1 - ra) : false;
 
           // XFetch: fire with probability proportional to recompute cost (delta) vs. remaining TTL
           // Formula: fire when remaining <= delta * beta * -ln(U), U ~ uniform(0,1)
-          const shouldXFetch = !!opts.xfetchBeta && l1Hit.delta != null
-            ? remaining <= l1Hit.delta * opts.xfetchBeta * -Math.log(Math.random())
+          const shouldXFetch = xb && l1Hit.delta != null
+            ? remaining <= l1Hit.delta * xb * -Math.log(Math.random())
             : false;
 
           // Set.has() deferred to here — the common case (fresh key, threshold not crossed)
@@ -740,9 +892,9 @@ export class CacheService {
           if ((shouldRefreshAhead || shouldXFetch) && !this.revalidating.has(k)) {
             // Defer inferPriority until we actually need it — avoids 3× string.includes()
             // scans on every warm hit when the threshold check is false (the common case).
-            const priority = opts.priority ?? inferPriority(cacheKey);
+            const priority = optPriority ?? inferPriority(cacheKey);
             this.revalidating.add(k);
-            void this._revalidate(k, fetchFn, entryTtl, (opts.swr ?? 0) * 1_000, priority);
+            void this._revalidate(k, fetchFn, entryTtl, optSwr * 1_000, priority);
             this.counters.swrRevalidations++;
             this.logger.debug(
               shouldXFetch ? 'XFetch: proactive background recompute' : 'Refresh-ahead: proactive background recompute',
@@ -759,8 +911,8 @@ export class CacheService {
     }
 
     const ttlMs      = this._jitterTtl(ttlSeconds * 1_000);
-    const swrGraceMs = (opts.swr ?? 0) * 1_000;
-    const priority   = opts.priority ?? inferPriority(cacheKey);
+    const swrGraceMs = optSwr * 1_000;
+    const priority   = optPriority ?? inferPriority(cacheKey);
 
     // L2: Redis (distributed, production-only by default)
     if (!this._redisDisabled) {
@@ -823,14 +975,29 @@ export class CacheService {
         const delta       = Date.now() - fetchStart;
 
         // Negative caching: null/undefined results get their own (shorter) TTL
-        const notFoundTtlMs = (opts.notFoundTtl ?? this.opts.notFoundTtl) * 1_000;
-        const effectiveTtl  = (data == null && notFoundTtlMs > 0) ? notFoundTtlMs : ttlMs;
+        const notFoundTtlMs = (optNotFoundTtl ?? this.opts.notFoundTtl) * 1_000;
+        let effectiveTtl  = (data == null && notFoundTtlMs > 0) ? notFoundTtlMs : ttlMs;
+
+        // Adaptive TTL: record this fetch duration and override the caller-supplied
+        // TTL once ≥ 5 samples are available for the key.
+        // Skipped for negative-cache (null/undefined) results — those use notFoundTtl.
+        if (this.latencyTracker && data != null) {
+          this.latencyTracker.record(k, delta);
+          const p95 = this.latencyTracker.p95(k);
+          if (p95 !== null) {
+            const adaptedMs = Math.round(p95 * this.opts.adaptiveTtlMultiplier * 1_000);
+            effectiveTtl = Math.max(
+              this.opts.adaptiveTtlMinMs,
+              Math.min(this.opts.adaptiveTtlMaxMs, adaptedMs),
+            );
+          }
+        }
 
         const staleAt  = swrGraceMs > 0 ? Date.now() + effectiveTtl : undefined;
         const storeTtl = swrGraceMs > 0 ? effectiveTtl + swrGraceMs : effectiveTtl;
 
         this.l1.set(k, data, storeTtl, priority, staleAt, delta);
-        if (opts.tags?.length) await this._registerTags(k, opts.tags, Math.ceil(effectiveTtl / 1_000));
+        if (optTags?.length) await this._registerTags(k, optTags, Math.ceil(effectiveTtl / 1_000));
 
         if (!this._redisDisabled) {
           try {
@@ -871,6 +1038,10 @@ export class CacheService {
       const data       = await fetchFn();
       const delta      = Date.now() - fetchStart;
       const staleAt    = Date.now() + ttlMs;
+
+      // Keep the latency tracker current during SWR background revalidations too
+      if (this.latencyTracker && data != null) this.latencyTracker.record(cacheKey, delta);
+
       this.l1.set(cacheKey, data, ttlMs + swrGraceMs, priority, staleAt, delta);
 
       if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
@@ -1717,6 +1888,18 @@ export class CacheService {
         maxBytes:  this.opts.l1MaxBytes,
       },
       disk: this.disk.stats,
+      ...(this.latencyTracker && {
+        adaptiveTtl: {
+          enabled: true as const,
+          trackedKeys: this.latencyTracker.trackedKeys,
+          slowestKeys: this.latencyTracker.snapshot(
+            this._namespace ? this._namespace.length + 1 : 0, // strip "namespace:" prefix
+            this.opts.adaptiveTtlMultiplier,
+            this.opts.adaptiveTtlMinMs,
+            this.opts.adaptiveTtlMaxMs,
+          ),
+        },
+      }),
     };
   }
 
@@ -1802,6 +1985,7 @@ export class CacheService {
       try { await this.redis.disconnect(); } catch { /* ok */ }
       this.redis = null;
     }
+    this.disk.close();
   }
 
 }
