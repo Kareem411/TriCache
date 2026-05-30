@@ -46,9 +46,13 @@ try {
     // Compiled output present (dist/ after tsup, or src/ after manual compile)
     _workerFile = jsPath;
   } else if (existsSync(tsPath)) {
-    // Source-only environment (Vitest, tsx dev runner) — run via tsx loader
+    // Source-only environment (Vitest, tsx dev runner) — run via tsx loader.
+    // Use '--import tsx' (not 'tsx/esm') so that tsx registers both CJS and ESM
+    // hooks, giving it full control over .js → .ts extension remapping for
+    // sub-imports (encryption.js → encryption.ts, etc.).  tsx/esm alone is
+    // unreliable for this inside worker threads on Node 22.
     _workerFile    = tsPath;
-    _workerExecArgv = ['--import', 'tsx/esm'];
+    _workerExecArgv = ['--import', 'tsx'];
   } else {
     _workerFile = jsPath; // will fail at runtime → pool marks itself unavailable
   }
