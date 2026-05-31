@@ -17,7 +17,6 @@
 import fs                from 'fs';
 import path              from 'path';
 import crypto            from 'crypto';
-import { createRequire } from 'module';
 import { pack, unpack }  from 'msgpackr';
 import { DiskCacheEntry, ILogger } from './types.js';
 
@@ -37,8 +36,11 @@ type _SqliteDB = {
 };
 let _SqliteDB: (new (p: string) => _SqliteDB) | null = null;
 try {
-  const _req = createRequire(import.meta.url);
-  _SqliteDB = (_req('node:sqlite') as { DatabaseSync: new (p: string) => _SqliteDB }).DatabaseSync;
+  // process.getBuiltinModule is available in Node >= 22.3.0 (within our >=22.13.0 engine
+  // requirement). It's synchronous and does not require the esbuild __require shim.
+  const sqlite = (process as unknown as { getBuiltinModule(m: string): unknown })
+    .getBuiltinModule('node:sqlite') as { DatabaseSync: new (p: string) => _SqliteDB } | undefined;
+  _SqliteDB = sqlite?.DatabaseSync ?? null;
 } catch { /* node:sqlite unavailable — file-only mode */ }
 // ── Encryption (self-contained to avoid circular import) ─────────────────────
 

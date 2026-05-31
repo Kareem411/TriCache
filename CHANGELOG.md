@@ -5,7 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.6.4] — 2026-05-31
+## [0.6.5] — 2026-05-31
+
+### Fixed
+
+- **Turbopack / Next.js 16 compatibility** — Two changes eliminate the `"Specified module format (CommonJs) is not matching EcmaScript Modules"` error seen when using tricache in Next.js 16 apps (which default to Turbopack for `next build`):
+
+  1. **Removed `.d.cts` declaration files from the published package.** tsup auto-generated `dist/index.d.cts` and `dist/serialize-worker.d.cts` as CJS-type sidecars. Turbopack discovers these files through its CJS sidecar resolution path for packages that expose both `import` and `require` export conditions, then attempts to process them as runtime JavaScript — triggering a format-mismatch error because they contain ESM `export {}` syntax. Since the exports map already has an explicit `"types": "./dist/index.d.ts"` condition (which TypeScript resolves before any sidecar), the `.d.cts` files were redundant. A `postbuild` step now removes them after every build.
+
+  2. **Eliminated the `__require` shim from the shared ESM chunk.** `worker-pool.ts` contained a raw `require('os')` call inside `availableCpus()`. In an ESM build, tsup/esbuild replaces raw `require()` calls with a `__require` polyfill and places it in the shared chunk (`chunk-*.js`), making that chunk a hybrid file (CJS `var __require = ...` + ESM `export {}`). The polyfill is now removed: `require('os')` is replaced with a top-level static `import os from 'os'`, which is safe because the `engines` field already requires Node ≥ 22.13.0 where `os.availableParallelism()` is always present.
+
+  3. **Replaced `createRequire` with `process.getBuiltinModule`** in `disk-tier.ts`. The optional `node:sqlite` bootstrap used `createRequire(import.meta.url)` to load `node:sqlite` synchronously. esbuild transforms this into the same `__require` shim. The replacement uses `process.getBuiltinModule('node:sqlite')`, which is available in Node ≥ 22.3.0 (within the ≥ 22.13.0 requirement), is synchronous, and requires no shim.
+
+
 
 ### Fixed
 

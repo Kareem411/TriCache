@@ -1,6 +1,6 @@
 {
   "name": "tricache",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "description": "Three-tier Node.js cache: L1 smart RAM (adaptive LFU/LRU + Count-Min Sketch) → L1.5 NVMe disk spill → L2 Redis/Valkey. Includes AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, and thundering-herd prevention.",
   "keywords": [
     "cache",
@@ -38,6 +38,7 @@
   ],
   "scripts": {
     "build": "tsup src/index.ts src/serialize-worker.ts --format esm,cjs --dts --clean",
+    "postbuild": "node --input-type=module -e \"import{rmSync}from'fs';['dist/index.d.cts','dist/serialize-worker.d.cts'].forEach(f=>rmSync(f,{force:true}));\"",
     "dev": "tsup src/index.ts src/serialize-worker.ts --format esm,cjs --dts --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

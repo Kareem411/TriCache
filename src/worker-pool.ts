@@ -26,6 +26,7 @@
 import { Worker } from 'worker_threads';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import os from 'os';
 import type { EncryptionMode } from './encryption.js';
 
 // Locate the serialize-worker entry point.
@@ -179,12 +180,6 @@ export class WorkerPool {
 }
 
 function availableCpus(): number {
-  try {
-    // Node.js 18.14+ provides `availableParallelism`; fall back to os.cpus().
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const os = require('os') as typeof import('os');
-    return (os as unknown as { availableParallelism?: () => number }).availableParallelism?.() ?? os.cpus().length;
-  } catch {
-    return 2;
-  }
+  // Node >= 22.13.0 (engines constraint) always has availableParallelism.
+  return os.availableParallelism?.() ?? os.cpus().length;
 }
