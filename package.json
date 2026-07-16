@@ -46,8 +46,8 @@
     "bench": "node --expose-gc --import tsx/esm bench/benchmark.ts"
   },
   "dependencies": {
-    "ioredis": "^5.11.0",
-    "msgpackr": "^2.0.2"
+    "ioredis": "5.11.1",
+    "msgpackr": "2.0.4"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

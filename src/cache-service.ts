@@ -512,7 +512,7 @@ export class CacheService {
       maxBytes:          this.opts.diskMaxBytes,
       entryMaxBytes:     this.opts.diskEntryMaxBytes,
       forbiddenPrefixes: forbiddenPrefixes,
-      encryptionKey:     this.enc.isEnabled ? (this.enc as unknown as { _key: Buffer })['_key'] : null,
+      encryption:       this.enc.isEnabled ? this.enc : null,
       logger,
     });
 
@@ -554,17 +554,12 @@ export class CacheService {
     // ── Fix 1: Worker thread pool for off-main-thread AES-GCM ────────────────
     if (this.opts.workerThreads && this.enc.isEnabled) {
       try {
-        const encRef = this.enc as unknown as {
-          _key: Buffer | null;
-          _mode: string;
-          _prevKey: Buffer | null;
-          _prevMode: string;
-        };
+        const encRef = this.enc.toWorkerInit();
         this._workerPool = new WorkerPool({
-          keyBase64:     encRef._key ? encRef._key.toString('base64') : '',
-          mode:          encRef._mode as never,
-          prevKeyBase64: encRef._prevKey ? encRef._prevKey.toString('base64') : undefined,
-          prevMode:      encRef._prevMode as never,
+          keyBase64:     encRef.keyBase64,
+          mode:          encRef.mode as never,
+          prevKeyBase64: encRef.prevKeyBase64,
+          prevMode:      encRef.prevMode as never,
           size:          this.opts.workerPoolSize || undefined,
         });
         if (this._workerPool.isAvailable) {

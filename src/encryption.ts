@@ -228,6 +228,26 @@ export class CacheEncryption {
 
   get isEnabled(): boolean { return this._key !== null; }
 
+  /**
+   * Snapshot the key material needed to spin up an off-main-thread worker pool.
+   * Replaces the previously-used `as unknown as { _key, _mode, … }` private-field
+   * cast in cache-service.ts — the worker pool reads these via this accessor
+   * instead of reaching into underscore-prefixed internals.
+   */
+  toWorkerInit(): {
+    keyBase64:     string;
+    mode:          EncryptionMode;
+    prevKeyBase64: string | undefined;
+    prevMode:      EncryptionMode;
+  } {
+    return {
+      keyBase64:     this._key ? this._key.toString('base64') : '',
+      mode:          this._mode,
+      prevKeyBase64: this._prevKey ? this._prevKey.toString('base64') : undefined,
+      prevMode:      this._prevMode,
+    };
+  }
+
   // ── String (Redis) ────────────────────────────────────────────────────────
 
   /**
@@ -273,18 +293,18 @@ export class CacheEncryption {
    */
   decrypt(value: string): string {
     try {
-      return this._decryptWithKey(value, this._key, this._keyObj, this._mode);
+      return this._decryptWithKey(value, this._key, this._keyObj);
     } catch (primaryErr) {
       if (this._prevKey) {
         try {
-          return this._decryptWithKey(value, this._prevKey, this._prevKeyObj, this._prevMode);
+          return this._decryptWithKey(value, this._prevKey, this._prevKeyObj);
         } catch { /* ignore — fall through to re-throw primary */ }
       }
       throw primaryErr;
     }
   }
 
-  private _decryptWithKey(value: string, key: Buffer | null, keyObj: KeyObject | null, mode: EncryptionMode): string {
+  private _decryptWithKey(value: string, key: Buffer | null, keyObj: KeyObject | null): string {
     if (value.startsWith(PREFIX_XOR)) {
       if (!key) throw new Error('Cannot decrypt: encryption key is not set');
       // WARNING: XOR is NOT cryptographic — obfuscation only.
@@ -321,7 +341,6 @@ export class CacheEncryption {
     const plain = d.update(ct);  // GCM: final() emits no bytes
     d.final();                   // verifies auth tag — throws on tamper
     return plain.toString('utf8');
-    void mode; void key; // mode and raw key used implicitly (mode via prefix; key via keyObj for AES, directly for XOR)
   }
 
   // ── Buffer (disk / snapshot) ──────────────────────────────────────────────

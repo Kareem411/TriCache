@@ -19,6 +19,7 @@ import path              from 'path';
 import crypto            from 'crypto';
 import { pack, unpack }  from 'msgpackr';
 import { DiskCacheEntry, ILogger } from './types.js';
+import { CacheEncryption }        from './encryption.js';
 
 // ── node:sqlite lazy bootstrap ────────────────────────────────────────────────
 // Stable in Node 24; experimental (needs --experimental-sqlite) in Node 22.
@@ -42,11 +43,12 @@ try {
     .getBuiltinModule('node:sqlite') as { DatabaseSync: new (p: string) => _SqliteDB } | undefined;
   _SqliteDB = sqlite?.DatabaseSync ?? null;
 } catch { /* node:sqlite unavailable — file-only mode */ }
-// ── Encryption (self-contained to avoid circular import) ─────────────────────
-
-const AES_ALGO  = 'aes-256-gcm' as const;
-const IV_BYTES  = 12;
-const TAG_BYTES = 16;
+// ── Encryption (delegates to CacheEncryption — mode-aware, no reimplementation) ──
+// DiskTier keeps its own V2 envelope (magic | plaintext expiresAt | payload) but
+// delegates the payload cipher to CacheEncryption, which already supports all four
+// modes (aes-256-gcm, aes-128-gcm, aes-128-ctr, xor) and is the single source of
+// truth for the on-disk binary format. This avoids a hardcoded aes-256-gcm that
+// threw (and silently no-op'd the disk tier) for any non-default mode.
 const DISK_MAGIC    = Buffer.from([0x44, 0x54, 0x49, 0x45, 0x52, 0x56, 0x31, 0x00]); // "DTIERV1\0"
 /**
  * V2 file format — expiresAt stored in plaintext outside the ciphertext so the
@@ -75,7 +77,10 @@ export interface DiskTierOptions {
   maxBytes:         number;
   entryMaxBytes:    number;
   forbiddenPrefixes: readonly string[];
-  encryptionKey?:   Buffer | null;
+  /** Mode-aware encryption instance. When set, disk files are encrypted with the
+   *  same algorithm as L2/Redis (aes-256-gcm, aes-128-gcm, aes-128-ctr, or xor).
+   *  When null, files are written unencrypted. Pass `cache.encryption` here. */
+  encryption?:      CacheEncryption | null;
   logger:           ILogger;
 }
 
@@ -261,57 +266,37 @@ export class DiskTier {
   }
 
   private encrypt(data: Buffer): Buffer {
-    const key = this.opts.encryptionKey;
-    if (!key) return data;
-    const iv  = crypto.randomBytes(IV_BYTES);
-    const c   = crypto.createCipheriv(AES_ALGO, key, iv);
-    const enc = Buffer.concat([c.update(data), c.final()]);
-    const tag = c.getAuthTag();
-    return Buffer.concat([DISK_MAGIC, iv, tag, enc]);
+    if (!this.opts.encryption) return data;
+    // V1 envelope: DISK_MAGIC prefix wrapping the mode-aware CacheEncryption blob.
+    return Buffer.concat([DISK_MAGIC, this.opts.encryption.encryptBuffer(data)]);
   }
 
   private decrypt(data: Buffer): Buffer {
     const mLen = DISK_MAGIC.length;
     if (data.length < mLen || !data.subarray(0, mLen).equals(DISK_MAGIC)) return data;
-    const key = this.opts.encryptionKey;
-    if (!key) throw new Error('DiskTier: entry is encrypted but no key is set');
-    const iv  = data.subarray(mLen, mLen + IV_BYTES);
-    const tag = data.subarray(mLen + IV_BYTES, mLen + IV_BYTES + TAG_BYTES);
-    const ct  = data.subarray(mLen + IV_BYTES + TAG_BYTES);
-    const d   = crypto.createDecipheriv(AES_ALGO, key, iv);
-    d.setAuthTag(tag);
-    return Buffer.concat([d.update(ct), d.final()]);
+    if (!this.opts.encryption) throw new Error('DiskTier: entry is encrypted but no encryption configured');
+    return this.opts.encryption.decryptBuffer(data.subarray(mLen));
   }
 
   /**
-   * V2 encryption — returns IV+TAG+ciphertext (no magic prefix; magic lives in
-   * the outer 16-byte header alongside the plaintext expiresAt).
-   * Returns the buffer unchanged when no encryption key is configured.
+   * V2 encryption — returns the mode-aware encrypted payload (no magic prefix; the
+   * magic + plaintext expiresAt live in the outer 16-byte header written by `save`).
+   * Returns the buffer unchanged when no encryption instance is configured.
    */
   private encryptV2(data: Buffer): Buffer {
-    const key = this.opts.encryptionKey;
-    if (!key) return data;
-    const iv  = crypto.randomBytes(IV_BYTES);
-    const c   = crypto.createCipheriv(AES_ALGO, key, iv);
-    const enc = Buffer.concat([c.update(data), c.final()]);
-    const tag = c.getAuthTag();
-    return Buffer.concat([iv, tag, enc]);
+    if (!this.opts.encryption) return data;
+    return this.opts.encryption.encryptBuffer(data);
   }
 
   /**
    * V2 decryption — inner payload after stripping the 16-byte header.
-   * When a key is configured the format is IV(12)+TAG(16)+ciphertext;
-   * without a key the payload is raw msgpack.
+   * When an encryption instance is configured the format is the mode-aware
+   * CacheEncryption blob (IV|TAG|CT for GCM, IV|CT for CTR, key⊕data for XOR);
+   * without one the payload is raw msgpack.
    */
   private decryptV2(inner: Buffer): Buffer {
-    const key = this.opts.encryptionKey;
-    if (!key) return inner;
-    const iv  = inner.subarray(0, IV_BYTES);
-    const tag = inner.subarray(IV_BYTES, IV_BYTES + TAG_BYTES);
-    const ct  = inner.subarray(IV_BYTES + TAG_BYTES);
-    const d   = crypto.createDecipheriv(AES_ALGO, key, iv);
-    d.setAuthTag(tag);
-    return Buffer.concat([d.update(ct), d.final()]);
+    if (!this.opts.encryption) return inner;
+    return this.opts.encryption.decryptBuffer(inner);
   }
 
   // ── Public API ────────────────────────────────────────────────────────────

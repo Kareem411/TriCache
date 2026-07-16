@@ -363,8 +363,8 @@ export class SmartMemoryCache {
     const lim    = this.getCategoryLimit(category);
     const catCnt = this.categoryCount.get(category) ?? 0;
     const catSz  = this.categorySize.get(category)  ?? 0;
-    const catOvf = catCnt >= lim.maxEntries || catSz + neededSize > lim.maxSizeBytes;
-    const glbOvf = this.cache.size >= this.opts.maxEntries || this.totalSize + neededSize > this.opts.maxBytes;
+    let   catOvf = catCnt >= lim.maxEntries || catSz + neededSize > lim.maxSizeBytes;
+    let   glbOvf = this.cache.size >= this.opts.maxEntries || this.totalSize + neededSize > this.opts.maxBytes;
     if (!catOvf && !glbOvf) {
       // Proactive watermark: when either the global entry count OR total byte
       // usage crosses 90 % of its configured ceiling while there is still
@@ -381,7 +381,23 @@ export class SmartMemoryCache {
       }
       return;
     }
-    this.smartEvict(category, catOvf);
+    // Hard overflow: evict until back under BOTH the category and global limits.
+    // A single smartEvict() pass removes at most EVICT_COUNT entries, which is not
+    // enough when one set() pushes the cache far past its ceiling (e.g. a large
+    // entry that itself dominates the byte budget). Loop until the overflow clears,
+    // bounded by MAX_EVICT_PASSES so a pathological key (larger than the limit
+    // cannot be evicted to fit itself) cannot spin forever.
+    const MAX_EVICT_PASSES = 64;
+    let passes = 0;
+    do {
+      this.smartEvict(category, catOvf);
+      const lim2    = this.getCategoryLimit(category);
+      const catCnt2 = this.categoryCount.get(category) ?? 0;
+      const catSz2  = this.categorySize.get(category)  ?? 0;
+      catOvf = catCnt2 >= lim2.maxEntries || catSz2 + neededSize > lim2.maxSizeBytes;
+      glbOvf = this.cache.size >= this.opts.maxEntries || this.totalSize + neededSize > this.opts.maxBytes;
+      passes++;
+    } while ((catOvf || glbOvf) && passes < MAX_EVICT_PASSES);
   }
 
   private score(entry: SmartCacheEntry, catBonus: number, now: number, key: string): number {
