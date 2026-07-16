@@ -862,6 +862,24 @@ The 562-byte WASM binary is inlined as Base64 — zero filesystem access at runt
 
 ---
 
+## 🔬 High-Performance Architecture & Memory Hygiene
+
+TriCache is engineered for low-latency, high-throughput environments where garbage collection (GC) pauses and main-thread blocking must be minimized. The codebase employs several advanced V8 and hardware-aware optimizations:
+
+### ⚡ Performance & Memory Hygiene
+- **Zero-Allocation Hot Paths:** To eliminate object allocation thrashing on hot L1 reads, TriCache reuses a single, pre-allocated static `_hit` object literal in [smart-memory-cache.ts](file:///c:/tricache/src/smart-memory-cache.ts) to return cache hits synchronously.
+- **Fast-Path Binary Operations (Uint32Array XOR):** The XOR obfuscation engine in [encryption.ts](file:///c:/tricache/src/encryption.ts) automatically detects if buffers are 4-byte-aligned. If so, it processes the operation using `Uint32Array` views, allowing the V8 JIT compiler to compile the loop into highly-optimized, 32-bit register-level CPU `XOR` instructions instead of a slow byte-by-byte traversal.
+- **Pre-allocated Eviction Pools:** During L1 eviction, candidate selection avoids generating temporary object literals. The system samples candidates into a pre-allocated `_evictPool` array and mutates their fields in-place, eliminating GC pressure when the cache is under heavy write load.
+
+### 🛡️ Production-First Ergonomics & Resiliency
+- **Next.js HMR Resiliency:** Normal in-memory caches re-instantiate and wipe their state during Next.js Hot Module Replacement (HMR) reloads. TriCache binds its singleton instance to `globalThis` to preserve the L1 cache across hot-reload cycles in server environments.
+- **Graceful Degradation & Fallbacks:**
+  - **L2 Circuit Breaker:** Protects your app from cascading failures if Redis gets slow or goes down, automatically failing back to L1/disk and probing Redis health on a cooldown timer.
+  - **Dynamic Bloom Filters:** Uses a WebAssembly Bloom filter for fast miss checks, but automatically falls back to a dynamically-sized, memory-optimized pure JS Bloom filter if the cache size exceeds the WebAssembly filter's hardcoded capacity limit.
+  - **CPU-Efficient Count-Min Sketch:** Keeps access-frequency history across eviction boundaries in a tight `4 rows × 512 counters` `Uint16Array` (4 KB total). This fits entirely within the CPU's L1d cache, ensuring frequency updates are essentially free.
+
+---
+
 ## 📊 Performance
 
 Measured on a single Node.js thread (no `await` on synchronous paths):
