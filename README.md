@@ -867,8 +867,8 @@ The 562-byte WASM binary is inlined as Base64 — zero filesystem access at runt
 TriCache is engineered for low-latency, high-throughput environments where garbage collection (GC) pauses and main-thread blocking must be minimized. The codebase employs several advanced V8 and hardware-aware optimizations:
 
 ### ⚡ Performance & Memory Hygiene
-- **Zero-Allocation Hot Paths:** To eliminate object allocation thrashing on hot L1 reads, TriCache reuses a single, pre-allocated static `_hit` object literal in [smart-memory-cache.ts](file:///c:/tricache/src/smart-memory-cache.ts) to return cache hits synchronously.
-- **Fast-Path Binary Operations (Uint32Array XOR):** The XOR obfuscation engine in [encryption.ts](file:///c:/tricache/src/encryption.ts) automatically detects if buffers are 4-byte-aligned. If so, it processes the operation using `Uint32Array` views, allowing the V8 JIT compiler to compile the loop into highly-optimized, 32-bit register-level CPU `XOR` instructions instead of a slow byte-by-byte traversal.
+- **Zero-Allocation Hot Paths:** To eliminate object allocation thrashing on hot L1 reads, TriCache reuses a single, pre-allocated static `_hit` object literal in [src/smart-memory-cache.ts](src/smart-memory-cache.ts) to return cache hits synchronously.
+- **Fast-Path Binary Operations (Uint32Array XOR):** The XOR obfuscation engine in [src/encryption.ts](src/encryption.ts) automatically detects if buffers are 4-byte-aligned. If so, it processes the operation using `Uint32Array` views, allowing the V8 JIT compiler to compile the loop into highly-optimized, 32-bit register-level CPU `XOR` instructions instead of a slow byte-by-byte traversal.
 - **Pre-allocated Eviction Pools:** During L1 eviction, candidate selection avoids generating temporary object literals. The system samples candidates into a pre-allocated `_evictPool` array and mutates their fields in-place, eliminating GC pressure when the cache is under heavy write load.
 
 ### 🛡️ Production-First Ergonomics & Resiliency
