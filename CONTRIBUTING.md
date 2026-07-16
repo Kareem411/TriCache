@@ -18,7 +18,7 @@ pnpm test:watch    # watch mode
 pnpm typecheck     # TypeScript type-check only
 ```
 
-All 43 tests must pass before opening a PR.
+All 350+ tests must pass before opening a PR.
 
 ## Running benchmarks
 
