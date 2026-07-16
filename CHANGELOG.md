@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.6] — 2026-07-16
+
+### Added
+- **Worker pool init accessor** — Introduced `CacheEncryption.toWorkerInit()` to cleanly expose key/mode material for off-main-thread worker pool initialization, replacing unsafe private-field casts.
+- **Fail-closed counter handling & divergent init detection** — Detect and guard against divergent singleton initialization calls.
+- **Circuit breaker & metrics** — Tightened the Redis circuit breaker and surfaced new internal counters in telemetry/metrics.
+
+### Fixed
+- **Disk encryption support for all modes** — Refactored `DiskTier` to use `CacheEncryption` directly instead of hardcoding AES-256-GCM. All encryption modes (`aes-128-gcm`, `aes-128-ctr`, `xor`) now successfully save and load from the disk spill layer.
+- **Eviction loop under budget limit** — Fixed `SmartMemoryCache.ensureCapacity()` eviction logic to loop until the cache usage is actually back under both category and global limits, rather than stopping after evicting a fixed count of entries.
+- **`mget()` fallback logic** — Made `mget()` check L1 cache, then Redis/Valkey, then the disk spill layer before invoking the fetch function.
+
+### Changed
+- **Pinned dependencies** — Pinned exact dependency versions (`ioredis` to `5.11.1` and `msgpackr` to `2.0.4`) in `package.json`.
+
 ## [0.6.5] — 2026-05-31
 
 ### Fixed
