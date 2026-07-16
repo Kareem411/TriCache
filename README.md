@@ -663,7 +663,7 @@ CacheService.create({
 
 ## 🔐 Encryption
 
-AES-256-GCM for L2 (Redis) values, disk spill files, and cold-start snapshots. Three modes are available via `encryptionMode`:
+AES-256-GCM for L2 (Redis) values, disk spill files, and cold-start snapshots. Four modes are available via `encryptionMode`:
 
 | Mode | Key length | Notes |
 |---|---|---|
