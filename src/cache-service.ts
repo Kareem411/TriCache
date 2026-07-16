@@ -69,18 +69,30 @@ class L2CircuitBreaker {
   private state      = CBState.CLOSED;
   private failures   = 0;
   private openedAt   = 0;
+  /** True while the single permitted HALF_OPEN probe is in flight. */
+  private probing    = false;
   constructor(
     private readonly threshold:  number,
     private readonly cooldownMs: number,
   ) {}
 
-  /** Call before each Redis attempt. Returns false when the circuit is open. */
+  /**
+   * Call before each Redis attempt. Returns false when the circuit is open.
+   * In HALF_OPEN, only ONE probe is permitted at a time — concurrent callers
+   * arriving while a probe is outstanding are rejected (return false) so a
+   * recovering Redis node is not stampeded.
+   */
   isAllowed(): boolean {
     if (this.state === CBState.CLOSED)    return true;
-    if (this.state === CBState.HALF_OPEN) return true; // one probe allowed
+    if (this.state === CBState.HALF_OPEN) {
+      if (this.probing) return false; // a probe is already in flight
+      this.probing = true;
+      return true;                    // this caller is the one permitted probe
+    }
     // OPEN: check if cooldown elapsed
     if (Date.now() - this.openedAt >= this.cooldownMs) {
-      this.state = CBState.HALF_OPEN;
+      this.state   = CBState.HALF_OPEN;
+      this.probing = true;
       return true; // probe
     }
     return false;
@@ -89,12 +101,14 @@ class L2CircuitBreaker {
   /** Call on Redis success. */
   onSuccess(): void {
     this.failures = 0;
+    this.probing  = false;
     this.state    = CBState.CLOSED;
   }
 
   /** Call on Redis failure. */
   onFailure(): void {
     this.failures++;
+    this.probing = false;
     if (this.state === CBState.HALF_OPEN || this.failures >= this.threshold) {
       this.state    = CBState.OPEN;
       this.openedAt = Date.now();
@@ -324,6 +338,8 @@ export class CacheService {
     disableDisk: boolean;
     redisClusterNodes: Array<{ host: string; port: number }> | undefined;
     redisSentinel: { name: string; sentinels: Array<{ host: string; port: number }> } | undefined;
+    strictSingleton: boolean;
+    failClosed: boolean;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -370,8 +386,15 @@ export class CacheService {
     invSkipped:       0,
     oomEvictions:     0,
     oomLastAt:        null as number | null,
+    /** Times `increment()` hit a Redis error (fail-open by default, or fail-closed re-throw). */
+    counterErrors:    0,
+    /** Times a later `create(ns)` call passed options differing from the live singleton. */
+    singletonDivergences: 0,
     startedAt:        Date.now(),
   };
+
+  /** One-time guard so the in-process increment() fallback warning fires only once. */
+  private _incrementFallbackWarned = false;
 
   // ── Constructor (use CacheService.create() for the recommended singleton) ──
 
@@ -450,6 +473,8 @@ export class CacheService {
       disableDisk:              options.disableDisk ?? false,
       redisClusterNodes:        options.redisClusterNodes,
       redisSentinel:            options.redisSentinel,
+      strictSingleton:          options.strictSingleton ?? false,
+      failClosed:               options.failClosed ?? false,
     };
 
     // Circuit breaker for L2 Redis
@@ -618,7 +643,10 @@ export class CacheService {
    * Get (or create) the process-level singleton CacheService instance.
    *
    * Options are only applied on first call — subsequent calls return the
-   * existing instance regardless of options passed.
+   * existing instance regardless of options passed. When the new options differ
+   * from what the existing singleton was built with, this is a silent no-op by
+   * default; set `strictSingleton: true` to throw instead, or watch the
+   * `singletonDivergences` metric for detection.
    *
    * When `namespace` is set the singleton is keyed by namespace, so two calls
    * with different namespaces return independent instances.
@@ -626,8 +654,80 @@ export class CacheService {
   static create(options?: CacheOptions): CacheService {
     const g   = globalThis as Record<string, unknown>;
     const key = CacheService.globalKey(options);
-    if (!g[key]) g[key] = new CacheService(options);
-    return g[key] as CacheService;
+    if (!g[key]) {
+      g[key] = new CacheService(options);
+      return g[key] as CacheService;
+    }
+
+    // Singleton already exists for this namespace — detect & surface divergence.
+    const existing = g[key] as CacheService;
+    const diff = CacheService.optionsDiff(options ?? {}, existing.options);
+    if (diff.length > 0) {
+      existing.bumpSingletonDivergence();
+      const msg = `tricache: singleton already initialised for namespace '${existing.options.namespace || '(default)'}' — ignoring divergent options: ${diff.join(', ')}`;
+      if (existing.options.strictSingleton) {
+        throw new Error(`strictSingleton: ${msg}`);
+      }
+      (existing.options.logger ?? consoleLogger).warn(msg, { divergentOptions: diff });
+    }
+    return existing;
+  }
+
+  /**
+   * Keys that, if set differently on a later `create()` call, represent a
+   * meaningful configuration divergence worth flagging (security/correctness
+   * relevant — not cosmetic, e.g. log level).
+   */
+  private static readonly DIVERGENT_KEYS: Array<keyof CacheOptions> = [
+    'redisHost', 'redisPort', 'redisTls', 'disableRedis',
+    'redisClusterNodes', 'redisSentinel', 'encryptionKey', 'encryptionMode',
+    'l1MaxBytes', 'l1MaxEntries', 'namespace', 'frozen', 'adaptiveTtl',
+    'l2WriteMode', 'instanceName', 'invalidationBackplane',
+  ];
+
+  /** Returns the names of options that differ between `a` and the live `b`. */
+  private static optionsDiff(a: CacheOptions, b: CacheOptions): string[] {
+    const out: string[] = [];
+    for (const k of CacheService.DIVERGENT_KEYS) {
+      const av = a[k];
+      const bv = (b as Record<string, unknown>)[k as string];
+      // Treat undefined (not passed) as "no opinion" — only flag explicit conflicts.
+      if (av === undefined) continue;
+      const same =
+        JSON.stringify(av) === JSON.stringify(bv) ||
+        (k === 'encryptionKey' && av === bv);
+      if (!same) out.push(String(k));
+    }
+    return out;
+  }
+
+  /** Increment the singleton-divergence counter (surfaced in `metrics()`). */
+  bumpSingletonDivergence(): void {
+    this.counters.singletonDivergences++;
+  }
+
+  /** Read-only view of the options the singleton was constructed with. */
+  get options(): CacheOptions {
+    const o = this.opts;
+    return {
+      namespace:           o.namespace,
+      logger:              o.logger,
+      l1MaxBytes:          o.l1MaxBytes,
+      l1MaxEntries:        o.l1MaxEntries,
+      redisHost:           o.redisHost,
+      redisPort:           o.redisPort,
+      redisTls:            o.redisTls,
+      disableRedis:        this._redisDisabled,
+      redisClusterNodes:   o.redisClusterNodes,
+      redisSentinel:       o.redisSentinel,
+      encryptionKey:       o.encryptionKey,
+      l2WriteMode:         o.l2WriteMode,
+      instanceName:        o.instanceName,
+      frozen:              o.frozen,
+      adaptiveTtl:         o.adaptiveTtl,
+      invalidationBackplane: o.invalidationBackplane,
+      strictSingleton:     o.strictSingleton,
+    };
   }
 
   /**
@@ -669,6 +769,11 @@ export class CacheService {
    */
   private nk(key: string): string {
     return this._namespace ? `${this._namespace}:${key}` : key;
+  }
+
+  /** Strip the instance namespace prefix from a namespaced key (inverse of `nk`). */
+  private unnk(key: string): string {
+    return this._namespace ? key.slice(this._namespace.length + 1) : key;
   }
 
   /** Apply TTL jitter: multiply ttlMs by (1 ± jitterFactor). */
@@ -1421,13 +1526,32 @@ export class CacheService {
   // ── Counter (distributed rate limiting) ──────────────────────────────────
 
   /**
-   * Atomically increment a counter in Redis. Returns the new value.
-   * Returns 0 if Redis is disabled (safe fallback — rate limiting won't block in dev).
+   * Distributed counter.
+   *
+   * When Redis is active, atomically increments the key via `INCR` and returns
+   * the new (fleet-wide) value. On a Redis error it increments `counters.errors`
+   * and, by default, fails OPEN — returning `0` so a caller's
+   * `if (count > LIMIT) reject()` guard does NOT reject during an outage. Set
+   * `failClosed: true` to re-throw the error instead, enforcing the limit even
+   * when Redis is unavailable.
+   *
+   * When Redis is disabled (or `disableRedis: true`), this maintains an
+   * IN-PROCESS counter with the same TTL semantics so dev/test rate-limiting
+   * works locally. The returned value is the local count (1, 2, 3, …), NOT 0 —
+   * a one-time warning is logged because rate-limiting is then per-instance, not
+   * fleet-wide.
    */
   async increment(cacheKey: string, ttlSeconds?: number): Promise<number> {
     const k = this.nk(cacheKey);
 
     if (this._redisDisabled) {
+      if (!this._incrementFallbackWarned) {
+        this._incrementFallbackWarned = true;
+        this.logger.warn(
+          'tricache: increment() using in-process counter — rate limiting is NOT fleet-wide (Redis disabled)',
+          { cacheKey },
+        );
+      }
       const now   = Date.now();
       const ttlMs = (ttlSeconds ?? 60) * 1_000;
       const entry = this._l1Counters.get(k);
@@ -1445,7 +1569,10 @@ export class CacheService {
       if (count === 1 && ttlSeconds) await client.expire(k, ttlSeconds);
       return count;
     } catch (err) {
+      this.counters.counterErrors++;
+      this.cb.onFailure();
       this.logger.error('increment: Redis error', { cacheKey }, err as Error);
+      if (this.opts.failClosed) throw err;
       return 0;
     }
   }
@@ -1642,8 +1769,10 @@ export class CacheService {
     const missIndexes: number[] = [];
     const missKeys:   string[]  = [];
 
+    // ── Tier 1: L1 (in-memory) ──
     for (let i = 0; i < keys.length; i++) {
-      const entry = this.l1.getEntry(this.nk(keys[i]));
+      const k = this.nk(keys[i]);
+      const entry = this.l1.getEntry(k);
       if (entry && entry.expiresAt > Date.now()) {
         result[i] = (entry.value !== undefined ? entry.value : unpack(entry.data)) as T;
         this.counters.l1Hits++;
@@ -1653,7 +1782,85 @@ export class CacheService {
       }
     }
 
+    if (missKeys.length === 0) return result;
+
+    // ── Tier 2: L2 (Redis) — fetch all remaining misses in one pipeline ──
+    if (!this._redisDisabled) {
+      try {
+        const client = await this.getRedis();
+        const nsKeys = missKeys.map(k => this.nk(k));
+        const pipeline = client.multi();
+        for (const nk of nsKeys) pipeline.get(nk);
+        const raws = await pipeline.exec() as Array<[Error | null, string | null] | null>;
+        this.cb.onSuccess();
+        for (let j = 0; j < missKeys.length; j++) {
+          const raw = raws[j] ? (raws[j] as [Error | null, string | null])[1] : null;
+          const idx = missIndexes[j];
+          if (raw) {
+            let parsed: T;
+            if (this.enc.isEnabled) {
+              const decrypted = (this._workerPool && raw.length > this.opts.workerThresholdBytes)
+                ? await this._workerPool.decrypt(raw)
+                : this.enc.decrypt(raw);
+              parsed = JSON.parse(decrypted) as T;
+            } else {
+              parsed = JSON.parse(raw) as T;
+            }
+            const k = nsKeys[j];
+            const p = priority ?? inferPriority(missKeys[j]);
+            this.l1.set(k, parsed, this._jitterTtl((typeof ttl === 'function' ? ttl(missKeys[j]) : ttl) * 1_000), p);
+            this.counters.l2Hits++;
+            result[idx] = parsed;
+            // Mark this miss slot as resolved (position j in the parallel arrays).
+            // NOTE: must use j here, NOT idx — idx is the value (an index into the
+            // original keys[]), which only equals j when missIndexes is contiguous
+            // (every key missed). With interleaved L1 hits, missIndexes is sparse
+            // and missIndexes[idx] would clobber an unrelated slot.
+            missIndexes[j] = -1;
+            missKeys[j] = '';
+          }
+        }
+        // Compact the still-missing arrays.
+        const remainingIdx = missIndexes.filter(i => i >= 0);
+        const remainingKeys = missKeys.filter(k => k !== '');
+        missIndexes.length = 0; missKeys.length = 0;
+        missIndexes.push(...remainingIdx);
+        missKeys.push(...remainingKeys);
+        if (missKeys.length === 0) return result;
+      } catch (err) {
+        this.cb.onFailure();
+        this.logger.debug('mget: Redis unavailable, continuing to disk/fetch', { error: (err as Error).message });
+      }
+    }
+
+    // ── Tier 1.5: disk spill (evicted L1 entries) ──
+    if (!this._diskDisabled) {
+      for (let j = missKeys.length - 1; j >= 0; j--) {
+        const k = this.nk(missKeys[j]);
+        const diskHit = this.disk.load(k);
+        if (diskHit !== null) {
+          const promoted = this.l1.importEntries(
+            [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
+            this.opts.forbiddenSnapshotPrefixes,
+          );
+          if (promoted > 0) {
+            const l1Check = this.l1.get(k);
+            if (l1Check !== null) {
+              this.counters.diskHits++;
+              result[missIndexes[j]] = l1Check.value as T;
+              // Remove from miss set.
+              missIndexes.splice(j, 1);
+              missKeys.splice(j, 1);
+            }
+          }
+        }
+      }
+      if (missKeys.length === 0) return result;
+    }
+
+    // ── Tier 3: fetchFn for whatever still missed ──
     if (missKeys.length > 0) {
+      this.counters.fetches++;
       const fetched = await fetchFn(missKeys);
       for (let j = 0; j < missKeys.length; j++) {
         const v = fetched[missKeys[j]];
@@ -1758,7 +1965,7 @@ export class CacheService {
           // Use a 10-minute TTL as a reasonable default; the real TTL is not
           // returned by GET (use PTTL to be precise, but that doubles round-trips).
           const remainingMs = 10 * 60 * 1_000;
-          this.l1.set(matchedKeys[i], parsed, remainingMs, opts?.priority ?? inferPriority(matchedKeys[i]));
+          this.l1.set(matchedKeys[i], parsed, remainingMs, opts?.priority ?? inferPriority(this.unnk(matchedKeys[i])));
           loaded++;;
         } catch { /* skip malformed entries */ }
       }
@@ -2065,6 +2272,10 @@ export class CacheService {
       sets:          { total: c.sets },
       deletes:       { total: c.deletes },
       revalidations: { total: c.swrRevalidations },
+      counters: {
+        errors:           c.counterErrors,
+        singletonDivergences: c.singletonDivergences,
+      },
 
       bloom: {
         checksTotal:       l1s.bloom.checks,

@@ -20,7 +20,7 @@ tricache is an extremely fast three-tier Node.js cache library. It serves warm r
 | Feature | Detail |
 |---|---|
 | **Adaptive eviction** | LFU × LRU × priority score + Count-Min Sketch cross-eviction frequency; reservoir-sampled O(1) hot path; category limits prevent any prefix monopolising RAM |
-| **Count-Min Sketch** | 4 × 512 `Uint16Array` (4 KB) tracks historical access frequency across eviction boundaries — same-priority burst keys cannot displace long-resident entries; **78 % survival rate** in benchmark flood tests |
+| **Count-Min Sketch** | 4 × 512 `Uint16Array` (4 KB) tracks historical access frequency across eviction boundaries — same-priority burst keys cannot displace long-resident entries; **84 % survival rate** in benchmark flood tests |
 | **WASM Bloom filter** | 562-byte binary inlined as Base64 — O(k=7) guaranteed-miss detection, no filesystem access, pure-JS fallback |
 | **msgpackr serialization** | All entries packed with msgpackr — uniform binary format, no JSON at any payload size |
 | **Stale-While-Revalidate** | Serve stale instantly, revalidate in background — zero added latency on cache hit |
@@ -243,6 +243,15 @@ CacheService.create({
   adaptiveTtlMax:         86400,   // ceiling: never exceed 24 h (default)
   adaptiveTtlMultiplier:  20,      // p95Ms × 20 = TTL in seconds (default)
 
+  // ── Singleton + rate-limit safety ──────────────────────────────────────
+  // strictSingleton: when true, a later create() for an existing namespace
+  // whose options differ from the first call THROWS instead of silently
+  // returning the existing instance. Guards against conflicting init points.
+  strictSingleton:       false,
+  // failClosed: when true, increment() re-throws on a Redis error instead of
+  // failing open (returning 0). Enforces the rate-limit guard during outages.
+  failClosed:            false,
+
   // ── OpenTelemetry tracer ──────────────────────────────────────────────
   // Pass any @opentelemetry/api-compatible tracer. No peer dependency.
   // Spans: 'tricache.get' | 'tricache.set' | 'tricache.delete'
@@ -310,7 +319,7 @@ CacheService.create({
 
 ### `CacheService.create(options?)` → `CacheService`
 
-Returns the process-level singleton. Options are only applied on the **first** call per namespace — subsequent calls return the existing instance.
+Returns the process-level singleton. Options are only applied on the **first** call per namespace — subsequent calls return the existing instance. When the new options differ from what the existing singleton was built with, this is a **silent no-op by default** (a one-time warning is logged and the `singletonDivergences` metric is incremented). Set `strictSingleton: true` on the first call to instead **throw** on a divergent later call — use this when multiple init points could pass conflicting Redis credentials or TTLs.
 
 ### `CacheService.createAsync(optionsOrPromise)` → `Promise<CacheService>`
 
@@ -334,7 +343,7 @@ Get from cache or call `fetchFn` on a miss. The inflight map ensures `fetchFn` f
 |---|---|---|---|
 | `key` | `string` | — | Cache key |
 | `fetchFn` | `() => Promise<T>` | — | Called on a miss; result is cached |
-| `ttlSeconds` | `number` | `300` | Hard TTL in seconds |
+| `ttlSeconds` | `number` | `300` | Hard TTL in seconds. **When `adaptiveTtl` is enabled, this is only authoritative until ≥ 5 samples are collected for the key — after that the library derives TTL from the p95 fetch latency** (see Adaptive TTL config). Use `opts` or a separate cache instance if you need a hard floor. |
 | `opts.swr` | `number` | `0` | Stale-While-Revalidate grace seconds |
 | `opts.priority` | `CachePriority` | auto-inferred | Eviction priority override |
 | `opts.refreshAhead` | `number` | — | Fraction `(0, 1]` of TTL — triggers background recompute when `remaining ≤ ttl × (1 - refreshAhead)` |
@@ -361,7 +370,7 @@ await cache.delete('org:42'); // org:42:members is evicted too
 
 ### `cache.mget<T>(keys, fetchFn, ttl?, priority?)` → `Promise<(T | undefined)[]>`
 
-Batch read. Returns L1-cached values for hot keys; calls `fetchFn` only with the keys that missed. Preserves input ordering.
+Batch read. Checks **all three tiers** for each key — L1 (RAM), then L2 (Redis, in one pipelined `MGET`), then the L1.5 disk spill — and calls `fetchFn` only for keys that miss every tier. Preserves input ordering and counts exactly one hit per key (no double-counting across tiers).
 
 `ttl` accepts a **plain number** (uniform TTL) or a **function `(key: string) => number`** (per-key TTL). The function is only called for miss keys — L1 hits are unaffected.
 
@@ -528,7 +537,9 @@ cache.rebalance();
 
 ### `cache.increment(key, ttlSeconds?)` → `Promise<number>`
 
-Redis `INCR` — atomically increments a counter, setting TTL on first write. When Redis is disabled, maintains an in-process counter with the same TTL semantics so rate-limiting works in dev/test.
+Distributed counter. With Redis active, atomically increments via `INCR` and returns the fleet-wide value. **By default it fails OPEN on a Redis error** — it returns `0`, so a caller's `if (count > LIMIT) reject()` guard will NOT reject during an outage. Set `failClosed: true` to re-throw the error instead, enforcing the limit even when Redis is unavailable. Track failures via `cache.metrics().counters.errors`.
+
+When Redis is disabled, it maintains an **in-process** counter with the same TTL semantics so dev/test rate-limiting works — but rate-limiting is then per-instance, **not fleet-wide**. A one-time warning is logged the first time this fallback is used.
 
 ### `cache.metrics()` → `CacheMetrics`
 
@@ -834,10 +845,13 @@ ioredis monitors the current master via the Sentinel topology and transparently 
 
 ## ⚡ WASM Bloom filter
 
-A 100,000-bit filter with k=7 hash probes:
+A 100,000-bit filter with k=7 hash probes is used when it is large enough for the
+configured `l1MaxEntries`; otherwise a right-sized pure-JS filter is instantiated
+automatically (see `createBloomFilter`). For the default 100K-bit filter:
 
-- At the default `l1MaxEntries: 2,000` — false-positive rate ≈ **0.01%**
-- At rated capacity (~18,000 entries) — false-positive rate ≈ **1%**
+- At the default `l1MaxEntries: 2,000` — false-positive rate ≈ **0.00007%** (m=100,000, k=7)
+- At its rated capacity (~10,400 entries) — false-positive rate ≈ **1%**
+- When `l1MaxEntries` exceeds the WASM filter's ~10,400-entry capacity, a JS filter sized via the optimal formula (m = ⌈–n·ln p / (ln 2)²⌉, k = round(ln 2 · m / n) clamped to [4, 10]) is used instead — no capacity cliff.
 - The filter rebuilds automatically when stale bits from deleted/expired entries accumulate
 
 Mechanics:
@@ -858,12 +872,12 @@ Measured on a single Node.js thread (no `await` on synchronous paths):
 |---|---|---|---|
 | `get` — hot hit (8K entries) | **2.81 M/s** | 356 ns | bloom → Map lookup → return cached value |
 | `get` — cold miss | **7.14 M/s** | 140 ns | bloom gates → early return |
-| `set` — tiny payload | 899 K/s | 1.11 µs | pack() + Map.set + bloom.add |
-| `set` — small payload (≈ 512 B) | 554 K/s | 1.81 µs | pack() same unified path, larger payload |
-| `set` — large payload (≥ 512 B) | 205.3 K/s | 4.87 µs | pack() larger payload |
-| `set` — CRITICAL priority | 730.1 K/s | 1.37 µs | same set path; skipped in eviction sort |
+| `set` — tiny payload | 1.06 M/s | 944 ns | pack() + Map.set + bloom.add |
+| `set` — small payload (< 512 B) | 574.1 K/s | 1.74 µs | pack() same unified path, larger payload |
+| `set` — large payload (≥ 512 B) | 228.6 K/s | 4.37 µs | pack() larger payload |
+| `set` — CRITICAL priority | 843.6 K/s | 1.19 µs | same set path; skipped in eviction sort |
 | `delete` — exact key | **5.36 M/s** | 186 ns | Map.delete |
-| `deletePattern` — glob wildcard | 7.2 K/s | 138 µs | O(n) Map scan |
+| `deletePattern` — glob wildcard | 18.7 K/s | 53.48 µs | O(n) Map scan |
 | Count-Min Sketch estimate | **3.37 M/s** | 297 ns | 4 row lookups — called on every `get()` hit and `set()` |
 
 **Iterator interface (L1 live entries, 500 entries)**

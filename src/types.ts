@@ -182,6 +182,14 @@ export interface CacheMetrics {
   deletes:       { total: number };
   revalidations: { total: number };
 
+  /** Rate-limit / singleton diagnostics */
+  counters: {
+    /** Times `increment()` hit a Redis error (fail-open by default, or fail-closed re-throw). */
+    errors: number;
+    /** Times a later `create(ns)` call passed options diverging from the live singleton. */
+    singletonDivergences: number;
+  };
+
   bloom: {
     /** Total bloom-filter checks (get() calls that passed prefix filter) */
     checksTotal:       number;
@@ -700,4 +708,25 @@ export interface CacheOptions {
     name:      string;
     sentinels: Array<{ host: string; port: number }>;
   };
+
+  /**
+   * When `true`, a second `CacheService.create()` call for an already-existing
+   * singleton (same namespace) whose options differ from the first call throws
+   * instead of silently returning the existing instance. Use in codebases where
+   * multiple init points could pass conflicting configuration (e.g. different
+   * Redis credentials or TTLs) and you want that class of bug to fail loudly.
+   *
+   * Default: `false` (warn once, return existing instance).
+   */
+  strictSingleton?: boolean;
+
+  /**
+   * `cache.increment()` distributed-rate-limit behaviour on a Redis error.
+   *
+   * Default: `false` (fail-open — on a Redis error the method returns `0`, so a
+   * caller's `if (count > LIMIT) reject()` guard never rejects during an outage).
+   * Set to `true` to instead re-throw the Redis error, letting the caller's limit
+   * guard enforce the limit even when Redis is unavailable.
+   */
+  failClosed?: boolean;
 }

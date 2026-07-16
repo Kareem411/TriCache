@@ -94,8 +94,8 @@ export class WasmBloomFilter {
 
   /**
    * Maximum safe insertions before false-positive rate exceeds ~1 %.
-   * Exact formula for k=7 hash rounds, m=100 000 bits:
-   *   n_max = -m * ln(1 - p^(1/k)) / k  ≈ 18 169
+   * Exact formula for k=7 hash rounds, m=100 000 bits, p=1%:
+   *   n_max = -m * ln(1 - p^(1/k)) / k  ≈ 10 434
    */
   get maxCapacity(): number { return this._maxCapacity; }
 }
