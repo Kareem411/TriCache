@@ -101,11 +101,11 @@ describe('SmartMemoryCache.touch()', () => {
   });
 
   it('returns true and extends the TTL for a live key', async () => {
-    smc.set('live', 'data', 50); // 50 ms TTL
-    await new Promise(r => setTimeout(r, 30));
-    // would expire in ~20 ms — touch extends it
-    expect(smc.touch('live', 10_000)).toBe(true);
+    smc.set('live', 'data', 200); // 200 ms TTL
     await new Promise(r => setTimeout(r, 40));
+    // would expire in ~160 ms — touch extends it
+    expect(smc.touch('live', 10_000)).toBe(true);
+    await new Promise(r => setTimeout(r, 200));
     // should still be alive after original TTL elapsed
     expect(smc.has('live')).toBe(true);
   });
@@ -126,11 +126,11 @@ describe('SmartMemoryCache.bumpExpiry()', () => {
   });
 
   it('returns true and adds time to an existing key', async () => {
-    smc.set('b', 'v', 50); // 50 ms TTL
-    await new Promise(r => setTimeout(r, 30));
-    expect(smc.bumpExpiry('b', 200)).toBe(true); // add 200 ms
+    smc.set('b', 'v', 200); // 200 ms TTL
     await new Promise(r => setTimeout(r, 40));
-    // original TTL (50 ms) elapsed, but bump added 200 ms — still alive
+    expect(smc.bumpExpiry('b', 400)).toBe(true); // add 400 ms (total ~600ms)
+    await new Promise(r => setTimeout(r, 200));
+    // original TTL (200 ms) elapsed, but bump added 400 ms — still alive
     expect(smc.has('b')).toBe(true);
   });
 

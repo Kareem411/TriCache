@@ -1,10 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { DiskTier } from '../src/disk-tier';
 import { CachePriority } from '../src/types';
 import type { SmartCacheEntry } from '../src/types';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { rmSync } from 'fs';
+import fs, { rmSync } from 'fs';
 import { consoleLogger } from '../src/types';
 import { pack, unpack } from 'msgpackr';
 
@@ -99,6 +99,42 @@ describe('DiskTier', () => {
     // stats.files = file count on disk; stats.sizeKB tracks usage bytes (rounds to KB)
     expect(disk.stats.files).toBe(2);
     expect(disk.stats.maxKB).toBeGreaterThan(0);
+  });
+
+  it('handles fs.statSync errors during ensureUsageCounted gracefully', async () => {
+    await disk.save('file-a', makeEntry('payload-a'));
+    await disk.save('file-b', makeEntry('payload-b'));
+
+    // Create a new DiskTier instance on the same directory
+    const freshDisk = new DiskTier({
+      dir,
+      maxBytes: 10 * 1024 * 1024,
+      entryMaxBytes: 1024 * 1024,
+      forbiddenPrefixes: [],
+      logger: consoleLogger,
+    });
+    // Force file-only mode to trigger ensureUsageCounted()
+    (freshDisk as any)._db = null;
+    (freshDisk as any).usageCounted = false;
+
+    const origStatSync = fs.statSync;
+    let thrown = false;
+    const statSpy = vi.spyOn(fs, 'statSync').mockImplementation((filePath, options) => {
+      const stat = origStatSync(filePath, options as any);
+      if (!stat.isDirectory() && !thrown) {
+        thrown = true;
+        throw new Error('ENOENT: file disappeared concurrently');
+      }
+      return stat;
+    });
+
+    try {
+      (freshDisk as any).ensureUsageCounted();
+      expect(freshDisk.stats.files).toBe(2);
+      expect(freshDisk.stats.sizeKB).toBeGreaterThanOrEqual(0);
+    } finally {
+      statSpy.mockRestore();
+    }
   });
 
   // ── purgeNextBucket (staggered disk janitor) ─────────────────────────────
