@@ -775,7 +775,8 @@ export class CacheService {
   private _jitterTtl(ttlMs: number): number {
     const j = this.opts.ttlJitterFactor;
     if (j === 0) return ttlMs;
-    return Math.round(ttlMs * (1 + (Math.random() * 2 - 1) * j));
+    const rand = (crypto.randomInt(0, 100_000) / 50_000) - 1; // uniform [-1.0, +1.0)
+    return Math.round(ttlMs * (1 + rand * j));
   }
 
   /** Shared no-op span for the common case where no tracer is configured.
@@ -877,7 +878,20 @@ export class CacheService {
   /** @internal Exposed for testing. Applies a raw backplane JSON message to local state. */
   _handleBackplaneMessage(message: string): void {
     try {
-      const msg = JSON.parse(message) as { op: 'del' | 'del-glob'; key: string; src: string };
+      const msg = JSON.parse(message);
+      if (
+        !msg ||
+        typeof msg !== 'object' ||
+        Array.isArray(msg) ||
+        typeof msg.src !== 'string' ||
+        typeof msg.key !== 'string' ||
+        (msg.op !== 'del' && msg.op !== 'del-glob')
+      ) {
+        this.logger.warn('Backplane: rejected invalid pubsub message format', {
+          raw: typeof message === 'string' ? message.slice(0, 100).replace(/[\r\n\t]/g, ' ') : String(message),
+        });
+        return;
+      }
       if (msg.src === this.instanceId) {
         this.counters.invSkipped++;
         return; // own message — our L1 is already current
@@ -902,7 +916,9 @@ export class CacheService {
       this.logger.debug('Backplane: peer invalidation applied', {
         op: msg.op, key: msg.key.slice(0, 60),
       });
-    } catch { /* malformed message — ignore */ }
+    } catch {
+      this.logger.warn('Backplane: malformed message JSON parse failed');
+    }
   }
 
   private async publishInvalidation(op: 'del' | 'del-glob', key: string): Promise<void> {

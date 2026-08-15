@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.7] — 2026-08-15
+
+### Security & Hardening
+- **Pub/Sub Invalidation Message Validation** — Added strict fail-closed runtime schema validation for incoming Redis/backplane pub/sub messages before accessing message properties. Rejects and drops non-object, scalar, non-string keys, invalid `op` commands, and prototype pollution attempts.
+- **Log Injection Hardening** — Stripped/sanitized carriage returns and newlines from raw rejected pub/sub payload strings before logging to prevent multiline log-injection attacks.
+- **Cryptographic TTL Jitter** — Swapped `Math.random()` in `_jitterTtl()` for uniform cryptographically secure randomness via `crypto.randomInt(0, 100_000)` to improve PRNG defense-in-depth hygiene.
+
+### Fixed
+- **Test Stability on Windows / CI** — Stabilized sub-50ms test timer margins in `v0.2.0-features.test.ts` to accommodate 15.6ms OS timer resolution quantization and prevent false-positive race conditions during `touch()` and `bumpExpiry()` assertions.
+
+### Added
+- **Error Resilience Test Suite** — Added dedicated unit tests for unhandled error recovery in `DiskTier.ensureUsageCounted()` (`fs.statSync` errors), `CacheService.loadSnapshot()` (`fs.unlinkSync` errors), and user-provided throwing `onMetrics` callbacks.
+- **Deterministic Jitter Bounds Suite** — Added deterministic unit tests verifying exact mathematical mapping of `crypto.randomInt` boundaries and statistical uniformity.
+
 ## [0.6.6] — 2026-07-16
 
 ### Added

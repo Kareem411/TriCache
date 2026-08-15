@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { CacheService } from '../src/cache-service';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { rmSync } from 'fs';
+import fs, { rmSync } from 'fs';
 
 function tempDir() {
   return join(tmpdir(), `tricache-cs-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -423,6 +423,41 @@ describe('Invalidation backplane (_handleBackplaneMessage)', () => {
     }).not.toThrow();
   });
 
+  it('rejects malformed, non-object, or hostile backplane messages without throwing or invalidating', async () => {
+    await svc.set('secure:key', 'safe_value', 60);
+    const handler = (svc as unknown as { _handleBackplaneMessage(m: string): void });
+
+    const hostilePayloads = [
+      'null',
+      '12345',
+      'true',
+      '""',
+      '"just a string"',
+      '{}',
+      '[]',
+      '["del", "secure:key", "peer-1"]',
+      '{"__proto__": {"admin": true}, "op": "evil", "key": "secure:key", "src": "peer-1"}',
+      '{"constructor": {"prototype": {"polluted": true}}, "op": "evil", "key": "secure:key", "src": "peer-1"}',
+      '{"op": "del\r\nINJECTED_LOG", "key": "secure:key", "src": "peer-1"}', // newline log injection attempt
+      JSON.stringify({ op: 'del' }),                                      // missing key & src
+      JSON.stringify({ key: 'secure:key', src: PEER_ID }),                // missing op
+      JSON.stringify({ op: 'unknown-op', key: 'secure:key', src: PEER_ID }), // unsupported op
+      JSON.stringify({ op: 'DEL', key: 'secure:key', src: PEER_ID }),     // wrong case
+      JSON.stringify({ op: 'del', key: 12345, src: PEER_ID }),            // non-string key
+      JSON.stringify({ op: 'del', key: 'secure:key', src: 999 }),         // non-string src
+      JSON.stringify({ op: 'del', key: 'secure:key', src: { toString: () => PEER_ID } }), // type coercion attempt
+      JSON.stringify({ op: 'del-glob', key: 42, src: PEER_ID }),         // non-string pattern
+    ];
+
+    for (const payload of hostilePayloads) {
+      expect(() => handler._handleBackplaneMessage(payload)).not.toThrow();
+    }
+
+    // Key must not have been invalidated by any of the invalid payloads
+    expect(svc.has('secure:key')).toBe(true);
+    expect(await svc.get('secure:key', async () => 'fallback', 60)).toBe('safe_value');
+  });
+
   it('disk.delete is deferred via setImmediate (does not block the event loop)', async () => {
     await svc.set('k', 42, 60);
     const diskSpy = vi.spyOn(
@@ -439,6 +474,142 @@ describe('Invalidation backplane (_handleBackplaneMessage)', () => {
     // after yielding to the event loop it fires
     await new Promise<void>(resolve => setImmediate(resolve));
     expect(diskSpy).toHaveBeenCalledWith('k');
+  });
+});
+
+describe('TTL jitter bounds and distribution', () => {
+  it('deterministically maps randomInt outputs to exact mathematical bounds', async () => {
+    const cryptoModule = await import('crypto');
+    const jitterSvc = CacheService.reset({
+      disableRedis: true,
+      diskCacheDir: tempDir(),
+      ttlJitterFactor: 0.10, // ±10%
+    });
+    try {
+      const jitterFn = (jitterSvc as unknown as { _jitterTtl(t: number): number })._jitterTtl.bind(jitterSvc);
+      const ttlMs = 10_000;
+
+      // Mock randomInt minimum (0 -> -1.0 factor -> 10_000 * 0.90 = 9_000)
+      const minSpy = vi.spyOn(cryptoModule.default, 'randomInt').mockReturnValue(0);
+      expect(jitterFn(ttlMs)).toBe(9_000);
+      minSpy.mockRestore();
+
+      // Mock randomInt midpoint (50_000 -> 0.0 factor -> 10_000 * 1.0 = 10_000)
+      const midSpy = vi.spyOn(cryptoModule.default, 'randomInt').mockReturnValue(50_000);
+      expect(jitterFn(ttlMs)).toBe(10_000);
+      midSpy.mockRestore();
+
+      // Mock randomInt maximum achievable value in [0, 100_000) (99_999 -> factor +0.99998 -> rounded to 11_000)
+      const maxSpy = vi.spyOn(cryptoModule.default, 'randomInt').mockReturnValue(99_999);
+      expect(jitterFn(ttlMs)).toBe(11_000);
+      maxSpy.mockRestore();
+    } finally {
+      jitterSvc.destroy();
+    }
+  });
+
+  it('strictly adheres to configured jitterFactor bounds across random samples', () => {
+    const jitterSvc = CacheService.reset({
+      disableRedis: true,
+      diskCacheDir: tempDir(),
+      ttlJitterFactor: 0.05, // ±5%
+    });
+    try {
+      const jitterFn = (jitterSvc as unknown as { _jitterTtl(t: number): number })._jitterTtl.bind(jitterSvc);
+      const ttlMs = 10_000;
+      const factor = 0.05;
+      const minBound = Math.round(ttlMs * (1 - factor));
+      const maxBound = Math.round(ttlMs * (1 + factor));
+
+      let belowMean = 0;
+      let aboveMean = 0;
+      const iterations = 1_000;
+
+      for (let i = 0; i < iterations; i++) {
+        const jittered = jitterFn(ttlMs);
+        expect(jittered).toBeGreaterThanOrEqual(minBound);
+        expect(jittered).toBeLessThanOrEqual(maxBound);
+        if (jittered < ttlMs) belowMean++;
+        if (jittered > ttlMs) aboveMean++;
+      }
+
+      // Distribution should be symmetric and uniform
+      expect(belowMean).toBeGreaterThan(iterations * 0.3);
+      expect(aboveMean).toBeGreaterThan(iterations * 0.3);
+    } finally {
+      jitterSvc.destroy();
+    }
+  });
+
+  it('returns exact ttlMs when ttlJitterFactor is 0', () => {
+    const noJitterSvc = CacheService.reset({
+      disableRedis: true,
+      diskCacheDir: tempDir(),
+      ttlJitterFactor: 0,
+    });
+    try {
+      const jitterFn = (noJitterSvc as unknown as { _jitterTtl(t: number): number })._jitterTtl.bind(noJitterSvc);
+      for (let i = 0; i < 100; i++) {
+        expect(jitterFn(5_000)).toBe(5_000);
+      }
+    } finally {
+      noJitterSvc.destroy();
+    }
+  });
+});
+
+describe('Error resilience for internal callbacks and fs operations', () => {
+  it('onMetrics exceptions do not crash background metrics interval', async () => {
+    const throwingOnMetrics = vi.fn().mockImplementation(() => {
+      throw new Error('boom in onMetrics callback');
+    });
+
+    const metricsDir = tempDir();
+    const testSvc = CacheService.reset({
+      disableRedis: true,
+      diskCacheDir: metricsDir,
+      onMetrics: throwingOnMetrics,
+      metricsIntervalMs: 20,
+    });
+
+    try {
+      await testSvc.set('mkey', 'val', 60);
+      await new Promise(r => setTimeout(r, 60)); // let metrics interval fire multiple times
+      expect(throwingOnMetrics).toHaveBeenCalled();
+      expect(testSvc.has('mkey')).toBe(true);
+    } finally {
+      await testSvc.destroy();
+      try { rmSync(metricsDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('loadSnapshot handles fs.unlinkSync failures gracefully', async () => {
+    const snapDir = tempDir();
+    const snapPath = join(snapDir, 'corrupt.snap');
+    const testSvc = CacheService.reset({
+      disableRedis: true,
+      diskCacheDir: snapDir,
+      snapshotPath: snapPath,
+    });
+
+    try {
+      fs.mkdirSync(snapDir, { recursive: true });
+      fs.writeFileSync(snapPath, Buffer.from('invalid-snapshot-data'));
+
+      // Mock unlinkSync to throw when called during error cleanup
+      const unlinkSpy = vi.spyOn(fs, 'unlinkSync').mockImplementation(() => {
+        throw new Error('EPERM: operation not permitted');
+      });
+
+      try {
+        expect(() => testSvc.loadSnapshot()).not.toThrow();
+      } finally {
+        unlinkSpy.mockRestore();
+      }
+    } finally {
+      await testSvc.destroy();
+      try { rmSync(snapDir, { recursive: true, force: true }); } catch {}
+    }
   });
 });
 
