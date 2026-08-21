@@ -50,17 +50,20 @@ describe('Disk Spill Saturation & Full Recovery Test', () => {
       await cache.set(`saturated:item:${i}`, payload, 600);
     }
 
-    // Allow async disk write queue to settle across thread workers
-    await new Promise(r => setTimeout(r, 500));
+    // Allow async disk write queue to settle across thread workers (with polling for slow CI I/O)
+    let stats = cache.stats();
+    for (let attempt = 0; attempt < 30 && stats.disk.files === 0; attempt++) {
+      await new Promise(r => setTimeout(r, 100));
+      stats = cache.stats();
+    }
 
     // Verify disk stats are tracked and within reasonable quota limits
-    const stats = cache.stats();
     expect(stats.disk.files).toBeGreaterThan(0);
     expect(stats.disk.sizeKB).toBeLessThanOrEqual((diskMaxBytes / 1024) * 1.5);
 
     // Verify no orphaned temporary lock files (.tmp) remain in the directory
-    const files = readdirSync(diskDir);
-    const tmpFiles = files.filter(f => f.endsWith('.tmp'));
+    const files = readdirSync(diskDir, { recursive: true }) as string[];
+    const tmpFiles = files.filter(f => typeof f === 'string' && f.endsWith('.tmp'));
     expect(tmpFiles.length).toBe(0);
 
     // Most recent entries should remain intact and accessible
