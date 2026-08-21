@@ -38,10 +38,31 @@ import {
   ICacheTracer,
   ICacheSpan,
   consoleLogger,
+  WrapOptions,
+  LockOptions,
+  ICacheMeter,
+  ICacheCounter,
 } from './types';
-import { CacheEncryption }   from './encryption';
+import { CacheEncryption, type EncryptionMode } from './encryption';
 import { SmartMemoryCache }  from './smart-memory-cache';
 import { DiskTier }          from './disk-tier';
+import {
+  compressBuffer,
+  decompressBuffer,
+  PREFIX_COMPRESSED,
+  PREFIX_ENC_COMPRESSED,
+  type CompressionAlgorithm,
+} from './compression';
+
+// ─── Lua scripts ─────────────────────────────────────────────────────────────
+
+const LUA_COMPARE_AND_DELETE = `
+local currentTs = redis.call('HGET', KEYS[1], 't')
+if currentTs and currentTs == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`;
 
 // ─── Snapshot constants ───────────────────────────────────────────────────────
 
@@ -58,6 +79,36 @@ const DEFAULT_CATEGORY_LIMITS: Record<string, CategoryLimit> = {
 // ─── Default forbidden prefixes ───────────────────────────────────────────────
 
 const DEFAULT_FORBIDDEN_PREFIXES = ['auth:', 'session:', 'mfa:', 'rate_limit:'] as const;
+
+// ─── Default counter TTL ──────────────────────────────────────────────────────
+const DEFAULT_COUNTER_TTL_SECONDS = 60;
+
+// ─── Glob regex cache (bounded LRU, max 256 compiled patterns) ───────────────
+const GLOB_REGEX_CACHE_MAX = 256;
+const globRegexCache = new Map<string, RegExp>();
+
+function getGlobRegex(pattern: string): RegExp {
+  let re = globRegexCache.get(pattern);
+  if (re) {
+    globRegexCache.delete(pattern);
+    globRegexCache.set(pattern, re);
+    return re;
+  }
+
+  // Escape special regex characters except '*', then collapse multiple consecutive '*' into '.*'
+  const escaped = pattern
+    .replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*+/g, '.*');
+
+  re = new RegExp('^' + escaped + '$');
+
+  if (globRegexCache.size >= GLOB_REGEX_CACHE_MAX) {
+    const oldestKey = globRegexCache.keys().next().value;
+    if (oldestKey !== undefined) globRegexCache.delete(oldestKey);
+  }
+  globRegexCache.set(pattern, re);
+  return re;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Circuit breaker — three-state (CLOSED → OPEN → HALF_OPEN) for L2 Redis
@@ -322,6 +373,7 @@ export class CacheService {
     l1EvictionWatermark: number;
     ttlJitterFactor: number;
     tracer: ICacheTracer | undefined;
+    meter: ICacheMeter | undefined;
     notFoundTtl: number;
     warmKeys: string | undefined;
     onHit: ((key: string, tier: 'l1' | 'disk' | 'l2') => void) | undefined;
@@ -338,8 +390,19 @@ export class CacheService {
     disableDisk: boolean;
     redisClusterNodes: Array<{ host: string; port: number }> | undefined;
     redisSentinel: { name: string; sentinels: Array<{ host: string; port: number }> } | undefined;
+    redisProtocol: 2 | 3 | undefined;
+    useShardedPubSub: boolean;
+    compression: CompressionAlgorithm;
+    compressionThresholdBytes: number;
     strictSingleton: boolean;
     failClosed: boolean;
+    tagStrategy: 'set' | 'generational';
+    tagVersionTtlMs: number;
+    cloneStrategy: 'none' | 'structuredClone';
+    backplaneMode: 'pubsub' | 'stream';
+    backplaneStreamMaxLen: number;
+    backplaneStreamBlockMs: number;
+    backplaneStreamKey?: string;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -350,6 +413,8 @@ export class CacheService {
   private readonly _l1Counters = new Map<string, { value: number; expiresAt: number }>();
   /** tag → Set of namespaced cache keys; maintained in-process for O(1) invalidateTag() */
   private readonly tagIndex    = new Map<string, Set<string>>();
+  /** tag → { version, lastSyncedAt } for generational tag invalidation (bounded to 10,000 entries) */
+  private readonly tagVersions = new Map<string, { version: number; lastSyncedAt: number }>();
   /**
    * Dependency index: source glob pattern → Set of namespaced dependent keys.
    * When an exact-key delete matches a registered pattern, all dependents are cascaded.
@@ -358,6 +423,10 @@ export class CacheService {
   private redis:               AnyRedisClient | null = null;
   private redisConnecting:     Promise<AnyRedisClient> | null = null;
   private readonly cb:         L2CircuitBreaker;
+  /** In-process mutex lock map for single-process environments or Redis outages. */
+  private _localLocks = new Map<string, Promise<void>>();
+  /** Active OpenTelemetry monotonic counters. */
+  private _otelMetrics: Partial<Record<string, ICacheCounter>> = {};
   private snapshotLoaded       = false;
   private _readyPromise:       Promise<void> = Promise.resolve();
   private cleanupInterval:     ReturnType<typeof setInterval> | null = null;
@@ -368,10 +437,14 @@ export class CacheService {
   private latencyTracker: LatencyTracker | null = null;
   private readonly instanceId:       string;
   private readonly backplaneChannel: string;
+  private readonly backplaneStreamKey: string;
   private subClient:           AnyRedisClient | null = null;
+  private streamClient:        AnyRedisClient | null = null;
+  private _lastStreamId = '$';
+  private _destroyed = false;
   /** Timestamp (Date.now()) when the backplane subscriber last lost its connection. */
   private _subDisconnectedAt:  number | null = null;
-  private readonly counters = {
+  private counters = {
     gets:             0,
     l1Hits:           0,
     diskHits:         0,
@@ -384,6 +457,9 @@ export class CacheService {
     invSent:          0,
     invReceived:      0,
     invSkipped:       0,
+    streamEntriesReceived: 0,
+    streamReplays:    0,
+    streamGaps:       0,
     oomEvictions:     0,
     oomLastAt:        null as number | null,
     /** Times `increment()` hit a Redis error (fail-open by default, or fail-closed re-throw). */
@@ -391,6 +467,8 @@ export class CacheService {
     /** Times a later `create(ns)` call passed options differing from the live singleton. */
     singletonDivergences: 0,
     startedAt:        Date.now(),
+    bloomChecks:      0,
+    bloomFalsePositives: 0,
   };
 
   /** One-time guard so the in-process increment() fallback warning fires only once. */
@@ -428,7 +506,7 @@ export class CacheService {
       logger,
       l1MaxBytes:               options.l1MaxBytes   ?? 200 * 1024 * 1024,
       l1MaxEntries:             options.l1MaxEntries ?? 2_000,
-      categoryLimits:           { ...DEFAULT_CATEGORY_LIMITS, ...(options.categoryLimits ?? {}) },
+      categoryLimits:           { ...DEFAULT_CATEGORY_LIMITS, ...options.categoryLimits },
       forbiddenSnapshotPrefixes: forbiddenPrefixes,
       // Namespace-isolated defaults: separate dir / snapshot per namespace so
       // two instances with different namespaces never share cache files.
@@ -457,6 +535,7 @@ export class CacheService {
       l1EvictionWatermark:      Math.min(Math.max(options.l1EvictionWatermark ?? 0.9, 0), 1),
       ttlJitterFactor:          Math.min(Math.max(options.ttlJitterFactor ?? 0, 0), 1),
       tracer:                   options.tracer,
+      meter:                    options.meter,
       notFoundTtl:              options.notFoundTtl ?? 0,
       warmKeys:                 options.warmKeys,
       onHit:                    options.onHit,
@@ -473,8 +552,19 @@ export class CacheService {
       disableDisk:              options.disableDisk ?? false,
       redisClusterNodes:        options.redisClusterNodes,
       redisSentinel:            options.redisSentinel,
+      redisProtocol:            options.redisProtocol,
+      useShardedPubSub:         options.useShardedPubSub ?? false,
+      compression:              options.compression ?? 'none',
+      compressionThresholdBytes: options.compressionThresholdBytes ?? 1024,
       strictSingleton:          options.strictSingleton ?? false,
       failClosed:               options.failClosed ?? false,
+      tagStrategy:              options.tagStrategy ?? 'set',
+      tagVersionTtlMs:          options.tagVersionTtlMs ?? 5_000,
+      cloneStrategy:            options.cloneStrategy ?? 'none',
+      backplaneMode:            options.backplaneMode ?? 'pubsub',
+      backplaneStreamMaxLen:    options.backplaneStreamMaxLen ?? 10_000,
+      backplaneStreamBlockMs:   options.backplaneStreamBlockMs ?? 2_000,
+      backplaneStreamKey:       options.backplaneStreamKey,
     };
 
     // Circuit breaker for L2 Redis
@@ -513,6 +603,8 @@ export class CacheService {
       entryMaxBytes:     this.opts.diskEntryMaxBytes,
       forbiddenPrefixes: forbiddenPrefixes,
       encryption:       this.enc.isEnabled ? this.enc : null,
+      compression:      this.opts.compression,
+      compressionThresholdBytes: this.opts.compressionThresholdBytes,
       logger,
     });
 
@@ -551,8 +643,8 @@ export class CacheService {
     process.once('SIGTERM', this._shutdownHandler);
     process.once('SIGINT',  this._shutdownHandler);
 
-    // ── Fix 1: Worker thread pool for off-main-thread AES-GCM ────────────────
-    if (this.opts.workerThreads && this.enc.isEnabled) {
+    // ── Fix 1: Worker thread pool for off-main-thread AES-GCM & Compression ──
+    if (this.opts.workerThreads) {
       try {
         const encRef = this.enc.toWorkerInit();
         this._workerPool = new WorkerPool({
@@ -560,6 +652,8 @@ export class CacheService {
           mode:          encRef.mode as never,
           prevKeyBase64: encRef.prevKeyBase64,
           prevMode:      encRef.prevMode as never,
+          compression:   this.opts.compression,
+          compressionThresholdBytes: this.opts.compressionThresholdBytes,
           size:          this.opts.workerPoolSize || undefined,
         });
         if (this._workerPool.isAvailable) {
@@ -621,14 +715,37 @@ export class CacheService {
       if (this.metricsInterval.unref) this.metricsInterval.unref();
     }
 
-    // Backplane: assign instance ID + channel, then subscribe
-    this.instanceId       = crypto.randomBytes(8).toString('hex');
-    this.backplaneChannel = `tricache:inv${ns ? ':' + ns : ''}`;
+    // Backplane: assign instance ID + channel + streamKey, then subscribe
+    this.instanceId         = crypto.randomBytes(8).toString('hex');
+    this.backplaneChannel   = `tricache:inv${ns ? ':' + ns : ''}`;
+    this.backplaneStreamKey = options.backplaneStreamKey ?? `tricache:stream:{${ns || 'default'}}`;
     this.initBackplane();
 
     // Auto-warm from L2 if warmKeys is configured; ready() waits for completion.
     if (this.opts.warmKeys) {
       this._readyPromise = this.warmFromL2(this.opts.warmKeys).then(() => undefined);
+    }
+
+    // Native OpenTelemetry metrics integration
+    if (this.opts.meter) {
+      this._initOtelMetrics(this.opts.meter);
+      const otel = this._otelMetrics;
+      const nsAttr = this._namespace ? { namespace: this._namespace } : undefined;
+      const targetCounters = this.counters;
+
+      this.counters = new Proxy(targetCounters, {
+        set(target, prop, value, receiver) {
+          const oldVal = (target as any)[prop];
+          const ok = Reflect.set(target, prop, value, receiver);
+          if (typeof prop === 'string' && typeof value === 'number' && typeof oldVal === 'number') {
+            const diff = value - oldVal;
+            if (diff > 0 && otel[prop]) {
+              otel[prop]!.add(diff, nsAttr);
+            }
+          }
+          return ok;
+        },
+      });
     }
   }
 
@@ -793,22 +910,18 @@ export class CacheService {
     return CacheService._nullSpan;
   }
 
-  private initBackplane(): void {
-    if (!this.opts.invalidationBackplane || this._redisDisabled) return;
-    if (this.subClient) return;
-
-    // ── Fix 4: Cluster/Sentinel subscriber ─────────────────────────────────
-    let sub: AnyRedisClient;
+  private createDedicatedRedisClient(): AnyRedisClient {
     if (this.opts.redisClusterNodes?.length) {
-      sub = new RedisCluster(this.opts.redisClusterNodes, {
+      return new RedisCluster(this.opts.redisClusterNodes, {
         redisOptions: {
           tls:                  this.opts.redisTls ? {} : undefined,
           connectTimeout:       10_000,
           maxRetriesPerRequest: null as unknown as number,
+          ...(this.opts.redisProtocol && { protocol: this.opts.redisProtocol }),
         },
       });
     } else if (this.opts.redisSentinel) {
-      sub = new RedisClient({
+      return new RedisClient({
         sentinels:            this.opts.redisSentinel.sentinels,
         name:                 this.opts.redisSentinel.name,
         tls:                  this.opts.redisTls ? {} : undefined,
@@ -817,9 +930,10 @@ export class CacheService {
         maxRetriesPerRequest: null as unknown as number,
         enableAutoPipelining: false,
         retryStrategy:        (times: number) => Math.min(times * 50, 2_000),
+        ...(this.opts.redisProtocol && { protocol: this.opts.redisProtocol }),
       });
     } else {
-      sub = new RedisClient({
+      return new RedisClient({
         host:                 this.opts.redisHost,
         port:                 this.opts.redisPort,
         tls:                  this.opts.redisTls ? {} : undefined,
@@ -829,13 +943,30 @@ export class CacheService {
         enableAutoPipelining: false,
         family:               4,
         retryStrategy:        (times: number) => Math.min(times * 50, 2_000),
+        ...(this.opts.redisProtocol && { protocol: this.opts.redisProtocol }),
       });
     }
+  }
 
-    sub.on('error', (e: Error) =>
-      this.logger.debug('Backplane subscriber error', { error: e.message }));
+  private initBackplane(): void {
+    if (!this.opts.invalidationBackplane || this._redisDisabled) return;
 
-    // ── Fix 2: Staleness fence — track disconnect time ──────────────────────
+    if (this.opts.backplaneMode === 'stream') {
+      if (this.streamClient) return;
+      void this._startStreamConsumer();
+      return;
+    }
+
+    if (this.subClient) return;
+
+    const sub = this.createDedicatedRedisClient();
+
+    sub.on('error', (e: Error) => {
+      this._checkAndLogResp3Hint(e);
+      this.logger.debug('Backplane subscriber error', { error: e.message });
+    });
+
+    // ── Staleness fence — track disconnect time ──────────────────────
     sub.on('close', () => {
       if (this._subDisconnectedAt === null) {
         this._subDisconnectedAt = Date.now();
@@ -847,9 +978,6 @@ export class CacheService {
       if (this._subDisconnectedAt !== null && this.opts.backplaneMaxStalenessMs > 0) {
         const gapMs = Date.now() - this._subDisconnectedAt;
         if (gapMs > this.opts.backplaneMaxStalenessMs) {
-          // We were disconnected long enough that peer invalidations were
-          // almost certainly missed.  Evict every L1 entry written before
-          // the disconnect started so stale data cannot be served.
           const evicted = this.l1.evictSetBefore(this._subDisconnectedAt);
           this.logger.warn('Backplane: reconnect after gap — flushed potentially stale L1 entries', {
             gapMs, evicted,
@@ -860,19 +988,138 @@ export class CacheService {
       }
     });
 
-    sub.on('message', (_channel: string, message: string) => {
-      this._handleBackplaneMessage(message);
-    });
+    const isClusterSharded = Boolean(this.opts.useShardedPubSub && this.opts.redisClusterNodes?.length);
 
-    sub.subscribe(this.backplaneChannel)
-      .then(() => this.logger.info('Backplane: subscribed', {
-        channel: this.backplaneChannel, instanceId: this.instanceId,
-      }))
-      .catch((err: Error) => this.logger.warn('Backplane: subscribe failed', {
-        error: err.message,
-      }));
+    if (isClusterSharded) {
+      sub.on('smessage', (_channel: string, message: string) => {
+        this._handleBackplaneMessage(message);
+      });
+      (sub as unknown as { ssubscribe: (c: string) => Promise<unknown> })
+        .ssubscribe(this.backplaneChannel)
+        .then(() => this.logger.info('Backplane: sharded subscribed', {
+          channel: this.backplaneChannel, instanceId: this.instanceId,
+        }))
+        .catch((err: Error) => this.logger.warn('Backplane: sharded subscribe failed', {
+          error: err.message,
+        }));
+    } else {
+      sub.on('message', (_channel: string, message: string) => {
+        this._handleBackplaneMessage(message);
+      });
+      sub.subscribe(this.backplaneChannel)
+        .then(() => this.logger.info('Backplane: subscribed', {
+          channel: this.backplaneChannel, instanceId: this.instanceId,
+        }))
+        .catch((err: Error) => this.logger.warn('Backplane: subscribe failed', {
+          error: err.message,
+        }));
+    }
 
     this.subClient = sub;
+  }
+
+  private async _startStreamConsumer(): Promise<void> {
+    const sub = this.streamClient ?? this.createDedicatedRedisClient();
+    this.streamClient = sub;
+
+    if (typeof (sub as any).on === 'function') {
+      sub.on('error', (e: Error) =>
+        this.logger.debug('Backplane stream consumer error', { error: e.message }));
+
+      sub.on('close', () => {
+        if (this._subDisconnectedAt === null) {
+          this._subDisconnectedAt = Date.now();
+          this.logger.debug('Backplane stream: consumer disconnected', { at: this._subDisconnectedAt });
+        }
+      });
+
+      sub.on('ready', () => {
+        if (this._subDisconnectedAt !== null) {
+          this.logger.debug('Backplane stream: consumer reconnected, resuming stream read', { lastId: this._lastStreamId });
+          this._subDisconnectedAt = null;
+        }
+      });
+    }
+
+    // Continuous async worker loop
+    const runLoop = async () => {
+      while (!this._destroyed && !this._redisDisabled) {
+        try {
+          const res = await (sub as any).xread(
+            'BLOCK', this.opts.backplaneStreamBlockMs,
+            'STREAMS', this.backplaneStreamKey, this._lastStreamId,
+          ) as Array<[string, Array<[string, string[]]>]> | null;
+
+          if (this._destroyed) break;
+
+          if (res && res.length > 0) {
+            for (const [, entries] of res) {
+              if (entries.length > 0) {
+                if (this._lastStreamId !== '$') {
+                  this.counters.streamReplays++;
+                }
+
+                for (const [id, fields] of entries) {
+                  this._lastStreamId = id;
+                  this.counters.streamEntriesReceived++;
+
+                  let op = '';
+                  let key = '';
+                  let src = '';
+                  let tagVersion: number | undefined;
+
+                  for (let i = 0; i < fields.length; i += 2) {
+                    const f = fields[i];
+                    const v = fields[i + 1];
+                    if (f === 'op') op = v;
+                    else if (f === 'key') key = v;
+                    else if (f === 'src') src = v;
+                    else if (f === 'tagVersion') tagVersion = parseInt(v, 10);
+                  }
+
+                  if (src === this.instanceId) {
+                    this.counters.invSkipped++;
+                    continue;
+                  }
+
+                  this.counters.invReceived++;
+                  this._applyInvalidationEvent(op, key, tagVersion);
+                }
+              }
+            }
+          } else {
+            // Idle timeout without messages — yield briefly before next long-poll
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+        } catch (err) {
+          if (this._destroyed) break;
+          const msg = (err as Error).message ?? '';
+          if (msg.includes('NOGROUP') || msg.includes('smaller than') || msg.includes('trimmed')) {
+            this.counters.streamGaps++;
+            this.l1.clear();
+            this._lastStreamId = '$';
+          }
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      }
+    };
+
+    void runLoop();
+  }
+
+  private _applyInvalidationEvent(op: string, key: string, tagVersion?: number): void {
+    if (op === 'del') {
+      this.l1.delete(key);
+      setImmediate(() => { if (!this._diskDisabled) this.disk.delete(key); });
+      this._cascadeDependencies(key);
+    } else if (op === 'del-glob') {
+      this.l1.deletePattern(key);
+    } else if (op === 'tag_incr') {
+      const tag = key;
+      const ver = typeof tagVersion === 'number' ? tagVersion : ((this.tagVersions.get(tag)?.version ?? 0) + 1);
+      this._setLocalTagVersion(tag, ver, Date.now());
+    }
+    this.logger.debug('Backplane: invalidation applied', { op, key: key.slice(0, 60) });
   }
 
   /** @internal Exposed for testing. Applies a raw backplane JSON message to local state. */
@@ -885,7 +1132,7 @@ export class CacheService {
         Array.isArray(msg) ||
         typeof msg.src !== 'string' ||
         typeof msg.key !== 'string' ||
-        (msg.op !== 'del' && msg.op !== 'del-glob')
+        (msg.op !== 'del' && msg.op !== 'del-glob' && msg.op !== 'tag_incr')
       ) {
         this.logger.warn('Backplane: rejected invalid pubsub message format', {
           raw: typeof message === 'string' ? message.slice(0, 100).replace(/[\r\n\t]/g, ' ') : String(message),
@@ -897,40 +1144,134 @@ export class CacheService {
         return; // own message — our L1 is already current
       }
       this.counters.invReceived++;
-      if (msg.op === 'del') {
-        // L1 eviction is synchronous and O(1); disk delete is deferred via
-        // setImmediate so the event-loop tick that processes this pub/sub
-        // message returns immediately without blocking hot get() calls.
-        this.l1.delete(msg.key);
-        setImmediate(() => { if (!this._diskDisabled) this.disk.delete(msg.key); });
-        // Cascade: evict dependents registered on this instance for the
-        // deleted key — same logic the local delete() path runs, now also
-        // applied to peer-originated invalidations so fleet-wide deletes
-        // propagate dependency cascades to every node.
-        this._cascadeDependencies(msg.key);
-      } else if (msg.op === 'del-glob') {
-        // Glob patterns clean L1 only — disk entries expire naturally via
-        // the background purge timer or are bypassed on the next L1 miss.
-        this.l1.deletePattern(msg.key);
-      }
-      this.logger.debug('Backplane: peer invalidation applied', {
-        op: msg.op, key: msg.key.slice(0, 60),
-      });
+      this._applyInvalidationEvent(msg.op, msg.key, typeof msg.tagVersion === 'number' ? msg.tagVersion : undefined);
     } catch {
       this.logger.warn('Backplane: malformed message JSON parse failed');
     }
   }
 
-  private async publishInvalidation(op: 'del' | 'del-glob', key: string): Promise<void> {
+  private async publishInvalidation(op: 'del' | 'del-glob' | 'tag_incr', key: string, tagVersion?: number): Promise<void> {
     if (!this.opts.invalidationBackplane || this._redisDisabled) return;
     try {
       const client = await this.getRedis();
-      await client.publish(
-        this.backplaneChannel,
-        JSON.stringify({ op, key, src: this.instanceId }),
-      );
+
+      if (this.opts.backplaneMode === 'stream') {
+        const args: string[] = [
+          this.backplaneStreamKey,
+          'MAXLEN', '~', String(this.opts.backplaneStreamMaxLen),
+          '*',
+          'op', op,
+          'key', key,
+          'src', this.instanceId,
+        ];
+        if (typeof tagVersion === 'number') {
+          args.push('tagVersion', String(tagVersion));
+        }
+        await (client as any).xadd(...args);
+        this.counters.invSent++;
+        return;
+      }
+
+      const payload = JSON.stringify({ op, key, src: this.instanceId, tagVersion });
+      const isClusterSharded = Boolean(this.opts.useShardedPubSub && this.opts.redisClusterNodes?.length);
+      if (isClusterSharded && typeof (client as unknown as { spublish?: unknown }).spublish === 'function') {
+        await (client as unknown as { spublish: (c: string, m: string) => Promise<unknown> }).spublish(
+          this.backplaneChannel,
+          payload,
+        );
+      } else {
+        await client.publish(
+          this.backplaneChannel,
+          payload,
+        );
+      }
       this.counters.invSent++;
     } catch { /* non-critical — never block the caller */ }
+  }
+
+  private _setLocalTagVersion(tag: string, version: number, now = Date.now()): void {
+    const existing = this.tagVersions.get(tag)?.version ?? 0;
+    const finalVersion = Math.max(existing, version);
+    if (this.tagVersions.size >= 10_000 && !this.tagVersions.has(tag)) {
+      const oldestKey = this.tagVersions.keys().next().value;
+      if (oldestKey !== undefined) this.tagVersions.delete(oldestKey);
+    }
+    this.tagVersions.set(tag, { version: finalVersion, lastSyncedAt: now });
+  }
+
+  private async _getTagVersion(tag: string): Promise<number> {
+    const now = Date.now();
+    const local = this.tagVersions.get(tag);
+    if (local && (now - local.lastSyncedAt < this.opts.tagVersionTtlMs)) {
+      return local.version;
+    }
+    if (!this._redisDisabled) {
+      try {
+        const client = await this.getRedis();
+        const raw = await client.get(this.nk(`tag_ver:${tag}`));
+        const version = raw ? parseInt(raw, 10) : 0;
+        this._setLocalTagVersion(tag, version, now);
+        return version;
+      } catch {
+        /* fallback to local */
+      }
+    }
+    return local?.version ?? 0;
+  }
+
+  private _deleteIfStale(k: string, setAtMs: number): void {
+    this.l1.deleteIfSetBefore(k, setAtMs);
+    if (!this._diskDisabled) this.disk.delete(k);
+    if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
+      void this.getRedis().then(client => {
+        return client.eval(LUA_COMPARE_AND_DELETE, 1, k, String(setAtMs));
+      }).catch(() => {});
+    }
+  }
+
+  /**
+   * Serialize payload for L2 Redis storage applying compression and encryption as configured.
+   * Offloads to worker thread if pool is active and payload exceeds threshold.
+   */
+  private async _serializeAndEncrypt(serialized: string): Promise<string> {
+    const isCompressed = this.opts.compression && this.opts.compression !== 'none' && serialized.length > this.opts.compressionThresholdBytes;
+    if (this._workerPool && (this.enc.isEnabled || isCompressed) && serialized.length > this.opts.workerThresholdBytes) {
+      return this._workerPool.encrypt(serialized);
+    }
+    if (isCompressed) {
+      const compressed = compressBuffer(Buffer.from(serialized, 'utf8'), this.opts.compression);
+      if (this.enc.isEnabled) {
+        const encrypted = this.enc.encryptBuffer(compressed);
+        return PREFIX_ENC_COMPRESSED + encrypted.toString('base64');
+      }
+      return PREFIX_COMPRESSED + compressed.toString('base64');
+    }
+    return this.enc.isEnabled ? this.enc.encrypt(serialized) : serialized;
+  }
+
+  /**
+   * Deserialize raw L2 Redis entry applying decryption and decompression as needed.
+   * Offloads to worker thread if pool is active and payload exceeds threshold.
+   */
+  private async _decryptAndDeserialize<T>(raw: string): Promise<T> {
+    let plain: string;
+    if (this._workerPool && raw.length > this.opts.workerThresholdBytes) {
+      plain = await this._workerPool.decrypt(raw);
+    } else if (raw.startsWith(PREFIX_ENC_COMPRESSED)) {
+      const encBuf = Buffer.from(raw.slice(PREFIX_ENC_COMPRESSED.length), 'base64');
+      const decBuf = this.enc.decryptBuffer(encBuf);
+      const decompressed = decompressBuffer(decBuf, this.opts.compression !== 'none' ? this.opts.compression : 'brotli');
+      plain = decompressed.toString('utf8');
+    } else if (raw.startsWith(PREFIX_COMPRESSED)) {
+      const cmpBuf = Buffer.from(raw.slice(PREFIX_COMPRESSED.length), 'base64');
+      const decompressed = decompressBuffer(cmpBuf, this.opts.compression !== 'none' ? this.opts.compression : 'brotli');
+      plain = decompressed.toString('utf8');
+    } else if (raw.startsWith('enc:v1:') || this.enc.isEnabled) {
+      plain = this.enc.decrypt(raw);
+    } else {
+      plain = raw;
+    }
+    return JSON.parse(plain) as T;
   }
 
   /**
@@ -960,8 +1301,26 @@ export class CacheService {
     return keys;
   }
 
+  private _checkAndLogResp3Hint(err: Error): void {
+    const msg = err?.message || '';
+    if (
+      !this.opts.redisProtocol &&
+      (msg.includes('unknown command') ||
+       msg.includes('HELLO') ||
+       msg.includes('protocol error') ||
+       msg.includes('ProtocolError') ||
+       msg.includes('Connection is closed'))
+    ) {
+      this.logger.warn(
+        'Redis connection/protocol error detected. If your Redis endpoint or proxy (e.g. Twemproxy, Envoy, older ElastiCache) does not support RESP3, set redisProtocol: 2 in CacheOptions to force RESP2 compatibility.',
+        { hint: 'redisProtocol: 2', originalError: msg },
+      );
+    }
+  }
+
   private async getRedis(): Promise<AnyRedisClient> {
     if (!this.cb.isAllowed()) throw new Error('tricache: L2 circuit breaker is open');
+    if (this.redis) return this.redis;
     if (this.redisConnecting) return this.redisConnecting;
 
     this.redisConnecting = (async () => {
@@ -977,13 +1336,17 @@ export class CacheService {
               connectTimeout:       10_000,
               maxRetriesPerRequest: 3,
               keepAlive:            30_000,
+              ...(this.opts.redisProtocol && { protocol: this.opts.redisProtocol }),
             },
             enableAutoPipelining: true,
             retryDelayOnClusterDown: 200,
             retryDelayOnFailover:    1_000,
           });
           client.on('connect',      () => this.logger.info('Redis Cluster connected'));
-          client.on('error',        (e: Error) => this.logger.error('Redis Cluster error', {}, e));
+          client.on('error',        (e: Error) => {
+            this._checkAndLogResp3Hint(e);
+            this.logger.error('Redis Cluster error', {}, e);
+          });
           client.on('reconnecting', () => this.logger.debug('Redis Cluster reconnecting'));
         } else if (this.opts.redisSentinel) {
           // Redis Sentinel — ioredis monitors master via sentinel topology.
@@ -997,9 +1360,13 @@ export class CacheService {
             enableAutoPipelining:  true,
             keepAlive:             30_000,
             retryStrategy: (times: number) => Math.min(times * 50, 2_000),
+            ...(this.opts.redisProtocol && { protocol: this.opts.redisProtocol }),
           });
           client.on('connect',      () => this.logger.info('Redis Sentinel connected', { name: this.opts.redisSentinel!.name }));
-          client.on('error',        (e: Error) => this.logger.error('Redis Sentinel error', { name: this.opts.redisSentinel!.name }, e));
+          client.on('error',        (e: Error) => {
+            this._checkAndLogResp3Hint(e);
+            this.logger.error('Redis Sentinel error', { name: this.opts.redisSentinel!.name }, e);
+          });
           client.on('reconnecting', () => this.logger.debug('Redis Sentinel reconnecting'));
         } else {
           // Single-node (original path)
@@ -1014,15 +1381,22 @@ export class CacheService {
             keepAlive:             30_000,
             family:                4,
             retryStrategy: (times: number) => Math.min(times * 50, 2_000),
+            ...(this.opts.redisProtocol && { protocol: this.opts.redisProtocol }),
           });
           client.on('connect',      () => this.logger.info('Redis connected', { host: this.opts.redisHost }));
-          client.on('error',        (e: Error) => this.logger.error('Redis error', { host: this.opts.redisHost }, e));
+          client.on('error',        (e: Error) => {
+            this._checkAndLogResp3Hint(e);
+            this.logger.error('Redis error', { host: this.opts.redisHost }, e);
+          });
           client.on('reconnecting', () => this.logger.debug('Redis reconnecting'));
         }
 
         await new Promise<void>((resolve, reject) => {
           client.once('ready', resolve);
-          client.once('error', reject);
+          client.once('error', (e: Error) => {
+            this._checkAndLogResp3Hint(e);
+            reject(e);
+          });
           setTimeout(() => reject(new Error('Redis connection timeout')), 15_000);
         });
 
@@ -1033,6 +1407,7 @@ export class CacheService {
       } catch (err) {
         this.cb.onFailure();
         this.redisConnecting = null; // allow retry on next call — fixes the cached-rejection bug
+        this._checkAndLogResp3Hint(err as Error);
         throw err;
       }
     })();
@@ -1051,7 +1426,7 @@ export class CacheService {
       const packed  = pack(payload);
       const final   = this.enc.isEnabled ? this.enc.encryptBuffer(packed) : packed;
       const dest    = altPath ?? this.opts.snapshotPath;
-
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.writeFileSync(dest, final, { mode: 0o600 });
       this.logger.info('Cache snapshot written', {
         path: dest, entries: entries.length,
@@ -1175,60 +1550,67 @@ export class CacheService {
     // L1: in-memory (fastest path)
     const l1Hit = this.l1.get(k);
     if (l1Hit !== null) {
-      if (l1Hit.isStale) {
-        const swrGraceMs = optSwr * 1_000;
-        if (swrGraceMs > 0 && !this.revalidating.has(k)) {
-          const priority = optPriority ?? inferPriority(cacheKey);
-          this.revalidating.add(k);
-          void this._revalidate(k, fetchFn, ttlSeconds * 1_000, swrGraceMs, priority);
-          this.counters.swrRevalidations++;
-          this.logger.debug('SWR: serving stale, revalidating', { cacheKey });
-        } else {
-          this.logger.debug('L1 hit');
-        }
-      } else {
-        this.logger.debug('L1 hit');
-        // Refresh-ahead and XFetch: proactively recompute a fresh entry before it expires.
-        // l1Hit already carries expiresAt/ttlMs/delta — no second Map lookup needed.
-        // Check opts first — pointless work when neither feature is configured.
-        // Local aliases for the opts fields already normalised at function entry.
-        const ra = optRefreshAhead;
-        const xb = optXfetchBeta;
-        if (ra || xb) {
-          // Reuse the timestamp already captured by l1.get() — avoids a second Date.now() syscall.
-          const now       = l1Hit.fetchedAt ?? Date.now();
-          const remaining = l1Hit.expiresAt - now;
-          const entryTtl  = l1Hit.ttlMs ?? ttlSeconds * 1_000;
-
-          const shouldRefreshAhead = ra ? remaining <= entryTtl * (1 - ra) : false;
-
-          // XFetch: fire with probability proportional to recompute cost (delta) vs. remaining TTL
-          // Formula: fire when remaining <= delta * beta * -ln(U), U ~ uniform(0,1)
-          const shouldXFetch = xb && l1Hit.delta != null
-            ? remaining <= l1Hit.delta * xb * -Math.log(Math.random())
-            : false;
-
-          // Set.has() deferred to here — the common case (fresh key, threshold not crossed)
-          // never pays the ~30 ns lookup cost.
-          if ((shouldRefreshAhead || shouldXFetch) && !this.revalidating.has(k)) {
-            // Defer inferPriority until we actually need it — avoids 3× string.includes()
-            // scans on every warm hit when the threshold check is false (the common case).
-            const priority = optPriority ?? inferPriority(cacheKey);
-            this.revalidating.add(k);
-            void this._revalidate(k, fetchFn, entryTtl, optSwr * 1_000, priority);
-            this.counters.swrRevalidations++;
-            this.logger.debug(
-              shouldXFetch ? 'XFetch: proactive background recompute' : 'Refresh-ahead: proactive background recompute',
-              { cacheKey, remainingMs: remaining, ttlMs: entryTtl },
-            );
+      let isGenerationalStale = false;
+      if (this.opts.tagStrategy === 'generational' && l1Hit.tagVersions) {
+        for (const [tag, entryVer] of Object.entries(l1Hit.tagVersions)) {
+          const currentVer = await this._getTagVersion(tag);
+          if (currentVer > entryVer) {
+            isGenerationalStale = true;
+            break;
           }
         }
       }
-      this.counters.l1Hits++;
-      this.opts.onHit?.(cacheKey, 'l1');
-      if (this.opts.frozen) deepFreeze(l1Hit.value);
-      span.setAttribute('cache.hit', 'l1').end();
-      return l1Hit.value as T;
+
+      if (isGenerationalStale) {
+        this._deleteIfStale(k, l1Hit.setAt ?? 0);
+      } else {
+        if (l1Hit.isStale) {
+          const swrGraceMs = optSwr * 1_000;
+          if (swrGraceMs > 0 && !this.revalidating.has(k)) {
+            const priority = optPriority ?? inferPriority(cacheKey);
+            this.revalidating.add(k);
+            void this._revalidate(k, fetchFn, ttlSeconds * 1_000, swrGraceMs, priority);
+            this.counters.swrRevalidations++;
+            this.logger.debug('SWR: serving stale, revalidating', { cacheKey });
+          } else {
+            this.logger.debug('L1 hit');
+          }
+        } else {
+          this.logger.debug('L1 hit');
+          // Refresh-ahead and XFetch: proactively recompute a fresh entry before it expires.
+          // l1Hit already carries expiresAt/ttlMs/delta — no second Map lookup needed.
+          const ra = optRefreshAhead;
+          const xb = optXfetchBeta;
+          if (ra || xb) {
+            const now       = l1Hit.fetchedAt ?? Date.now();
+            const remaining = l1Hit.expiresAt - now;
+            const entryTtl  = l1Hit.ttlMs ?? ttlSeconds * 1_000;
+
+            const shouldRefreshAhead = ra ? remaining <= entryTtl * (1 - ra) : false;
+            const shouldXFetch = xb && l1Hit.delta != null
+              ? remaining <= l1Hit.delta * xb * -Math.log(Math.random())
+              : false;
+
+            if ((shouldRefreshAhead || shouldXFetch) && !this.revalidating.has(k)) {
+              const priority = optPriority ?? inferPriority(cacheKey);
+              this.revalidating.add(k);
+              void this._revalidate(k, fetchFn, entryTtl, optSwr * 1_000, priority);
+              this.counters.swrRevalidations++;
+              this.logger.debug(
+                shouldXFetch ? 'XFetch: proactive background recompute' : 'Refresh-ahead: proactive background recompute',
+                { cacheKey, remainingMs: remaining, ttlMs: entryTtl },
+              );
+            }
+          }
+        }
+        this.counters.l1Hits++;
+        this.opts.onHit?.(cacheKey, 'l1');
+        if (this.opts.frozen) deepFreeze(l1Hit.value);
+        span.setAttribute('cache.hit', 'l1').end();
+        return (this.opts.cloneStrategy === 'structuredClone' && l1Hit.value != null && typeof l1Hit.value === 'object')
+          ? structuredClone(l1Hit.value) as T
+          : l1Hit.value as T;
+      }
     }
 
     const ttlMs      = this._jitterTtl(ttlSeconds * 1_000);
@@ -1239,23 +1621,53 @@ export class CacheService {
     if (!this._redisDisabled) {
       try {
         const client = await this.getRedis();
-        const raw    = await client.get(k);
-        this.cb.onSuccess();
-        if (raw) {
-          // ── Fix 1: offload decryption to worker thread for large payloads ──
-          let decrypted: string;
-          if (this._workerPool && this.enc.isEnabled && raw.length > this.opts.workerThresholdBytes) {
-            decrypted = await this._workerPool.decrypt(raw);
-          } else {
-            decrypted = this.enc.isEnabled ? this.enc.decrypt(raw) : raw;
+        if (this.opts.tagStrategy === 'generational') {
+          const hashData = await client.hgetall(k);
+          this.cb.onSuccess();
+          if (hashData && hashData.d) {
+            let isStale = false;
+            let storedTagVersions: Record<string, number> = {};
+            if (hashData.tv) {
+              try { storedTagVersions = JSON.parse(hashData.tv); } catch { /* ignore */ }
+            }
+            for (const [tag, entryVer] of Object.entries(storedTagVersions)) {
+              const currentVer = await this._getTagVersion(tag);
+              if (currentVer > entryVer) {
+                isStale = true;
+                break;
+              }
+            }
+            if (isStale) {
+              const setAtMs = parseInt(hashData.t, 10) || 0;
+              this._deleteIfStale(k, setAtMs);
+            } else {
+              const parsed = await this._decryptAndDeserialize<T>(hashData.d);
+              this.l1.set(k, parsed, ttlMs, priority, undefined, undefined, storedTagVersions);
+              this.counters.l2Hits++;
+              this.opts.onHit?.(cacheKey, 'l2');
+              this.logger.debug('L2 hit (Redis hash)', { cacheKey });
+              span.setAttribute('cache.hit', 'l2').end();
+              if (this.opts.frozen) deepFreeze(parsed);
+              return (this.opts.cloneStrategy === 'structuredClone' && parsed != null && typeof parsed === 'object')
+                ? structuredClone(parsed)
+                : parsed;
+            }
           }
-          const parsed = JSON.parse(decrypted) as T;
-          this.l1.set(k, parsed, ttlMs, priority);
-          this.counters.l2Hits++;
-          this.opts.onHit?.(cacheKey, 'l2');
-          this.logger.debug('L2 hit (Redis)', { cacheKey });
-          span.setAttribute('cache.hit', 'l2').end();
-          return parsed;
+        } else {
+          const raw = await client.get(k);
+          this.cb.onSuccess();
+          if (raw) {
+            const parsed = await this._decryptAndDeserialize<T>(raw);
+            this.l1.set(k, parsed, ttlMs, priority);
+            this.counters.l2Hits++;
+            this.opts.onHit?.(cacheKey, 'l2');
+            this.logger.debug('L2 hit (Redis)', { cacheKey });
+            span.setAttribute('cache.hit', 'l2').end();
+            if (this.opts.frozen) deepFreeze(parsed);
+            return (this.opts.cloneStrategy === 'structuredClone' && parsed != null && typeof parsed === 'object')
+              ? structuredClone(parsed)
+              : parsed;
+          }
         }
       } catch (err) {
         this.cb.onFailure();
@@ -1267,18 +1679,36 @@ export class CacheService {
     if (!this._diskDisabled) {
       const diskHit = this.disk.load(k);
       if (diskHit !== null) {
-        const promoted = this.l1.importEntries(
-          [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
-          this.opts.forbiddenSnapshotPrefixes,
-        );
-        if (promoted > 0) {
-          const l1Check = this.l1.get(k);
-          if (l1Check !== null) {
-            this.counters.diskHits++;
-            this.opts.onHit?.(cacheKey, 'disk');
-            this.logger.debug('L1.5 hit (disk → L1)', { cacheKey });
-            span.setAttribute('cache.hit', 'disk').end();
-            return l1Check.value as T;
+        let isDiskStale = false;
+        if (this.opts.tagStrategy === 'generational' && diskHit.tagVersions) {
+          for (const [tag, entryVer] of Object.entries(diskHit.tagVersions)) {
+            const currentVer = await this._getTagVersion(tag);
+            if (currentVer > entryVer) {
+              isDiskStale = true;
+              break;
+            }
+          }
+        }
+
+        if (isDiskStale) {
+          this.disk.delete(k);
+        } else {
+          const promoted = this.l1.importEntries(
+            [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
+            this.opts.forbiddenSnapshotPrefixes,
+          );
+          if (promoted > 0) {
+            const l1Check = this.l1.get(k);
+            if (l1Check !== null) {
+              this.counters.diskHits++;
+              this.opts.onHit?.(cacheKey, 'disk');
+              this.logger.debug('L1.5 hit (disk → L1)', { cacheKey });
+              span.setAttribute('cache.hit', 'disk').end();
+              if (this.opts.frozen) deepFreeze(l1Check.value);
+              return (this.opts.cloneStrategy === 'structuredClone' && l1Check.value != null && typeof l1Check.value === 'object')
+                ? structuredClone(l1Check.value) as T
+                : l1Check.value as T;
+            }
           }
         }
       }
@@ -1307,9 +1737,6 @@ export class CacheService {
         const notFoundTtlMs = (optNotFoundTtl ?? this.opts.notFoundTtl) * 1_000;
         let effectiveTtl  = (data == null && notFoundTtlMs > 0) ? notFoundTtlMs : ttlMs;
 
-        // Adaptive TTL: record this fetch duration and override the caller-supplied
-        // TTL once ≥ 5 samples are available for the key.
-        // Skipped for negative-cache (null/undefined) results — those use notFoundTtl.
         if (this.latencyTracker && data != null) {
           this.latencyTracker.record(k, delta);
           const p95 = this.latencyTracker.p95(k);
@@ -1325,21 +1752,39 @@ export class CacheService {
         const staleAt  = swrGraceMs > 0 ? Date.now() + effectiveTtl : undefined;
         const storeTtl = swrGraceMs > 0 ? effectiveTtl + swrGraceMs : effectiveTtl;
 
-        this.l1.set(k, data, storeTtl, priority, staleAt, delta);
-        if (optTags?.length) await this._registerTags(k, optTags, Math.ceil(effectiveTtl / 1_000));
+        let activeTagVersions: Record<string, number> | undefined;
+        if (optTags?.length) {
+          if (this.opts.tagStrategy === 'generational') {
+            activeTagVersions = {};
+            for (const tag of optTags) {
+              activeTagVersions[tag] = await this._getTagVersion(tag);
+            }
+          } else {
+            await this._registerTags(k, optTags, Math.ceil(effectiveTtl / 1_000));
+          }
+        }
+
+        this.l1.set(k, data, storeTtl, priority, staleAt, delta, activeTagVersions);
 
         if (!this._redisDisabled) {
           try {
             const client     = await this.getRedis();
             const serialized = JSON.stringify(data);
-            // ── Fix 1: offload encryption to worker thread for large payloads ──
-            let toStore: string;
-            if (this._workerPool && this.enc.isEnabled && serialized.length > this.opts.workerThresholdBytes) {
-              toStore = await this._workerPool.encrypt(serialized);
+            const toStore    = await this._serializeAndEncrypt(serialized);
+            const ttlSec     = Math.ceil(effectiveTtl / 1_000);
+            if (this.opts.tagStrategy === 'generational' && activeTagVersions) {
+              const now = Date.now();
+              const tx = client.multi();
+              tx.hset(k, {
+                d: toStore,
+                t: String(now),
+                tv: JSON.stringify(activeTagVersions),
+              });
+              tx.expire(k, ttlSec);
+              await tx.exec();
             } else {
-              toStore = this.enc.isEnabled ? this.enc.encrypt(serialized) : serialized;
+              await client.setex(k, ttlSec, toStore);
             }
-            await client.setex(k, Math.ceil(effectiveTtl / 1_000), toStore);
             this.cb.onSuccess();
             this.logger.debug('Cached L1+L2', { cacheKey, ttlSeconds, encrypted: this.enc.isEnabled });
           } catch {
@@ -1350,7 +1795,10 @@ export class CacheService {
           this.logger.debug('Cached L1', { cacheKey });
         }
 
-        return data;
+        if (this.opts.frozen) deepFreeze(data);
+        return (this.opts.cloneStrategy === 'structuredClone' && data != null && typeof data === 'object')
+          ? structuredClone(data)
+          : data;
       } finally {
         this.inflight.delete(k);
         span.end();
@@ -1359,6 +1807,28 @@ export class CacheService {
 
     this.inflight.set(k, fetchPromise);
     return fetchPromise;
+  }
+
+  /**
+   * Universal fetch-and-cache wrapper with an ergonomic options object.
+   *
+   * Drop-in ergonomic alternative to `get()` matching developer expectations
+   * from `cache-manager` and `keyv`.
+   *
+   * @param cacheKey - Unique cache key.
+   * @param fetchFn  - Executed on a cache miss to retrieve fresh data.
+   * @param options  - Optional configuration object (TTL, SWR, tags, priority, etc.).
+   *
+   * @example
+   * const user = await cache.wrap(`user:${id}`, () => db.user.findUnique({ where: { id } }), {
+   *   ttl: 300,
+   *   swr: 60,
+   *   tags: ['users'],
+   * });
+   */
+  wrap<T>(cacheKey: string, fetchFn: () => Promise<T>, options?: WrapOptions): Promise<T> {
+    const ttl = options?.ttl ?? 300;
+    return this.get<T>(cacheKey, fetchFn, ttl, options);
   }
 
   private async _revalidate<T>(
@@ -1377,20 +1847,36 @@ export class CacheService {
       // Keep the latency tracker current during SWR background revalidations too
       if (this.latencyTracker && data != null) this.latencyTracker.record(cacheKey, delta);
 
-      this.l1.set(cacheKey, data, ttlMs + swrGraceMs, priority, staleAt, delta);
+      let activeTagVersions: Record<string, number> | undefined;
+      const l1Existing = this.l1.get(cacheKey);
+      if (this.opts.tagStrategy === 'generational' && l1Existing?.tagVersions) {
+        activeTagVersions = {};
+        for (const tag of Object.keys(l1Existing.tagVersions)) {
+          activeTagVersions[tag] = await this._getTagVersion(tag);
+        }
+      }
+
+      this.l1.set(cacheKey, data, ttlMs + swrGraceMs, priority, staleAt, delta, activeTagVersions);
 
       if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
         try {
           const client = await this.getRedis();
           const s      = JSON.stringify(data);
-          // ── Fix 1: offload encryption to worker thread for large payloads ──
-          let stored: string;
-          if (this._workerPool && this.enc.isEnabled && s.length > this.opts.workerThresholdBytes) {
-            stored = await this._workerPool.encrypt(s);
+          const stored = await this._serializeAndEncrypt(s);
+          const ttlSec = Math.ceil(ttlMs / 1_000);
+          if (this.opts.tagStrategy === 'generational' && activeTagVersions) {
+            const now = Date.now();
+            const tx = client.multi();
+            tx.hset(cacheKey, {
+              d: stored,
+              t: String(now),
+              tv: JSON.stringify(activeTagVersions),
+            });
+            tx.expire(cacheKey, ttlSec);
+            await tx.exec();
           } else {
-            stored = this.enc.isEnabled ? this.enc.encrypt(s) : s;
+            await client.setex(cacheKey, ttlSec, stored);
           }
-          await client.setex(cacheKey, Math.ceil(ttlMs / 1_000), stored);
         } catch { /* ok */ }
       }
       this.logger.debug('SWR: revalidation complete', { cacheKey });
@@ -1419,9 +1905,20 @@ export class CacheService {
     const p     = priority ?? inferPriority(cacheKey);
     const k     = this.nk(cacheKey);
     this.counters.sets++;
-    this.l1.set(k, data, ttlMs, p);
 
-    if (opts?.tags?.length) await this._registerTags(k, opts.tags, ttlSeconds);
+    let activeTagVersions: Record<string, number> | undefined;
+    if (opts?.tags?.length) {
+      if (this.opts.tagStrategy === 'generational') {
+        activeTagVersions = {};
+        for (const tag of opts.tags) {
+          activeTagVersions[tag] = await this._getTagVersion(tag);
+        }
+      } else {
+        await this._registerTags(k, opts.tags, ttlSeconds);
+      }
+    }
+
+    this.l1.set(k, data, ttlMs, p, undefined, undefined, activeTagVersions);
 
     // Register dependency patterns: when any key matching a pattern is deleted,
     // this key (k) is automatically cascaded.
@@ -1438,14 +1935,21 @@ export class CacheService {
       try {
         const client = await this.getRedis();
         const s      = JSON.stringify(data);
-        // ── Fix 1: offload encryption to worker thread for large payloads ──
-        let stored: string;
-        if (this._workerPool && this.enc.isEnabled && s.length > this.opts.workerThresholdBytes) {
-          stored = await this._workerPool.encrypt(s);
+        const stored = await this._serializeAndEncrypt(s);
+        const ttlSec = Math.ceil(ttlMs / 1_000);
+        if (this.opts.tagStrategy === 'generational' && activeTagVersions) {
+          const now = Date.now();
+          const tx = client.multi();
+          tx.hset(k, {
+            d: stored,
+            t: String(now),
+            tv: JSON.stringify(activeTagVersions),
+          });
+          tx.expire(k, ttlSec);
+          await tx.exec();
         } else {
-          stored = this.enc.isEnabled ? this.enc.encrypt(s) : s;
+          await client.setex(k, ttlSec, stored);
         }
-        await client.setex(k, Math.ceil(ttlMs / 1_000), stored);
         this.cb.onSuccess();
       } catch (err) {
         this.cb.onFailure();
@@ -1564,7 +2068,7 @@ export class CacheService {
         );
       }
       const now   = Date.now();
-      const ttlMs = (ttlSeconds ?? 60) * 1_000;
+      const ttlMs = (ttlSeconds ?? DEFAULT_COUNTER_TTL_SECONDS) * 1_000;
       const entry = this._l1Counters.get(k);
       if (entry && entry.expiresAt > now) {
         entry.value++;
@@ -1612,6 +2116,7 @@ export class CacheService {
       if (!this._diskDisabled) this.disk.clear();
       this._l1Counters.clear();
       this.tagIndex.clear();
+      this.tagVersions.clear();
     }
 
     if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
@@ -1664,9 +2169,10 @@ export class CacheService {
    * for (const key of cache.keys()) console.log(key);
    */
   *keys(): Generator<string> {
-    const prefixLen = this._namespace ? this._namespace.length + 1 : 0;
+    const prefix = this._namespace ? this._namespace + ':' : '';
     for (const key of this.l1.liveKeys()) {
-      yield prefixLen > 0 ? key.slice(prefixLen) : key;
+      if (prefix && !key.startsWith(prefix)) continue;
+      yield prefix ? key.slice(prefix.length) : key;
     }
   }
 
@@ -1678,8 +2184,15 @@ export class CacheService {
    * for (const val of cache.values<User>()) console.log(val.id);
    */
   *values<T = unknown>(): Generator<T> {
-    // yield* delegates directly into liveValues(), collapsing one generator frame.
-    yield* this.l1.liveValues() as Generator<T>;
+    const prefix = this._namespace ? this._namespace + ':' : '';
+    if (!prefix) {
+      yield* this.l1.liveValues() as Generator<T>;
+    } else {
+      for (const [key, entry] of this.l1.liveEntries()) {
+        if (!key.startsWith(prefix)) continue;
+        yield this.l1.resolveValue(entry) as T;
+      }
+    }
   }
 
   /**
@@ -1690,10 +2203,10 @@ export class CacheService {
    * for (const [key, val] of cache.entries<User>()) console.log(key, val.id);
    */
   *entries<T = unknown>(): Generator<[string, T]> {
-    const prefixLen = this._namespace ? this._namespace.length + 1 : 0;
+    const prefix = this._namespace ? this._namespace + ':' : '';
     for (const [key, entry] of this.l1.liveEntries()) {
-      const k = prefixLen > 0 ? key.slice(prefixLen) : key;
-      yield [k, this.l1.resolveValue(entry) as T];
+      if (prefix && !key.startsWith(prefix)) continue;
+      yield [prefix ? key.slice(prefix.length) : key, this.l1.resolveValue(entry) as T];
     }
   }
 
@@ -1776,7 +2289,7 @@ export class CacheService {
     ttl: number | ((key: string) => number) = 300,
     priority?: CachePriority,
   ): Promise<(T | undefined)[]> {
-    const result: (T | undefined)[] = new Array(keys.length);
+    const result: (T | undefined)[] = Array.from({ length: keys.length });
     const missIndexes: number[] = [];
     const missKeys:   string[]  = [];
 
@@ -1808,15 +2321,7 @@ export class CacheService {
           const raw = raws[j] ? (raws[j] as [Error | null, string | null])[1] : null;
           const idx = missIndexes[j];
           if (raw) {
-            let parsed: T;
-            if (this.enc.isEnabled) {
-              const decrypted = (this._workerPool && raw.length > this.opts.workerThresholdBytes)
-                ? await this._workerPool.decrypt(raw)
-                : this.enc.decrypt(raw);
-              parsed = JSON.parse(decrypted) as T;
-            } else {
-              parsed = JSON.parse(raw) as T;
-            }
+            const parsed = await this._decryptAndDeserialize<T>(raw);
             const k = nsKeys[j];
             const p = priority ?? inferPriority(missKeys[j]);
             this.l1.set(k, parsed, this._jitterTtl((typeof ttl === 'function' ? ttl(missKeys[j]) : ttl) * 1_000), p);
@@ -1971,13 +2476,12 @@ export class CacheService {
         const [err, raw] = results[i];
         if (err || raw == null) continue;
         try {
-          const decrypted = this.enc.isEnabled ? this.enc.decrypt(raw) : raw;
-          const parsed    = JSON.parse(decrypted) as unknown;
+          const parsed    = await this._decryptAndDeserialize<unknown>(raw);
           // Use a 10-minute TTL as a reasonable default; the real TTL is not
           // returned by GET (use PTTL to be precise, but that doubles round-trips).
           const remainingMs = 10 * 60 * 1_000;
           this.l1.set(matchedKeys[i], parsed, remainingMs, opts?.priority ?? inferPriority(this.unnk(matchedKeys[i])));
-          loaded++;;
+          loaded++;
         } catch { /* skip malformed entries */ }
       }
       void now; // suppress unused warning
@@ -2002,6 +2506,26 @@ export class CacheService {
    * await cache.invalidateTag('catalog'); // clears product:1 and any other tagged entries
    */
   async invalidateTag(tag: string): Promise<void> {
+    if (this.opts.tagStrategy === 'generational') {
+      let newVer = 1;
+      if (!this._redisDisabled) {
+        try {
+          const client = await this.getRedis();
+          newVer = await client.incr(this.nk(`tag_ver:${tag}`));
+        } catch (err) {
+          this.logger.debug('invalidateTag: Redis unavailable', { tag, error: (err as Error).message });
+          const current = this.tagVersions.get(tag)?.version ?? 0;
+          newVer = current + 1;
+        }
+      } else {
+        const current = this.tagVersions.get(tag)?.version ?? 0;
+        newVer = current + 1;
+      }
+      this._setLocalTagVersion(tag, newVer, Date.now());
+      void this.publishInvalidation('tag_incr', tag, newVer);
+      return;
+    }
+
     const tagKey  = this.nk(`_tag_:${tag}`);
     const members = this.tagIndex.get(tagKey) ?? new Set<string>();
 
@@ -2044,6 +2568,33 @@ export class CacheService {
     if (tags.length === 0) return;
     if (tags.length === 1) { await this.invalidateTag(tags[0]); return; }
 
+    if (this.opts.tagStrategy === 'generational') {
+      const now = Date.now();
+      if (!this._redisDisabled) {
+        try {
+          const client = await this.getRedis();
+          const pl = client.pipeline();
+          for (const tag of tags) pl.incr(this.nk(`tag_ver:${tag}`));
+          const results = await pl.exec() as Array<[Error | null, number]>;
+          for (let i = 0; i < tags.length; i++) {
+            const [err, newVer] = results[i] ?? [null, null];
+            const ver = (!err && typeof newVer === 'number') ? newVer : (this.tagVersions.get(tags[i])?.version ?? 0) + 1;
+            this._setLocalTagVersion(tags[i], ver, now);
+            void this.publishInvalidation('tag_incr', tags[i], ver);
+          }
+          return;
+        } catch (err) {
+          this.logger.debug('invalidateTags: Redis unavailable', { tags, error: (err as Error).message });
+        }
+      }
+      for (const tag of tags) {
+        const ver = (this.tagVersions.get(tag)?.version ?? 0) + 1;
+        this._setLocalTagVersion(tag, ver, now);
+        void this.publishInvalidation('tag_incr', tag, ver);
+      }
+      return;
+    }
+
     // In-process: collect all member keys across all tags and remove from L1 + disk
     const tagKeys: string[] = [];
     const allMembers = new Set<string>();
@@ -2081,6 +2632,13 @@ export class CacheService {
         this.logger.debug('invalidateTags: Redis unavailable', { tags, error: (err as Error).message });
       }
     }
+  }
+
+  /**
+   * Get the current generational tag version for a tag (synced with Redis when due).
+   */
+  async getTagVersion(tag: string): Promise<number> {
+    return this._getTagVersion(tag);
   }
 
   /**
@@ -2198,6 +2756,148 @@ export class CacheService {
     return true;
   }
 
+  // ── Distributed / In-Process Mutex Lock ───────────────────────────────────
+
+  /**
+   * Acquire a distributed (or in-process) mutual exclusion lock on `resourceKey`,
+   * execute `fn`, and automatically release the lock on completion or error.
+   *
+   * When Redis is connected, uses `SET lock:<key> <token> NX EX <ttl>` with
+   * safe Lua token release (`if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`).
+   * When Redis is disabled, uses an in-process promise-chain mutex to ensure thread-safety.
+   *
+   * @param resourceKey Unique lock name / resource identifier (e.g. `'cron:nightly-sync'`).
+   * @param fn Task to run exclusively while holding the lock.
+   * @param options TTL, acquire timeout, and retry polling intervals.
+   */
+  async lock<T>(
+    resourceKey: string,
+    fn: () => Promise<T>,
+    options?: LockOptions,
+  ): Promise<T> {
+    const ttlSeconds     = Math.max(1, options?.ttl ?? 30);
+    const acquireTimeout = Math.max(0, options?.acquireTimeout ?? 5_000);
+    const retryInterval  = Math.max(10, options?.retryInterval ?? 100);
+
+    const lockKey = this.nk(`lock:${resourceKey}`);
+    const token   = crypto.randomUUID();
+    const deadline = Date.now() + acquireTimeout;
+
+    let acquired = false;
+
+    if (!this._redisDisabled) {
+      try {
+        const client = await this.getRedis();
+        while (Date.now() <= deadline) {
+          const res = await client.set(lockKey, token, 'EX', ttlSeconds, 'NX');
+          if (res === 'OK') {
+            acquired = true;
+            break;
+          }
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) break;
+          await new Promise(r => setTimeout(r, Math.min(retryInterval, remaining)));
+        }
+
+        if (!acquired) {
+          throw new Error(`Failed to acquire lock for resource "${resourceKey}" within ${acquireTimeout}ms`);
+        }
+
+        try {
+          return await fn();
+        } finally {
+          try {
+            const LUA_RELEASE_LOCK = `
+              if redis.call("get", KEYS[1]) == ARGV[1] then
+                return redis.call("del", KEYS[1])
+              else
+                return 0
+              end
+            `;
+            await client.eval(LUA_RELEASE_LOCK, 1, lockKey, token);
+          } catch { /* ok */ }
+        }
+      } catch (err) {
+        if ((err as Error).message.startsWith('Failed to acquire lock')) throw err;
+        this.logger.debug('Distributed lock: Redis error, falling back to in-process mutex', {
+          resourceKey, error: (err as Error).message,
+        });
+      }
+    }
+
+    // In-process lock fallback
+    let unlock: () => void = () => {};
+    const lockPromise = new Promise<void>(resolve => { unlock = resolve; });
+
+    while (Date.now() <= deadline) {
+      const existing = this._localLocks.get(lockKey);
+      if (!existing) {
+        this._localLocks.set(lockKey, lockPromise);
+        acquired = true;
+        break;
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await Promise.race([
+        existing,
+        new Promise(r => setTimeout(r, Math.min(retryInterval, remaining))),
+      ]);
+    }
+
+    if (!acquired) {
+      throw new Error(`Failed to acquire lock for resource "${resourceKey}" within ${acquireTimeout}ms`);
+    }
+
+    try {
+      return await fn();
+    } finally {
+      unlock();
+      if (this._localLocks.get(lockKey) === lockPromise) {
+        this._localLocks.delete(lockKey);
+      }
+    }
+  }
+
+  // ── OpenTelemetry Metrics Integration ──────────────────────────────────────
+
+  private _initOtelMetrics(meter: ICacheMeter): void {
+    try {
+      this._otelMetrics.gets = meter.createCounter('tricache.gets.total', { description: 'Total cache get operations' });
+      this._otelMetrics.l1Hits = meter.createCounter('tricache.l1.hits', { description: 'L1 RAM cache hits' });
+      this._otelMetrics.l2Hits = meter.createCounter('tricache.l2.hits', { description: 'L2 Redis cache hits' });
+      this._otelMetrics.diskHits = meter.createCounter('tricache.disk.hits', { description: 'L1.5 disk cache hits' });
+      this._otelMetrics.fetches = meter.createCounter('tricache.fetches', { description: 'Cache miss fetch calls' });
+      this._otelMetrics.stampedes = meter.createCounter('tricache.stampedes.prevented', { description: 'Coalesced duplicate inflight requests' });
+      this._otelMetrics.sets = meter.createCounter('tricache.sets.total', { description: 'Total set operations' });
+      this._otelMetrics.deletes = meter.createCounter('tricache.deletes.total', { description: 'Total delete operations' });
+      this._otelMetrics.swrRevalidations = meter.createCounter('tricache.swr.revalidations', { description: 'SWR background revalidations' });
+
+      const gL1Entries = meter.createObservableGauge('tricache.l1.entries', { description: 'Current L1 entry count' });
+      const gL1Bytes   = meter.createObservableGauge('tricache.l1.bytes', { description: 'Current L1 memory usage in bytes' });
+      const gDiskFiles = meter.createObservableGauge('tricache.disk.files', { description: 'Current L1.5 disk file count' });
+      const gDiskBytes = meter.createObservableGauge('tricache.disk.bytes', { description: 'Current L1.5 disk size in bytes' });
+      const gBloomFpr  = meter.createObservableGauge('tricache.bloom.fpr', { description: 'Bloom filter false-positive rate' });
+
+      meter.addBatchObservableCallback((observableResult) => {
+        const stats = this.stats();
+        const l1 = stats.l1;
+        const disk = stats.disk;
+        const checks = this.counters.bloomChecks;
+        const fps = this.counters.bloomFalsePositives;
+        const fpr = checks > 0 ? fps / checks : 0;
+        const attrs = this._namespace ? { namespace: this._namespace } : undefined;
+
+        observableResult.observe(gL1Entries, l1.entries, attrs);
+        observableResult.observe(gL1Bytes, l1.sizeBytes, attrs);
+        observableResult.observe(gDiskFiles, disk.files, attrs);
+        observableResult.observe(gDiskBytes, disk.sizeKB * 1024, attrs);
+        observableResult.observe(gBloomFpr, fpr, attrs);
+      }, [gL1Entries, gL1Bytes, gDiskFiles, gDiskBytes, gBloomFpr]);
+    } catch (err) {
+      this.logger.warn('Failed to initialize OpenTelemetry metrics meter', { error: (err as Error).message });
+    }
+  }
+
   // ── Hot key introspection ─────────────────────────────────────────────
 
   /**
@@ -2231,25 +2931,29 @@ export class CacheService {
    */
   private _matchesGlob(key: string, pattern: string): boolean {
     if (!pattern.includes('*')) return key === pattern;
-    const re = new RegExp('^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
-    return re.test(key);
+    return getGlobRegex(pattern).test(key);
   }
 
   /**
    * When an exact key `deletedKey` is removed, cascade to every dependent key
    * that was registered via `dependsOn` and whose source pattern matches.
+   * Transitive dependencies are traversed with cycle protection via a visited Set.
    */
-  private _cascadeDependencies(deletedKey: string): void {
+  private _cascadeDependencies(deletedKey: string, visited: Set<string> = new Set()): void {
+    if (visited.has(deletedKey)) return;
+    visited.add(deletedKey);
+
     for (const [pattern, dependents] of this.dependencyIndex) {
       if (!this._matchesGlob(deletedKey, pattern)) continue;
       for (const dep of dependents) {
-        if (dep === deletedKey) continue; // no self-cascade
+        if (visited.has(dep)) continue;
         this.l1.delete(dep);
         if (!this._diskDisabled) this.disk.delete(dep);
         void this.publishInvalidation('del', dep);
         this.logger.debug('Dependency cascade: invalidated dependent key', {
           trigger: deletedKey.slice(0, 60), dependent: dep.slice(0, 60),
         });
+        this._cascadeDependencies(dep, visited);
       }
     }
   }
@@ -2302,9 +3006,13 @@ export class CacheService {
 
       backplane: {
         enabled:  this.opts.invalidationBackplane && !this._redisDisabled,
+        mode:     this.opts.backplaneMode,
         sent:     c.invSent,
         received: c.invReceived,
         skipped:  c.invSkipped,
+        streamEntriesReceived: c.streamEntriesReceived,
+        streamReplays:         c.streamReplays,
+        streamGaps:            c.streamGaps,
       },
 
       l2CircuitBreaker: {
@@ -2401,8 +3109,22 @@ export class CacheService {
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
+  /**
+   * Dynamically rotate the active encryption key at runtime without restarting.
+   * Installs the new key as primary for all subsequent writes, while preserving
+   * the previous key for seamless fallback decryption of existing cache entries.
+   */
+  async rotateEncryptionKey(newKeyBase64: string, newMode?: EncryptionMode): Promise<void> {
+    this.enc.rotateKey(newKeyBase64, newMode);
+    if (this._workerPool) {
+      await this._workerPool.drainAndReinit(this.enc.toWorkerInit());
+    }
+    this.logger.info('tricache: encryption key rotated dynamically', { mode: this.enc.mode });
+  }
+
   /** Close Redis connections and stop all background timers. */
   async destroy(): Promise<void> {
+    this._destroyed = true;
     if (this.cleanupInterval)     clearInterval(this.cleanupInterval);
     if (this.diskJanitorInterval)  clearInterval(this.diskJanitorInterval);
     if (this.oomInterval)          clearInterval(this.oomInterval);
@@ -2417,8 +3139,12 @@ export class CacheService {
       this._workerPool = null;
     }
     if (this.subClient) {
-      try { await this.subClient.quit(); } catch { /* ok */ }
+      try { this.subClient.disconnect(); } catch { /* ok */ }
       this.subClient = null;
+    }
+    if (this.streamClient) {
+      try { this.streamClient.disconnect(); } catch { /* ok */ }
+      this.streamClient = null;
     }
     if (this.redis) {
       try { await this.redis.disconnect(); } catch { /* ok */ }

@@ -43,6 +43,7 @@ const BLOOM_WASM_MODULE = new WebAssembly.Module(Buffer.from(BLOOM_WASM_BASE64, 
 export class WasmBloomFilter {
   private readonly exports: BloomWasmExports;
   private readonly mem: Uint8Array;
+  private readonly stagingTarget: Uint8Array;
   private readonly encoder = new TextEncoder();
   private readonly numBits = 100_000;
   /** Pre-computed — k and numBits are fixed constants; no need to recalculate on every probe. */
@@ -54,14 +55,14 @@ export class WasmBloomFilter {
     const instance = new WebAssembly.Instance(BLOOM_WASM_MODULE, {});
     this.exports = instance.exports as unknown as BloomWasmExports;
     this.mem = new Uint8Array(this.exports.memory.buffer);
+    this.stagingTarget = new Uint8Array(this.exports.memory.buffer, KEY_STAGING_OFFSET, MAX_KEY_BYTES);
     const k = 7, p = 0.01;
     this._maxCapacity = Math.floor(-this.numBits * Math.log(1 - Math.pow(p, 1 / k)) / k);
   }
 
   private writeKey(key: string): number {
     if (key.length === 0) return 0;
-    const target = this.mem.subarray(KEY_STAGING_OFFSET, KEY_STAGING_OFFSET + MAX_KEY_BYTES);
-    return this.encoder.encodeInto(key, target).written;
+    return this.encoder.encodeInto(key, this.stagingTarget).written;
   }
 
   add(key: string): void {

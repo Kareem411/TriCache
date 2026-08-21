@@ -790,13 +790,13 @@ const MISS_KEYS = 500;
 
 for (let i = 0; i < HOT_KEYS; i++) await svc.set(`rw:hot:${i}`, { data: `v-${i}` }, 600);
 
-let realFetches = 0;
+let _realFetches = 0;
 const realisticFn = async (i: number): Promise<void> => {
   const r = Math.random();
   if (r < 0.80) {
     await svc.get(`rw:hot:${i % HOT_KEYS}`,  async () => ({ data: `v-${i}` }), 600);
   } else if (r < 0.95) {
-    await svc.get(`rw:miss:${i % MISS_KEYS}`, async () => { realFetches++; return { v: i }; }, 10);
+    await svc.get(`rw:miss:${i % MISS_KEYS}`, async () => { _realFetches++; return { v: i }; }, 10);
   } else {
     await svc.set(`rw:hot:${i % HOT_KEYS}`,  { data: `updated-${i}` }, 600);
   }
@@ -2008,6 +2008,7 @@ for (const [label, count] of [['1 K entries', 1_000], ['5 K entries', 5_000], ['
     20, 3,
     `O(n) scan + bloom rebuild + ${count} set() refill; bloom rebuild dominates at large N`,
   );
+  evL1.clear();
 }
 
 // ── 19b. disableDisk — ephemeral-mode throughput vs disk-enabled ──────────────
@@ -2172,6 +2173,168 @@ note('workerPoolSize=1 here to show per-round-trip cost; pool(4) gives ~4× thro
   await pool?.destroy();
 }
 
+// ── §20. Read Safety Strategy (cloneStrategy: 'none' vs 'structuredClone') ──
+
+header('§20. Read Safety Strategy — cloneStrategy: "none" vs "structuredClone"');
+note('"none" returns direct V8 in-memory reference (sub-microsecond throughput, 0 allocations).');
+note('"structuredClone" creates deep-cloned copy on read, preventing caller mutation bugs.');
+
+{
+  const testObj = { id: 101, name: 'Alice Enterprise', roles: ['admin', 'billing'], metadata: { active: true, loginCount: 42 } };
+
+  const cacheNone = CacheService.reset({
+    namespace: 'bench_clone_none',
+    cloneStrategy: 'none',
+    disableRedis: true,
+    disableDisk: true,
+  });
+
+  const cacheClone = CacheService.reset({
+    namespace: 'bench_clone_deep',
+    cloneStrategy: 'structuredClone',
+    disableRedis: true,
+    disableDisk: true,
+  });
+
+  await cacheNone.set('user:obj', testObj, 300);
+  await cacheClone.set('user:obj', testObj, 300);
+
+  await bench(
+    '  get — cloneStrategy: "none" (direct reference)',
+    async () => { await cacheNone.get('user:obj', async () => testObj, 300); },
+    100_000, 5_000, 'zero heap allocation, sub-microsecond L1 hit',
+  );
+
+  await bench(
+    '  get — cloneStrategy: "structuredClone" (deep isolation)',
+    async () => { await cacheClone.get('user:obj', async () => testObj, 300); },
+    50_000, 2_000, 'deep copy per read; safe against in-place mutations',
+  );
+
+  await cacheNone.destroy();
+  await cacheClone.destroy();
+}
+
+// ── §21. Distributed Mutex & Lock Primitive (cache.lock) ───────────────────
+
+header('§21. Distributed Mutex & Lock Primitive — cache.lock() throughput');
+note('Measures uncontended vs contended critical-section execution.');
+note('In-process promise-chain mutex fallback handles concurrency when Redis is disabled.');
+
+{
+  const lockCache = CacheService.reset({
+    namespace: 'bench_lock',
+    disableRedis: true,
+    disableDisk: true,
+  });
+
+  await bench(
+    '  lock() — uncontended single-coroutine execution',
+    async i => {
+      await lockCache.lock(`res:${i % 50}`, async () => 42, { acquireTimeout: 1000 });
+    },
+    20_000, 1_000, 'acquire → critical section (fast) → release',
+  );
+
+  await benchParallel(
+    '  lock() — 10 concurrent coroutines contending on 1 mutex',
+    async () => {
+      await lockCache.lock('res:shared', async () => {
+        // Micro-task yield
+        await Promise.resolve();
+      }, { acquireTimeout: 5000 });
+    },
+    10, 2_000, 'Promise-chain mutex serialization',
+  );
+
+  await lockCache.destroy();
+}
+
+// ── §22. Generational Tag Invalidation (tagStrategy: 'generational') ────────
+
+header('§22. Generational Tag Invalidation — O(1) Atomic Version Bumps');
+note('Replaces O(N) bulk key scans / Redis SMEMBERS set deletions with O(1) version counters.');
+
+{
+  const tagCache = CacheService.reset({
+    namespace: 'bench_gen_tags',
+    tagStrategy: 'generational',
+    disableRedis: true,
+    disableDisk: true,
+  });
+
+  // Populate tagged entries
+  for (let i = 0; i < 500; i++) {
+    await tagCache.set(`entity:${i}`, { id: i }, 300, undefined, { tags: ['entities', `type:${i % 5}`] });
+  }
+
+  await bench(
+    '  invalidateTag() — single tag O(1) version bump',
+    async () => { await tagCache.invalidateTag('entities'); },
+    50_000, 2_000, 'atomic in-memory version counter increment',
+  );
+
+  await bench(
+    '  invalidateTags() — multi-tag pipelined O(1) bump (3 tags)',
+    async () => { await tagCache.invalidateTags(['entities', 'type:1', 'type:2']); },
+    30_000, 1_000, 'batch atomic version increment',
+  );
+
+  await bench(
+    '  get() — tagged read with captured version check',
+    async i => {
+      await tagCache.get(`entity:${i % 100}`, async () => ({ id: i }), 300, { tags: ['entities'] });
+    },
+    50_000, 2_000, 'L1 hit + O(1) generational tag version comparison',
+  );
+
+  await tagCache.destroy();
+}
+
+// ── §23. Ergonomic Primitives & Ecosystem Wrappers ──────────────────────────
+
+header('§23. Ergonomic Primitives & Ecosystem Wrappers (wrap, ORMs, HTTP)');
+note('Measures options-object wrapper overhead and deterministic query hashing.');
+
+{
+  const wrapCache = CacheService.reset({
+    namespace: 'bench_wrap',
+    disableRedis: true,
+    disableDisk: true,
+  });
+
+  const fetcher = async () => ({ id: 42, role: 'member' });
+  await wrapCache.set('user:42', { id: 42, role: 'member' }, 300);
+
+  await bench(
+    '  cache.get() — positional arguments baseline',
+    async () => { await wrapCache.get('user:42', fetcher, 300); },
+    100_000, 5_000, 'raw positional args',
+  );
+
+  await bench(
+    '  cache.wrap() — options object wrapper',
+    async () => { await wrapCache.wrap('user:42', fetcher, { ttl: 300, swr: 30, tags: ['users'] }); },
+    100_000, 5_000, 'ergonomic options normalization',
+  );
+
+  // Deterministic SQL query key hashing (as used in Prisma & Drizzle adapters)
+  const sql = 'SELECT id, name, email, role FROM users WHERE org_id = ? AND active = ? ORDER BY created_at DESC LIMIT 50';
+  const params = [12345, true];
+  const hashQueryKey = (s: string, p: unknown[]): string => {
+    return crypto.createHash('sha256').update(s + '::' + JSON.stringify(p)).digest('hex');
+  };
+
+  await bench(
+    '  ORM Query Key SHA-256 Hashing (Drizzle/Prisma)',
+    () => { hashQueryKey(sql, params); },
+    100_000, 5_000, 'deterministic query + params hashing',
+  );
+
+  await wrapCache.destroy();
+}
+
+console.log(`\n  ${C.bold}${C.green}✓ All 24 benchmark suites completed successfully.${C.reset}\n`);
 process.exit(0);
 
 

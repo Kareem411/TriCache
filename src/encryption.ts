@@ -34,7 +34,7 @@
  */
 
 import { createCipheriv, createDecipheriv, createSecretKey, randomFillSync, type KeyObject } from 'crypto';
-import type { ILogger } from './types';
+import { type ILogger, consoleLogger } from './types';
 
 // ── Public type ───────────────────────────────────────────────────────────────
 /** Encryption algorithm used for L2 (Redis) values and disk-tier files. */
@@ -73,7 +73,7 @@ const IV_POOL_COUNT = 64;
 export class CacheEncryption {
   private _key:     Buffer    | null = null;  // raw bytes — used only for XOR
   private _keyObj:  KeyObject | null = null;  // parsed KeyObject — used for all AES modes
-  private readonly _mode: EncryptionMode;
+  private _mode: EncryptionMode;
   private _prevKey:    Buffer    | null = null;
   private _prevKeyObj: KeyObject | null = null;
   private _prevMode: EncryptionMode = 'aes-256-gcm';
@@ -156,12 +156,19 @@ export class CacheEncryption {
 
   constructor(
     keyBase64: string | undefined,
-    logger: ILogger,
+    loggerOrMode: ILogger | EncryptionMode = consoleLogger,
     mode: EncryptionMode = 'aes-256-gcm',
     previousKeyBase64?: string,
     previousMode?: EncryptionMode,
   ) {
-    this._mode = mode;
+    const logger: ILogger = (typeof loggerOrMode === 'object' && loggerOrMode !== null)
+      ? loggerOrMode
+      : consoleLogger;
+    const resolvedMode: EncryptionMode = typeof loggerOrMode === 'string'
+      ? loggerOrMode
+      : mode;
+
+    this._mode = resolvedMode;
     if (!keyBase64) {
       if (process.env.NODE_ENV === 'production') {
         logger.warn(
@@ -173,7 +180,7 @@ export class CacheEncryption {
     }
     try {
       const buf = Buffer.from(keyBase64, 'base64');
-      const requiredLen = mode === 'aes-256-gcm' ? 32 : (mode === 'aes-128-gcm' || mode === 'aes-128-ctr') ? 16 : 0;
+      const requiredLen = resolvedMode === 'aes-256-gcm' ? 32 : (resolvedMode === 'aes-128-gcm' || resolvedMode === 'aes-128-ctr') ? 16 : 0;
       if (requiredLen > 0 && buf.length !== requiredLen) {
         throw new Error(`${mode} requires exactly ${requiredLen} bytes (got ${buf.length})`);
       }
@@ -227,6 +234,7 @@ export class CacheEncryption {
   }
 
   get isEnabled(): boolean { return this._key !== null; }
+  get mode(): EncryptionMode { return this._mode; }
 
   /**
    * Snapshot the key material needed to spin up an off-main-thread worker pool.
@@ -246,6 +254,49 @@ export class CacheEncryption {
       prevKeyBase64: this._prevKey ? this._prevKey.toString('base64') : undefined,
       prevMode:      this._prevMode,
     };
+  }
+
+  /**
+   * Rotate the active encryption key dynamically at runtime.
+   * Promotes the current primary key to previousEncryptionKey for zero-downtime
+   * fallback decryption of existing cache entries in L2/Disk, and installs
+   * the new key as primary for all subsequent writes.
+   */
+  rotateKey(newKeyBase64: string, newMode?: EncryptionMode): void {
+    if (!newKeyBase64) {
+      throw new Error('rotateKey requires a valid non-empty base64 key');
+    }
+    const mode = newMode ?? this._mode;
+    const buf = Buffer.from(newKeyBase64, 'base64');
+    const requiredLen = mode === 'aes-256-gcm' ? 32 : (mode === 'aes-128-gcm' || mode === 'aes-128-ctr') ? 16 : 0;
+    if (requiredLen > 0 && buf.length !== requiredLen) {
+      throw new Error(`${mode} requires exactly ${requiredLen} bytes (got ${buf.length})`);
+    }
+    if (buf.length < 1) {
+      throw new Error('XOR key must be at least 1 byte');
+    }
+
+    let newKeyObj: KeyObject | null = null;
+    if (mode !== 'xor') {
+      newKeyObj = createSecretKey(buf);
+      const _wc = createCipheriv(
+        mode,
+        newKeyObj,
+        Buffer.alloc(mode === 'aes-128-ctr' ? CTR_IV_BYTES : IV_BYTES),
+      );
+      _wc.update(Buffer.alloc(0));
+      _wc.final();
+    }
+
+    // Shift current primary to previous key
+    this._prevKey = this._key;
+    this._prevKeyObj = this._keyObj;
+    this._prevMode = this._mode;
+
+    // Set new primary key
+    this._key = buf;
+    this._keyObj = newKeyObj;
+    this._mode = mode;
   }
 
   // ── String (Redis) ────────────────────────────────────────────────────────

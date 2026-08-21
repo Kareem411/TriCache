@@ -178,6 +178,7 @@ describe('Issue 3 — rebalance() evicts entries that exceed category limits', (
     // (simulating a post-startup reconfiguration scenario):
     (svc['l1'] as any).opts.maxEntries = 0; // make ANY entry exceed global limit
     const evicted = svc.rebalance();
+    expect(evicted).toBe(0);
 
     // CRITICAL entry with future TTL must survive
     const result = await svc.get('auth:tok:1', () => Promise.resolve(null), 300);

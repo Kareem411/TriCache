@@ -6,12 +6,12 @@
  *   3. Serverless / ephemeral disk auto-detection (disableDisk)
  *   4. Redis Cluster & Sentinel options wiring
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { CacheService }      from '../src/cache-service';
 import { SmartMemoryCache }  from '../src/smart-memory-cache';
 import { WorkerPool }        from '../src/worker-pool';
 import { CacheEncryption }   from '../src/encryption';
-import { CachePriority, consoleLogger } from '../src/types';
+import { CachePriority }     from '../src/types';
 import { tmpdir }    from 'os';
 import { join }      from 'path';
 import { rmSync }    from 'fs';
@@ -175,7 +175,6 @@ describe('SmartMemoryCache.evictSetBefore — staleness fence primitive', () => 
   });
 
   it('evicts entries whose write-time is before the cutoff', () => {
-    const before = Date.now();
     cache.set('stale:1', 'a', 60_000);
     cache.set('stale:2', 'b', 60_000);
     const after = Date.now() + 1;

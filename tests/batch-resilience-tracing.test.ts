@@ -6,7 +6,7 @@
  *   4. L2 circuit breaker
  *   5. warmFromL2(pattern)
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { CacheService } from '../src/cache-service';
 import { CachePriority, type ICacheTracer, type ICacheSpan } from '../src/types';
 import { tmpdir } from 'os';

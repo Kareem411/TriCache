@@ -11,7 +11,10 @@ import { CacheService } from '../src/cache-service';
 import { CachePriority } from '../src/types';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { rmSync } from 'fs';
+
+import { afterEach } from 'vitest';
+
+const silentLogger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
 
 function tempDir() {
   return join(tmpdir(), `tricache-audit-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -24,10 +27,20 @@ function makeSvc(extra: Record<string, unknown> = {}) {
     l1MaxBytes: 20 * 1024 * 1024,
     l1MaxEntries: 500,
     diskCacheDir: diskDir,
+    logger: silentLogger,
     ...extra,
   });
   return { svc, diskDir };
 }
+
+afterEach(async () => {
+  try {
+    const g = globalThis as Record<string, unknown>;
+    const inst = g['__tricache_shop__'] as CacheService | undefined;
+    await inst?.destroy();
+    delete g['__tricache_shop__'];
+  } catch {}
+});
 
 describe('P0b — create() singleton divergence detection', () => {
   it('warns (does not throw) on a second create() with divergent options by default', () => {
@@ -112,7 +125,7 @@ describe('P1b — set() infers priority from the bare key, not the namespaced ke
 describe('P1c — L2 circuit breaker caps HALF_OPEN to a single probe', () => {
   it('only the first isAllowed() in HALF_OPEN returns true; concurrent callers are rejected', () => {
     const svc = makeSvc().svc;
-    const cb = svc['cb'] as {
+    const cb = (svc as any)['cb'] as {
       isAllowed(): boolean; onFailure(): void; onSuccess(): void;
       openedAt: number;
     };

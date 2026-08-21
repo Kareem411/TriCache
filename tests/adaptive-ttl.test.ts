@@ -89,10 +89,10 @@ describe('adaptiveTtl', () => {
   });
 
   it('adaptiveTtlMin clamps derived TTL upward', async () => {
-    // p95 ≈ 5ms × multiplier 1 = 5ms → 0.005 s → clamped up to min 60 s
+    // p95 ≈ 5ms × multiplier 0.001 = 0.005ms → clamped up to min 60 s
     const cache = CacheService.reset({
       adaptiveTtl: true,
-      adaptiveTtlMultiplier: 1,
+      adaptiveTtlMultiplier: 0.001,
       adaptiveTtlMin: 60,
       adaptiveTtlMax: 86400,
     });

@@ -22,6 +22,7 @@ export { CacheEncryption, type EncryptionMode } from './encryption';
 export { SmartMemoryCache }    from './smart-memory-cache';
 export { DiskTier }            from './disk-tier';
 export { WasmBloomFilter }     from './wasm/bloom-filter-wasm';
+export { type CompressionAlgorithm } from './compression';
 
 export {
   CachePriority,
@@ -37,4 +38,10 @@ export {
   type CachePingResult,
   type ICacheTracer,
   type ICacheSpan,
+  type WrapOptions,
+  type LockOptions,
+  type ICacheCounter,
+  type ICacheObservableGauge,
+  type ICacheBatchObservableCallback,
+  type ICacheMeter,
 } from './types';
