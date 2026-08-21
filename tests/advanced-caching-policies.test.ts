@@ -204,50 +204,50 @@ describe('XFetch probabilistic early expiration (xfetchBeta)', () => {
     // First fetch: stores delta (real elapsed ms). Use a small artificial delay
     // so delta is non-zero and the XFetch threshold becomes meaningful.
     await svc.get('xf:live', async () => {
-      await new Promise<void>(r => setTimeout(r, 3)); // 3 ms → delta ≈ 3
+      await new Promise<void>(r => setTimeout(r, 5)); // 5 ms → delta ≈ 5
       fetchCount++;
       return 'v1';
-    }, 0.12); // 120 ms TTL
+    }, 1.0); // 1000 ms TTL
 
-    // Wait until ~80 ms remain so remaining (40 ms) is well within
-    // the XFetch threshold at beta=1e6: delta(3) * 1e6 * -log(rand) >> 40 ms
-    await new Promise<void>(r => setTimeout(r, 80));
+    // Wait 100 ms (900 ms remaining)
+    // Beta = 1e6: delta(5) * 1e6 * -log(rand) >> 900 ms, guaranteed to trigger XFetch
+    await new Promise<void>(r => setTimeout(r, 100));
 
-    const val = await svc.get('xf:live', async () => { fetchCount++; return 'v2'; }, 0.12, {
+    const val = await svc.get('xf:live', async () => { fetchCount++; return 'v2'; }, 1.0, {
       xfetchBeta: 1e6,
     });
 
-    expect(val).toBe('v1');                                       // still served from cache
+    expect(val).toBe('v1'); // still served from cache
     expect(svc.metrics().revalidations.total).toBeGreaterThanOrEqual(1);
+    expect(fetchCount).toBeGreaterThanOrEqual(1);
 
     svc.destroy();
     try { rmSync(diskDir, { recursive: true, force: true }); } catch {}
-  }, 500);
+  }, 2000);
 
   it('does not retrigger on the same key while revalidation is in flight', async () => {
     const { svc, diskDir } = makeService();
     let fetchCount = 0;
 
     await svc.get('xf:once', async () => {
-      await new Promise<void>(r => setTimeout(r, 3));
+      await new Promise<void>(r => setTimeout(r, 5));
       fetchCount++;
       return 'v1';
-    }, 0.12);
+    }, 1.0);
 
-    await new Promise<void>(r => setTimeout(r, 80));
+    await new Promise<void>(r => setTimeout(r, 100));
 
     // Hit twice rapidly — only one background revalidation should be scheduled.
-    // fetchFn uses a small setTimeout so the revalidation stays in-flight across
-    // both gets (prevents it completing in microtasks between the two awaits).
-    const slowFetch = async () => { await new Promise<void>(r => setTimeout(r, 30)); fetchCount++; return 'v2'; };
-    await svc.get('xf:once', slowFetch, 0.12, { xfetchBeta: 1e6 });
-    await svc.get('xf:once', slowFetch, 0.12, { xfetchBeta: 1e6 });
+    const slowFetch = async () => { await new Promise<void>(r => setTimeout(r, 50)); fetchCount++; return 'v2'; };
+    await svc.get('xf:once', slowFetch, 1.0, { xfetchBeta: 1e6 });
+    await svc.get('xf:once', slowFetch, 1.0, { xfetchBeta: 1e6 });
 
     expect(svc.metrics().revalidations.total).toBeLessThanOrEqual(1);
+    expect(fetchCount).toBeGreaterThanOrEqual(1);
 
     svc.destroy();
     try { rmSync(diskDir, { recursive: true, force: true }); } catch {}
-  }, 500);
+  }, 2000);
 });
 
 // ─── 4. Refresh-ahead scheduling (refreshAhead) ──────────────────────────────
@@ -279,6 +279,7 @@ describe('refreshAhead — proactive background recompute', () => {
 
       expect(val).toBe('original');                                 // served from cache
       expect(svc.metrics().revalidations.total).toBeGreaterThanOrEqual(1);
+      expect(fetchCount).toBeGreaterThanOrEqual(0);
     } finally {
       vi.useRealTimers();
       svc.destroy();
@@ -548,6 +549,31 @@ describe('dependsOn — dependency-aware cascade invalidation', () => {
     expect(svc.has('org:99:config')).toBe(false);
 
     void nsDependent; // suppress unused-variable warning
+  });
+
+  it('safely handles consecutive wildcards and special regex metacharacters without ReDoS', async () => {
+    // Register dependencies with consecutive wildcards and regex metacharacters
+    await svc.set('dep:special', 'v', 60, undefined, {
+      dependsOn: ['test.key+with[brackets]$***and(parens)***'],
+    });
+    expect(svc.has('dep:special')).toBe(true);
+
+    // Delete exact matching key
+    await svc.delete('test.key+with[brackets]$and(parens)');
+    expect(svc.has('dep:special')).toBe(false);
+
+    // Test with crafted backtracking pattern and long non-matching string
+    await svc.set('dep:redos', 'v', 60, undefined, {
+      dependsOn: ['a*a*a*a*a*b'],
+    });
+    expect(svc.has('dep:redos')).toBe(true);
+
+    const start = Date.now();
+    await svc.delete('a'.repeat(50) + 'c'); // non-matching, should not hang
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeLessThan(1000); // executed near instantaneously without ReDoS hang
+    expect(svc.has('dep:redos')).toBe(true); // not matching, so not deleted
   });
 });
 

@@ -33,7 +33,7 @@ export interface ILogger {
 
 /** Default no-op logger — swap out via CacheService options */
 export const consoleLogger: ILogger = {
-  debug: (msg, meta) => {},
+  debug: () => {},
   info:  (msg, meta) => console.info('[tricache]', msg, meta ?? ''),
   warn:  (msg, meta) => console.warn('[tricache]', msg, meta ?? ''),
   error: (msg, meta, err) => console.error('[tricache]', msg, meta ?? '', err ?? ''),
@@ -112,6 +112,8 @@ export interface SmartCacheEntry {
    * Optional for backward compatibility with snapshots written by older versions.
    */
   setAt?: number;
+  /** Active tag versions at write time (used when tagStrategy === 'generational') */
+  tagVersions?: Record<string, number>;
 }
 
 /** Returned by SmartMemoryCache.get() — distinguishes "cached null" from a real miss */
@@ -129,6 +131,10 @@ export interface CacheHit {
   /** Timestamp (Date.now()) recorded inside SmartMemoryCache.get() — lets CacheService
    *  reuse this value for refresh-ahead/XFetch math instead of making a second syscall. */
   fetchedAt?: number;
+  /** Active tag versions at write time (used when tagStrategy === 'generational') */
+  tagVersions?: Record<string, number>;
+  /** Timestamp (ms) when this entry was written into memory */
+  setAt?: number;
 }
 
 // ─── Disk tier ───────────────────────────────────────────────────────────────
@@ -144,6 +150,8 @@ export interface DiskCacheEntry {
   hits: number;
   lastAccess: number;
   priority: number;
+  /** Active tag versions at write time (used when tagStrategy === 'generational') */
+  tagVersions?: Record<string, number>;
 }
 
 // ─── Metrics snapshot ────────────────────────────────────────────────────────
@@ -209,15 +217,22 @@ export interface CacheMetrics {
     bytesSaved:          number;
   };
 
-  /** Pub/Sub invalidation backplane statistics */
+  /** Invalidation backplane statistics */
   backplane: {
     enabled:  boolean;
+    mode:     'pubsub' | 'stream';
     /** Invalidation messages published to other instances */
     sent:     number;
     /** Invalidation messages received from other instances */
     received: number;
     /** Own messages silently skipped (prevents double-eviction) */
     skipped:  number;
+    /** Stream entries received (when backplaneMode is 'stream') */
+    streamEntriesReceived?: number;
+    /** Replayed invalidations after network reconnect */
+    streamReplays?: number;
+    /** Stream trim gaps detected (where consumer fell behind oldest entry) */
+    streamGaps?: number;
   };
 
   /** L2 Redis circuit breaker state */
@@ -317,6 +332,11 @@ export interface CacheOptions {
    */
   redisTls?: boolean;
   /**
+   * Redis wire protocol version (RESP2 or RESP3).
+   * Defaults to 3 in ioredis v6+. Set to 2 for legacy proxies or servers without RESP3 support.
+   */
+  redisProtocol?: 2 | 3;
+  /**
    * Set to `true` to disable L2 Redis entirely (e.g. when running single-process
    * services that don't need distributed caching). Default: false in production,
    * true in development.
@@ -350,6 +370,22 @@ export interface CacheOptions {
   previousEncryptionKey?: string;
   /** Encryption mode that was used with `previousEncryptionKey`. Defaults to `encryptionMode`. */
   previousEncryptionMode?: 'aes-256-gcm' | 'aes-128-gcm' | 'aes-128-ctr' | 'xor';
+
+  // ── Compression ──────────────────────────────────────────────────────────
+  /**
+   * Optional compression algorithm for L2 (Redis) strings and disk-tier binary blobs.
+   * - `'brotli'` (default when enabled) — superior compression ratio for JSON / text payloads.
+   * - `'gzip'` — faster compression / lower CPU overhead.
+   * - `'none'` — disable compression.
+   * Default: `'none'` (uncompressed).
+   */
+  compression?: 'brotli' | 'gzip' | 'none';
+  /**
+   * Minimum payload size in bytes before compression is applied.
+   * Payloads smaller than this threshold remain uncompressed to avoid compression overhead.
+   * Default: `1024` (1 KB).
+   */
+  compressionThresholdBytes?: number;
 
   // ── Snapshot ────────────────────────────────────────────────────────────
   /**
@@ -429,6 +465,15 @@ export interface CacheOptions {
    * Set to `false` for single-process services or eventual-consistency scenarios.
    */
   invalidationBackplane?: boolean;
+
+  /**
+   * Enable Redis 7+ Sharded Pub/Sub (`SPUBLISH` / `SSUBSCRIBE`) when connected to
+   * a Redis Cluster (`redisClusterNodes`). Scopes pub/sub message routing strictly
+   * to the cluster shard handling the key slot, reducing inter-node cluster bus gossip.
+   *
+   * Default: `false` (standard cluster PUBLISH / SUBSCRIBE).
+   */
+  useShardedPubSub?: boolean;
 
   // ── OOM protection ──────────────────────────────────────────────────────
   /**
@@ -729,4 +774,129 @@ export interface CacheOptions {
    * guard enforce the limit even when Redis is unavailable.
    */
   failClosed?: boolean;
+
+  /**
+   * Strategy used for tag-based cache invalidation:
+   * - `'set'` (default): Traditional Redis Set tracking. Members are registered in Redis
+   *   sets and deleted individually on `invalidateTag()`. Best for low-to-medium cardinality tags.
+   * - `'generational'`: Generational tag versioning ($O(1)$ invalidations). Tag invalidation
+   *   increments an atomic integer version counter in Redis and local memory. Entries store their
+   *   creation tag versions; stale entries are detected on access and pruned with version-gated
+   *   compare-and-delete. Eliminates key scans and Redis bulk deletion stalls on large datasets.
+   */
+  tagStrategy?: 'set' | 'generational';
+
+  /**
+   * Milliseconds before an in-memory generational tag version is re-synced from Redis.
+   * Bounds maximum partition/missed-broadcast staleness when using `tagStrategy: 'generational'`.
+   * Default: `5000` ms (5 seconds).
+   */
+  tagVersionTtlMs?: number;
+
+  /**
+   * Read safety strategy for returned cached objects:
+   * - `'none'` (default): Returns raw in-memory references for sub-microsecond performance (~350 ns).
+   * - `'structuredClone'`: Clones values via native `structuredClone()` on L1 hits, L2 promotions,
+   *   and fetch returns, preventing caller mutations from polluting the cached reference.
+   *   Supported types: plain objects, arrays, Dates, Maps, Sets, TypedArrays. Functions and class
+   *   prototype chains are not preserved.
+   */
+  cloneStrategy?: 'none' | 'structuredClone';
+
+  /**
+   * Invalidation backplane transport mode:
+   * - `'pubsub'` (default): Ephemeral Redis Pub/Sub (at-most-once delivery).
+   * - `'stream'`: Durable Redis Streams (XADD/XREAD) with missed-event replay on reconnect.
+   */
+  backplaneMode?: 'pubsub' | 'stream';
+
+  /**
+   * Maximum retained entries in the Redis invalidation stream (`MAXLEN ~ N`).
+   * Default: `10000`.
+   */
+  backplaneStreamMaxLen?: number;
+
+  /**
+   * Blocking poll timeout in milliseconds for `XREAD BLOCK`.
+   * Default: `2000` ms (2 seconds).
+   */
+  backplaneStreamBlockMs?: number;
+
+  /**
+   * Custom Redis Stream key name.
+   * Default: `tricache:stream:{<namespace>}` (hash-tagged for Redis Cluster single-slot routing).
+   */
+  backplaneStreamKey?: string;
+
+  /**
+   * OpenTelemetry Meter instance for native metrics publishing.
+   * Compatible with `@opentelemetry/api` Meter.
+   */
+  meter?: ICacheMeter;
+}
+
+/**
+ * Options for the ergonomic `cache.wrap(key, fetchFn, options)` method.
+ */
+export interface WrapOptions {
+  /** TTL in seconds (default: 300 s). */
+  ttl?: number;
+  /** Stale-While-Revalidate grace period in seconds. */
+  swr?: number;
+  /** Override the auto-inferred eviction priority. */
+  priority?: CachePriority;
+  /** Semantic tags for invalidation. */
+  tags?: string[];
+  /** Dependency cascade patterns (e.g. `['user:*']`). */
+  dependsOn?: string[];
+  /** 0–1 fraction of TTL elapsed at which a proactive background refresh is scheduled. */
+  refreshAhead?: number;
+  /** XFetch probabilistic early expiration factor (0.5–2.0). */
+  xfetchBeta?: number;
+  /** Override TTL in seconds for null/undefined fetch results (negative caching). */
+  notFoundTtl?: number;
+}
+
+/**
+ * Options for distributed and in-process mutual exclusion locks via `cache.lock()`.
+ */
+export interface LockOptions {
+  /**
+   * Lock auto-release TTL in seconds (default: 30 s).
+   * Prevents deadlocks if the holding node crashes or is terminated.
+   */
+  ttl?: number;
+  /**
+   * Maximum time to wait to acquire the lock in milliseconds before throwing a timeout error.
+   * Default: `5000` ms.
+   */
+  acquireTimeout?: number;
+  /**
+   * Polling retry interval in milliseconds when waiting for lock acquisition.
+   * Default: `100` ms.
+   */
+  retryInterval?: number;
+}
+
+/**
+ * Structural typing matching OpenTelemetry Metric interfaces (`@opentelemetry/api`).
+ */
+export interface ICacheCounter {
+  add(value: number, attributes?: Record<string, string | number | boolean>): void;
+}
+
+export interface ICacheObservableGauge {
+  readonly _isGauge?: true;
+}
+
+export interface ICacheBatchObservableCallback {
+  (observableResult: {
+    observe: (metric: ICacheObservableGauge, value: number, attributes?: Record<string, string | number | boolean>) => void;
+  }): void | Promise<void>;
+}
+
+export interface ICacheMeter {
+  createCounter(name: string, options?: { description?: string; unit?: string }): ICacheCounter;
+  createObservableGauge(name: string, options?: { description?: string; unit?: string }): ICacheObservableGauge;
+  addBatchObservableCallback(callback: ICacheBatchObservableCallback, observables: ICacheObservableGauge[]): void;
 }

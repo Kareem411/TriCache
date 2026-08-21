@@ -262,9 +262,9 @@ describe('OOM guard', () => {
 
 describe('Iterator interface (keys / values / entries)', () => {
   it('keys() yields namespace-stripped keys for live entries', async () => {
-    const nsSvc = CacheService.reset({
+    const nsSvc = new CacheService({
       disableRedis: true,
-      namespace:    'app',
+      namespace:    `app-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       l1MaxEntries: 100,
       l1MaxBytes:   10 * 1024 * 1024,
       diskCacheDir: tempDir(),
@@ -288,9 +288,9 @@ describe('Iterator interface (keys / values / entries)', () => {
   });
 
   it('entries() yields [key, value] pairs with namespace stripped', async () => {
-    const nsSvc = CacheService.reset({
+    const nsSvc = new CacheService({
       disableRedis: true,
-      namespace:    'ns',
+      namespace:    `ns-${Date.now()}-${Math.random().toString(36).slice(2)}`,
       l1MaxEntries: 100,
       l1MaxBytes:   10 * 1024 * 1024,
       diskCacheDir: tempDir(),
@@ -490,17 +490,17 @@ describe('TTL jitter bounds and distribution', () => {
       const ttlMs = 10_000;
 
       // Mock randomInt minimum (0 -> -1.0 factor -> 10_000 * 0.90 = 9_000)
-      const minSpy = vi.spyOn(cryptoModule.default, 'randomInt').mockReturnValue(0);
+      const minSpy = vi.spyOn(cryptoModule.default, 'randomInt').mockImplementation((() => 0) as any);
       expect(jitterFn(ttlMs)).toBe(9_000);
       minSpy.mockRestore();
 
       // Mock randomInt midpoint (50_000 -> 0.0 factor -> 10_000 * 1.0 = 10_000)
-      const midSpy = vi.spyOn(cryptoModule.default, 'randomInt').mockReturnValue(50_000);
+      const midSpy = vi.spyOn(cryptoModule.default, 'randomInt').mockImplementation((() => 50_000) as any);
       expect(jitterFn(ttlMs)).toBe(10_000);
       midSpy.mockRestore();
 
       // Mock randomInt maximum achievable value in [0, 100_000) (99_999 -> factor +0.99998 -> rounded to 11_000)
-      const maxSpy = vi.spyOn(cryptoModule.default, 'randomInt').mockReturnValue(99_999);
+      const maxSpy = vi.spyOn(cryptoModule.default, 'randomInt').mockImplementation((() => 99_999) as any);
       expect(jitterFn(ttlMs)).toBe(11_000);
       maxSpy.mockRestore();
     } finally {

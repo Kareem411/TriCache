@@ -5,6 +5,101 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-08-21
+
+### Added
+- **Universal HTTP Caching & 304 ETag Middleware (`tricache/http`)** — Universal middleware for Express, Connect, and Hono:
+  - `expressCache(options)` and `honoCache(options)` automatically compute weak ETags, cache endpoint responses, and return `304 Not Modified` on `If-None-Match` matches with zero body transfer overhead. Exported via subpath `"./http"`.
+- **Worker Thread Crash Auto-Recovery** — Handled worker thread sudden crash/exit events with non-zero exit codes in `WorkerPool`, rejecting in-flight tasks cleanly and auto-spawning healthy replacement workers to preserve pool capacity.
+- **First-Class Prisma Client Extension (`tricache/prisma`)** — Added `withTriCache(options)` Prisma Client extension (`$extends`):
+  - Intercepts read queries (`findUnique`, `findFirst`, `findMany`, `count`, `aggregate`, `groupBy`) with options `{ ttl, swr, tags, key }`.
+  - Automatically derives deterministic cache keys from model + operation + query args.
+  - Automatically invalidates model tags on write mutations (`create`, `update`, `delete`, `upsert`, `createMany`, `updateMany`, `deleteMany`). Exported via subpath `"./prisma"`.
+- **First-Class Drizzle ORM Query Wrapper (`tricache/drizzle`)** — Added `withCache(query, options)` wrapper for Drizzle ORM query builders:
+  - Generates deterministic SHA-256 cache keys from compiled SQL + parameter bindings via `query.toSQL()`.
+  - Seamlessly wraps query execution with `cache.wrap()` supporting custom TTL, SWR grace windows, and tags. Exported via subpath `"./drizzle"`.
+- **Distributed Mutex & Lock Primitive (`cache.lock()`)** — Added distributed and in-process mutual exclusion locking:
+  - Atomic acquire via Redis `SET lock:<key> <token> NX EX <ttl>` with safe Lua script release (`if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`).
+  - Automatic release on return or throw to prevent deadlocks.
+  - Configurable `acquireTimeout` and `retryInterval` with an in-process promise-chain mutex fallback.
+- **Native OpenTelemetry Metrics (`ICacheMeter`)** — Direct integration with OpenTelemetry Meter API:
+  - Structural typing matching `@opentelemetry/api` `Meter` without mandatory runtime dependencies.
+  - Registers monotonic counters (`tricache.gets.total`, `tricache.l1.hits`, `tricache.l2.hits`, `tricache.disk.hits`, `tricache.fetches`, `tricache.stampedes.prevented`, `tricache.sets.total`, `tricache.deletes.total`, `tricache.swr.revalidations`).
+  - Registers observable batch gauges for L1 entries/bytes, disk files/bytes, and Bloom filter false-positive rate.
+- **Developer & Troubleshooting CLI (`npx tricache`)** — Zero-dependency developer CLI (`bin/tricache.js` / `dist/cli.js`):
+  - `npx tricache inspect`: Live terminal dashboard displaying hit ratios, 3-tier latencies, L1/disk sizes, and Count-Min Sketch hot keys.
+  - `npx tricache ping`: Measures response latencies across RAM, disk, and Redis.
+  - `npx tricache clear`: Safely flushes all entries or keys matching a prefix across the cluster.
+- **Universal `cache.wrap()` Primitive** — Added `cache.wrap<T>(key, fetchFn, options?: WrapOptions)` in `CacheService` as an ergonomic options-object alternative to `cache.get()`, normalizing `ttl`, `swr`, `tags`, `dependsOn`, `priority`, `refreshAhead`, and `xfetchBeta` into a single configuration object for seamless integration with ORMs (Prisma, Drizzle, TypeORM).
+- **Official NestJS Module, Store & Decorators (`tricache/nestjs`)** — Dedicated dynamic module, store adapter, and declarative decorators for NestJS:
+  - `TriCacheModule.register()` and `TriCacheModule.registerAsync()` for synchronous and async dependency injection.
+  - `TriCacheStore` conforming to `@nestjs/cache-manager` and `cache-manager` v5/v6 contracts with accurate millisecond-to-second TTL conversion.
+  - Declarative `@Cacheable(options)` and `@CacheEvict(options)` method decorators with dynamic key generation, argument injection, and automatic tag invalidation.
+  - Zero mandatory NestJS runtime dependencies (uses structural typing with optional peer dependencies). Exported via subpath `"./nestjs"`.
+- **Zero-Copy WorkerPool Memory Transfers (`transferList`)** — Implemented zero-copy memory transfers between the main thread and worker threads via `transferList`:
+  - `getTransferableArrayBuffer()` detects dedicated buffers and transfers ownership with zero heap copying.
+  - Slices from Node's internal 8 KB buffer pool ($\ge 128\text{ KB}$) are isolated to prevent detached-buffer memory corruption.
+  - Worker thread transfers output buffers back to parent thread via `[transferable]`, guaranteeing two-way zero-copy throughput.
+- **Next.js 16 `cacheLife` Preset & Profile Mapper** — Built-in support for Next.js 16 semantic cache profiles (`PRESET_CACHE_LIFE_PROFILES` and `resolveCacheLife`):
+  - Automatically maps `'default'`, `'seconds'`, `'minutes'`, `'hours'`, `'days'`, `'weeks'`, and `'max'` profiles.
+  - Translates `revalidate` $\rightarrow$ `ttl` and `(expire - revalidate)` $\rightarrow$ `swr` for seamless `"use cache"` lifecycles.
+- **Next.js 16 & 15 Integration Adapter (`tricache/next`)** — Comprehensive `CacheHandler` implementation for Next.js 16 `"use cache"`, React 19 RSC streaming, and legacy ISR. Includes:
+  - 5-method `TriCacheHandler` (`get`, `set`, `refreshTags`, `getExpiration`, `updateTags`) and 4-method `TriCacheISRHandler` (`get`, `set`, `revalidateTag`, `resetRequestCache`).
+  - Single-use stream safety: automatically drains incoming `ReadableStream<Uint8Array>` on `set()` into a contiguous binary buffer and creates fresh, unlocked `ReadableStream` instances on every `get()` hit.
+  - Dynamic `softTags` verification: reads `ctx.softTags` (e.g. `_N_T_/layout`, `_N_T_/page`) on `get()` and validates against active generational tag versions, triggering misses on route/layout boundary invalidations.
+  - Fail-soft error boundaries for stream drops / client disconnects and automatic `NEXT_PHASE=phase-production-build` detection to bypass Redis sockets during static builds.
+  - Exported via `"./next"` in `package.json` with ESM, CJS, and DTS builds (`TriCacheHandler` exported as named and `default`).
+- **Generational Tag Invalidation (`tagStrategy: 'generational'`)** — $O(1)$ tag invalidations replacing $O(N)$ Redis set deletions:
+  - Tag invalidation executes atomic `INCR tag_ver:<tag>` in Redis and memory.
+  - Entries store captured tag versions in a unified Redis hash `{ d: envelope, t: timestamp, tv: tagVersionsJson }` with an atomic `MULTI/EXEC` transaction.
+  - Pipelined multi-tag invalidation (`invalidateTags(tags)`) in a single network round-trip.
+  - Monotonic version progression guarantee (`Math.max(existing, incoming)`) preventing out-of-order packet reordering from resurrecting stale data.
+  - Atomic compare-and-delete Lua script on Redis and `deleteIfSetBefore(cutoffMs)` on L1 RAM to prevent wiping newer data during concurrent revalidation races.
+  - Time-based self-healing reconciliation (`tagVersionTtlMs`, default 5 s) with a 10,000 LRU bounded in-memory cache to heal network partitions and dropped broadcasts.
+- **Transitive Cycle-Protected Dependency Cascades (`dependsOn`)** — `_cascadeDependencies` traverses multi-tier entity graphs using a `visited: Set<string>`, invalidating deep chains ($D_0 \rightarrow \dots \rightarrow D_N$) in $O(V + E)$ while preventing infinite loops on circular graphs ($A \rightarrow B \rightarrow A$).
+- **Redis Streams Invalidation Backplane (`backplaneMode: 'stream'`)** — Durable append-only invalidation logging:
+  - Publishes mutations via `XADD <streamKey> MAXLEN ~ 10000 * ...`.
+  - Cluster single-slot safety via hash tags: `tricache:stream:{<namespace>}`.
+  - Dedicated Redis consumer connection running an unref'd non-blocking `XREAD BLOCK` long-polling loop.
+  - Zero-drop replay of missed mutations across network reconnects and GC pauses using `_lastStreamId`.
+  - Self-healing trim gap fallback: detects when an instance fell behind the stream retention window, increments `metrics.streamGaps`, flushes L1, and resets stream pointer.
+  - Clean instant socket teardown on `destroy()` without long-poll blocking stalls.
+- **Read Safety Strategy (`cloneStrategy: 'structuredClone'`)** — Optional deep-clone isolation on L1 hits, L2 promotions, and fetch returns, protecting cached objects from caller mutation while preserving raw in-memory sub-microsecond performance (`'none'`) and `frozen: true` dev-mode guards.
+- **Atomic Disk Writes & Janitor Sweep** — Staging disk writes to unique sibling `.tmp` files (`${filePath}.${pid}.${timestamp}.${rand}.tmp`) before atomic rename, Windows NTFS file-lock micro-retries, and background cleanup of abandoned `.tmp` files (`sweepOrphanedTmpFiles`).
+- **Dynamic Runtime Key Rotation (`rotateEncryptionKey`)** — Rotate active AES-256-GCM / AES-128 keys at runtime with zero downtime via `cache.rotateEncryptionKey(newKey, mode)`. Seamlessly falls back to the previous key for reading existing L2 (Redis) and disk entries, automatically promotes key material to the worker pool via graceful thread draining (`WorkerPool.drainAndReinit()`), and guarantees graceful cache misses for $N-2$ keys without unhandled exceptions.
+- **Redis 7+ Sharded Pub/Sub (`useShardedPubSub`)** — Scopes invalidation messages strictly to the cluster shard handling the key slot via `SPUBLISH` / `SSUBSCRIBE` when connected to Redis Cluster (`redisClusterNodes`), drastically reducing inter-node cluster bus gossip traffic on high-throughput clusters.
+- **Transparent Payload Compression (Redis L2 & Disk Tier)** — Built-in Brotli and Gzip compression for L2 strings and disk-tier binary blobs with configurable size threshold (`compressionThresholdBytes`, default 1 KB). Offloads compression and decompression to worker threads alongside encryption for large payloads, supporting a 4-state envelope matrix (`cmp:v1:`, `ecp:v1:`, `enc:v1:`, raw JSON) with full backward-compatibility for uncompressed legacy cache entries.
+- **Redis Protocol Selection & RESP3 Auto-Diagnostic (`redisProtocol`)** — Added optional `redisProtocol?: 2 | 3` option in `CacheOptions` allowing explicit wire-protocol selection (RESP2 or RESP3). Includes fail-soft diagnostic detection that intercepts `unknown command 'HELLO'` / protocol errors on legacy proxies (Twemproxy, Envoy, older ElastiCache) and emits an actionable warning prompting the user to configure `redisProtocol: 2`.
+- **Mission-Critical Chaos, Resilience & Ecosystem Test Suites** — Added 484 passing unit, stress, and chaos tests across 41 suites:
+  - 10,000 concurrent stampede coalescing (`tests/stampede-10k.test.ts`).
+  - Redis connection flapping resilience (`tests/chaos-flapping.test.ts`).
+  - Disk spill quota saturation & LRU recovery (`tests/disk-spill-saturation.test.ts`).
+  - SWR outage stampedes under failing upstreams with `staleIfError` TTL extension (`tests/deep-resilience.test.ts`).
+  - Truncated and corrupted snapshot cold-start recovery (`tests/deep-resilience.test.ts`).
+  - Multi-tenant namespace isolation under mass flushes and mutations (`tests/deep-resilience.test.ts`).
+  - 50,000-cycle high-velocity heap soak and memory leak bounds (`tests/heap-soak-leak.test.ts`).
+  - Multi-instance generational backplane synchronization (`tests/multiprocess-backplane-sync.test.ts`).
+  - Worker thread crash auto-recovery & replacement (`tests/worker-crash-recovery.test.ts`).
+  - Distributed mutex lock concurrency exclusion & token release safety (`tests/lock-token-safety.test.ts`, `tests/distributed-lock.test.ts`).
+  - Cross-version format evolution backward compatibility matrix (`tests/format-evolution-matrix.test.ts`).
+  - HTTP caching middleware with 304 ETag short-circuiting for Express and Hono (`tests/http-middleware.test.ts`).
+  - RESP3 proxy rejection diagnostic hint detection (`tests/resp3-diagnostic.test.ts`).
+  - Native OpenTelemetry metric counters & observable gauges (`tests/opentelemetry-metrics.test.ts`).
+  - Prisma client extension & Drizzle query wrapper caching (`tests/prisma-drizzle-adapters.test.ts`).
+  - CLI inspect, ping, clear, version, and help commands (`tests/cli.test.ts`).
+  - High-performance `oxlint` linter and full TypeScript strict checking (`tsconfig.test.json`).
+
+### Security & Hardening
+- **ReDoS Hardening in Glob Dependency Matching** — Hardened `_matchesGlob` against catastrophic backtracking by collapsing consecutive wildcards (`\*+` → `.*`), escaping regex metacharacters, and caching compiled expressions in a bounded LRU regex cache (`globRegexCache`).
+- **WorkerPool Availability Guards** — Guarded `WorkerPool._dispatch` against destroyed or unavailable pools, rejecting immediately with a descriptive error rather than throwing an unhandled TypeError.
+
+### Changed
+- **Zero-Allocation WASM Bloom Filter Staging** — Pre-allocated `stagingTarget` `Uint8Array` in `WasmBloomFilter` constructor, eliminating per-probe `subarray()` view allocations on hot L1 lookups. Boosts filter insertions to **4.54 M/s (220 ns)** and hot hit gating to **1.87 M/s (534 ns)**.
+- **`ioredis` 5.11.1 → 6.0.0** — Upgraded to ioredis v6 major release with default RESP3 protocol support, improved connection lifecycle resilience, and slot routing prototype pollution defenses.
+- **`msgpackr` 2.0.4 → 2.0.5** — Upgraded to msgpackr 2.0.5 patch release addressing sequential/stream unpacking offset tracking and TypeScript export path definitions.
+- **Security & Dependency Audit Fixes** — Updated devDependencies (`vitest`, `tsup`, `tsx`, `@types/node`, `vite`) and configured package overrides to eliminate all 7 security advisory warnings (`vite`, `postcss`, `nanoid`, `esbuild`).
+- **Extracted Named Constants** — Extracted `DEFAULT_COUNTER_TTL_SECONDS` (60 s) for in-process rate-limiting counter fallback in `increment()`.
+
 ## [0.6.7] — 2026-08-15
 
 ### Security & Hardening
@@ -136,7 +231,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ioredis` 5.10.1 → 5.11.0
 - `msgpackr` 2.0.1 → 2.0.2
 
-
+## [0.6.0] — 2026-05-26
 
 ### Added
 

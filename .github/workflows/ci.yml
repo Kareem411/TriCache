@@ -1,4 +1,4 @@
-name: CI
+name: CI/CD Pipeline
 
 on:
   push:
@@ -7,22 +7,60 @@ on:
   pull_request:
     branches: [master]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NODE_OPTIONS: '--max-old-space-size=8192'
 
 jobs:
-  test:
-    name: Test (Node ${{ matrix.node }})
+  validate:
+    name: Lint & Typecheck (Node 22)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Oxlint static analysis
+        run: pnpm lint
+
+      - name: Strict TypeScript verification (src + tests)
+        run: pnpm typecheck:all
+
+  test-linux:
+    name: Test (Ubuntu - Node ${{ matrix.node }})
+    needs: validate
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         node: ['22', '24']
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
-        # version auto-detected from packageManager field in package.json
 
       - uses: actions/setup-node@v4
         with:
@@ -32,20 +70,55 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Type check
-        run: pnpm typecheck
+      - name: Run test suite
+        run: pnpm test
+        env:
+          REDIS_HOST: '127.0.0.1'
+          REDIS_PORT: 6379
 
-      - name: Run tests
+      - name: Build
+        run: pnpm build
+
+      - name: Package tarball dry-run verification
+        run: pnpm pack --dry-run
+
+  test-matrix:
+    name: Test (${{ matrix.os }} - Node ${{ matrix.node }})
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        node: ['22', '24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run test suite
         run: pnpm test
 
       - name: Build
         run: pnpm build
 
+      - name: Package tarball dry-run verification
+        run: pnpm pack --dry-run
+
   publish:
-    name: Publish to npm + GitHub Release
-    needs: test
+    name: Publish to npm & GitHub Release
+    needs: [test-linux, test-matrix]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    if: false # disabled — publish manually via pnpm publish
     permissions:
       contents: write
       id-token: write
@@ -54,22 +127,26 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
-        # version auto-detected from packageManager field in package.json
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
           cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Strict TypeScript verification
+        run: pnpm typecheck:all
+
       - name: Build
         run: pnpm build
 
-      - name: Publish to npm
-        run: npm publish --provenance
+      - name: Publish with npm provenance
+        run: pnpm publish --access public --provenance --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Create GitHub Release
         env:

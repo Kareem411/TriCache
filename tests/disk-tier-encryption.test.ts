@@ -27,7 +27,7 @@ const NOOP_LOGGER = {
 // retain a brief handle, so retrying avoids EPERM masking real test results.
 function cleanup(dir: string): void {
   for (let i = 0; i < 5; i++) {
-    try { cleanup(dir); return; }
+    try { rmSync(dir, { recursive: true, force: true }); return; }
     catch { /* retry */ }
   }
 }

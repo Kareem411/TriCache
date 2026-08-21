@@ -18,8 +18,13 @@ import fs                from 'fs';
 import path              from 'path';
 import crypto            from 'crypto';
 import { pack, unpack }  from 'msgpackr';
-import { DiskCacheEntry, ILogger } from './types.js';
-import { CacheEncryption }        from './encryption.js';
+import type { DiskCacheEntry, ILogger } from './types.js';
+import type { CacheEncryption }        from './encryption.js';
+import {
+  compressWithHeader,
+  decompressWithHeader,
+  type CompressionAlgorithm,
+} from './compression.js';
 
 // ── node:sqlite lazy bootstrap ────────────────────────────────────────────────
 // Stable in Node 24; experimental (needs --experimental-sqlite) in Node 22.
@@ -46,7 +51,7 @@ try {
 // ── Encryption (delegates to CacheEncryption — mode-aware, no reimplementation) ──
 // DiskTier keeps its own V2 envelope (magic | plaintext expiresAt | payload) but
 // delegates the payload cipher to CacheEncryption, which already supports all four
-// modes (aes-256-gcm, aes-128-gcm, aes-128-ctr, xor) and is the single source of
+// modes (aes-256-gcm, aes-128-gcm, aes-128-ctr, or xor) and is the single source of
 // truth for the on-disk binary format. This avoids a hardcoded aes-256-gcm that
 // threw (and silently no-op'd the disk tier) for any non-default mode.
 const DISK_MAGIC    = Buffer.from([0x44, 0x54, 0x49, 0x45, 0x52, 0x56, 0x31, 0x00]); // "DTIERV1\0"
@@ -81,6 +86,8 @@ export interface DiskTierOptions {
    *  same algorithm as L2/Redis (aes-256-gcm, aes-128-gcm, aes-128-ctr, or xor).
    *  When null, files are written unencrypted. Pass `cache.encryption` here. */
   encryption?:      CacheEncryption | null;
+  compression?:     CompressionAlgorithm;
+  compressionThresholdBytes?: number;
   logger:           ILogger;
 }
 
@@ -340,32 +347,52 @@ export class DiskTier {
       };
       const packed = pack(payload);
       if (packed.length > this.opts.entryMaxBytes) return;
+      let toEncrypt = packed;
+      if (this.opts.compression && this.opts.compression !== 'none' && packed.length > (this.opts.compressionThresholdBytes ?? 1024)) {
+        toEncrypt = compressWithHeader(packed, this.opts.compression);
+      }
       // V2 format: 16-byte plaintext header (magic + expiresAt) followed by the
       // encrypted-or-raw payload.  The plaintext expiresAt allows purgeNextBucket()
       // to check expiry with a 16-byte partial read — no decrypt or unpack needed.
       const header = Buffer.allocUnsafe(V2_HEADER_LEN);
       DISK_MAGIC_V2.copy(header, 0);
       header.writeBigUInt64LE(BigInt(entry.expiresAt), 8);
-      final = Buffer.concat([header, this.encryptV2(packed)]);
+      final = Buffer.concat([header, this.encryptV2(toEncrypt)]);
     } catch (err) {
       this.opts.logger.debug('DiskTier: pack/encrypt failed', { key: key.slice(0, 50), error: (err as Error).message });
       return;
     }
 
-    // ── Async phase: mkdir + write (does not block the event loop) ────
+    // ── Async phase: mkdir + write to same-dir tmp + atomic rename ────
     const hash     = this.keyToHash(key);
     const filePath = this.hashToWritePath(hash, entry.expiresAt);
+    const tmpPath  = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
     this.diskUsageBytes += final.length; // optimistic — rolled back on error
     this.fileCount++;
 
     try {
       await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.promises.writeFile(filePath, final, { mode: 0o600 });
+      await fs.promises.writeFile(tmpPath, final, { mode: 0o600 });
+
+      // Atomic rename with micro-retry loop for Windows NTFS handle release
+      try {
+        await fs.promises.rename(tmpPath, filePath);
+      } catch (renameErr: unknown) {
+        const code = (renameErr as { code?: string })?.code;
+        if (code === 'EBUSY' || code === 'EPERM') {
+          await new Promise<void>(resolve => setTimeout(resolve, 5));
+          await fs.promises.rename(tmpPath, filePath);
+        } else {
+          throw renameErr;
+        }
+      }
+
       if (this._db) {
         this._stmtInsert!.run(hash, filePath, entry.expiresAt, final.length);
       }
       this.opts.logger.debug('DiskTier: entry saved', { key: key.slice(0, 50), bytes: final.length });
     } catch (err) {
+      try { await fs.promises.unlink(tmpPath); } catch { /* ignore if already gone/failed */ }
       this.diskUsageBytes -= Math.min(this.diskUsageBytes, final.length); // rollback
       this.fileCount = Math.max(0, this.fileCount - 1);
       if (this._db) try { this._stmtDelete!.run(hash); } catch { /* ok */ }
@@ -449,7 +476,8 @@ export class DiskTier {
         try { decrypted = this.decrypt(raw); } catch { return null; }
       }
 
-      const payload = unpack(decrypted) as DiskPayload;
+      const uncompressed = decompressWithHeader(decrypted, this.opts.compression ?? 'brotli');
+      const payload = unpack(uncompressed) as DiskPayload;
       if (!payload || payload.version !== DISK_TIER_VERSION || payload.key !== key) return null;
       if (payload.entry.expiresAt <= Date.now()) return null;
 
@@ -511,6 +539,18 @@ export class DiskTier {
     const headerBuf = Buffer.allocUnsafe(V2_HEADER_LEN);
     for (const filePath of this.walkCacheFiles()) {
       const filename = path.basename(filePath);
+
+      // Clean up orphaned .tmp files older than 5 minutes
+      if (filename.endsWith('.tmp')) {
+        try {
+          const stat = fs.statSync(filePath);
+          if (now - stat.mtimeMs > 5 * 60 * 1000) {
+            fs.unlinkSync(filePath);
+            purged++;
+          }
+        } catch { /* already gone */ }
+        continue;
+      }
 
       // ── V3 fast path: expiresAt encoded in filename, zero file I/O for live entries
       if (filename.length === 77 && filename[64] === '_') {
@@ -617,6 +657,17 @@ export class DiskTier {
       let orphanFiles: string[];
       try { orphanFiles = fs.readdirSync(orphanBucketP); } catch { return expired.length; }
       for (const file of orphanFiles) {
+        if (file.endsWith('.tmp')) {
+          const fp = path.join(orphanBucketP, file);
+          try {
+            const stat = fs.statSync(fp);
+            if (now - stat.mtimeMs > 5 * 60 * 1000) {
+              fs.unlinkSync(fp);
+            }
+          } catch { /* already gone */ }
+          continue;
+        }
+
         if (file.length === 77 && file[64] === '_') {
           const expiresAt = parseInt(file.slice(65), 16);
           if (expiresAt <= now) {
@@ -644,6 +695,19 @@ export class DiskTier {
     // One reusable header buffer — avoids per-file allocation inside the V2 fallback loop.
     const headerBuf = Buffer.allocUnsafe(V2_HEADER_LEN);
     for (const file of files) {
+      // Clean up orphaned .tmp files older than 5 minutes
+      if (file.endsWith('.tmp')) {
+        const fp = path.join(bucketPath, file);
+        try {
+          const stat = fs.statSync(fp);
+          if (now - stat.mtimeMs > 5 * 60 * 1000) {
+            fs.unlinkSync(fp);
+            purged++;
+          }
+        } catch { /* already gone */ }
+        continue;
+      }
+
       // ── V3 fast path: expiresAt encoded in filename, zero file I/O for live entries
       // Filename format: {sha256-64-hex}_{expiresAt-12-hex} = 77 chars total.
       if (file.length === 77 && file[64] === '_') {

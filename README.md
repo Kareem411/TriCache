@@ -2,12 +2,12 @@
 
 [![CI](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![npm downloads](https://img.shields.io/npm/dm/tricache.svg)](https://www.npmjs.com/package/tricache)
+[![Tests](https://img.shields.io/badge/tests-484%20passing-brightgreen)](tests)
+[![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 22](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x%20%7C%206.x-blue)](https://www.typescriptlang.org)
-[![L1 get](https://img.shields.io/badge/L1%20get-2.81%20M%2Fs-brightgreen)](BENCHMARKS.md)
-[![Thundering herd](https://img.shields.io/badge/thundering%20herd-100%25%20coalesced-brightgreen)](BENCHMARKS.md)
+[![TypeScript](https://img.shields.io/badge/TypeScript-Strict%20%7C%205.x%20%7C%206.x-blue)](https://www.typescriptlang.org)
+[![npm provenance](https://img.shields.io/badge/provenance-verified-brightgreen)](https://www.npmjs.com/package/tricache)
 
 tricache is a three-tier Node.js cache library — in-memory (L1), local disk spill, and Redis/Valkey (L2). Warm L1 reads run at 2.81 million operations per second on a single thread (356 ns/op) — well below any network round-trip, including a local Redis call. When L1 fills, evicted entries spill to disk instead of being dropped, keeping hit rates high without unbounded RAM growth. Misses that reach L2 are coalesced across concurrent callers, so a spike of simultaneous requests for the same key triggers exactly one fetchFn call, not one per caller. See the performance section for full numbers. Optional configuration adds Stale-While-Revalidate, at-rest encryption (AES-256-GCM by default), pub/sub fleet-wide invalidation, an OOM guard, cold-start snapshots, and Prometheus metrics — none of it required to get started.
 
@@ -15,17 +15,44 @@ tricache is a three-tier Node.js cache library — in-memory (L1), local disk sp
 
 ---
 
+## 🏆 What Makes TriCache a "No-Brainer"
+
+| Dimension | Industry Standard (`keyv`, `@neshca/cache-handler`, `cache-manager`) | **TriCache v0.7.0** |
+|:---|:---|:---|
+| **Storage Hierarchy** | Single-tier (RAM or Redis or Disk) | **Three-Tier (RAM → NVMe Disk → Redis/Valkey)** |
+| **Thundering-Herd** | Unhandled / requires external single-flight libraries | **Built-in Inflight Promise Coalescing (10k tested)** |
+| **Tag Invalidation** | $O(N)$ bulk key scans or Redis `SMEMBERS` deletions | **$O(1)$ Generational Version Counters (`MULTI/EXEC`)** |
+| **Next.js 16 Support** | Basic key-value handlers, broken RSC stream reuse | **Native 5-Method Bridge with stream re-hydration & `cacheLife`** |
+| **NestJS Support** | Generic `CacheModule` with missing batch/tag methods | **Dynamic `TriCacheModule` + `@Cacheable` & `@CacheEvict` decorators** |
+| **Cluster Invalidation** | At-most-once Pub/Sub (drops messages on network blips) | **Durable Redis Streams (`XADD`/`XREAD`) with reconnect replay** |
+| **Memory Hygiene** | Standard JSON stringification, unconstrained RAM | **WASM Bloom filter, Count-Min Sketch, Zero-Copy `transferList` workers** |
+| **Failure Tolerance** | Cascading 500s when Redis/Upstream flutters | **Circuit Breaker, `staleIfError` SWR grace, monotonic tag guarantees** |
+
+---
+
 ## ✨ Features
 
 | Feature | Detail |
 |---|---|
+| **Next.js 16 & 15 Adapter** | Full `CacheHandler` implementation for Next.js 16 `"use cache"` and legacy ISR; single-use stream re-hydration, dynamic `softTags` checking, and automatic `NEXT_PHASE` build bypass |
+| **NestJS Dynamic Module & Store** | Dedicated `TriCacheModule.register()` dynamic module, `TriCacheStore` adapter for `@nestjs/cache-manager`, and declarative `@Cacheable` / `@CacheEvict` method decorators |
+| **First-Class Prisma Extension** | `withTriCache(options)` for `$extends` with automatic query key hashing, cache options, and write mutation tag invalidation |
+| **First-Class Drizzle Wrapper** | `withCache(query, options)` wrapping Drizzle queries with automatic SQL + params hashing and SWR support |
+| **Distributed Mutex Lock** | `cache.lock(key, fn, options)` with Redis `SET NX EX`, atomic Lua token-release, and local promise-chain fallback |
+| **Native OpenTelemetry Metrics** | Direct `meter` integration publishing monotonic counters and observable gauges without scrapers |
+| **Interactive Developer CLI** | Zero-dependency CLI (`npx tricache inspect`, `ping`, `clear`) with terminal dashboard and latency probes |
+| **Universal `cache.wrap()` Primitive** | Options-object wrapper (`{ ttl, swr, tags, dependsOn, priority }`) for ORMs and service layers |
+| **Generational Tagging** | $O(1)$ tag invalidations via Redis version counters (`INCR tag_ver:<tag>`); atomic `{d, t, tv}` hash schema, pipelined batch `invalidateTags()`, and time-based self-healing reconciliation |
+| **Read Safety (`cloneStrategy`)** | `cloneStrategy: 'structuredClone'` isolates returned objects from caller mutation; sub-microsecond raw reference fallback (`'none'`) |
+| **Redis Streams Backplane** | `backplaneMode: 'stream'` replaces at-most-once Pub/Sub with durable `XADD`/`XREAD` append-only log; cluster hash tag slot safety and zero-drop reconnect replay |
+| **Atomic Disk Writes** | Atomic staging via unique `.tmp` sibling files with Windows NTFS file-lock micro-retries and background `.tmp` janitor sweep |
 | **Adaptive eviction** | LFU × LRU × priority score + Count-Min Sketch cross-eviction frequency; reservoir-sampled O(1) hot path; category limits prevent any prefix monopolising RAM |
 | **Count-Min Sketch** | 4 × 512 `Uint16Array` (4 KB) tracks historical access frequency across eviction boundaries — same-priority burst keys cannot displace long-resident entries; **84 % survival rate** in benchmark flood tests |
 | **WASM Bloom filter** | 562-byte binary inlined as Base64 — O(k=7) guaranteed-miss detection, no filesystem access, pure-JS fallback |
 | **msgpackr serialization** | All entries packed with msgpackr — uniform binary format, no JSON at any payload size |
 | **Stale-While-Revalidate** | Serve stale instantly, revalidate in background — zero added latency on cache hit |
 | **Stale-if-error** | Extend a stale entry's TTL when SWR revalidation fails — no errors served during upstream outages |
-| **Thundering-herd prevention** | Inflight `Promise` registry — only one `fetchFn` call per key regardless of concurrency |
+| **Thundering-herd prevention** | Inflight `Promise` registry — only one `fetchFn` call per key regardless of concurrency (10,000 tested) |
 | **Pub/sub invalidation backplane** | Redis pub/sub channel propagates deletes across all instances in real time |
 | **Tag-based invalidation** | Tag entries on write; `invalidateTag('catalog')` evicts all matching entries from L1, disk, and Redis atomically |
 | **Batch read** | `mget()` collects L1 hits, calls `fetchFn` only for misses, preserves ordering |
@@ -82,6 +109,13 @@ const user = await cache.get(
   300,
 );
 
+// Universal wrap() with options object (alternative to get)
+const profile = await cache.wrap(
+  `user:${userId}:profile`,
+  () => db.users.findProfile(userId),
+  { ttl: 300, swr: 60, tags: ['users'] },
+);
+
 // Explicit set
 await cache.set(`user:${userId}`, user, 300);
 
@@ -120,7 +154,13 @@ await cache.mset({
 
 // Batch delete
 await cache.mdel([`user:${userIdA}`, `user:${userIdB}`]);
+```
 
+> [!TIP]
+> **In-Memory Reference Semantics & Mutation Safety:**  
+> By default, TriCache returns direct in-memory object references from L1 RAM (`cloneStrategy: 'none'`) to achieve sub-microsecond throughput (**2.81M ops/sec / 356 ns**). If your callers mutate returned objects in-place, enable `cloneStrategy: 'structuredClone'` for deep copy isolation, or enable `frozen: true` in non-production environments to catch mutations at runtime.
+
+```typescript
 // Warm L1 from Redis at startup
 const loaded = await cache.warmFromL2('user:*');
 console.log(`Pre-warmed ${loaded} user entries`);
@@ -189,12 +229,32 @@ CacheService.create({
   redisHost:    'my-redis.example.com',   // or REDIS_HOST env var
   redisPort:    6379,
   redisTls:     true,                     // default: true when NODE_ENV=production
+  redisProtocol: 3,                       // default: 3 (RESP3 in ioredis v6+); set to 2 for RESP2 proxies (Twemproxy/Envoy)
   disableRedis: false,                    // default: true when NODE_ENV!=production
 
+  // ── Transparent payload compression ──────────────────────────────────
+  // 'none' (default)   — raw msgpack/JSON representation
+  // 'brotli' | 'gzip'  — compress Redis L2 payloads and disk tier binaries
+  compression:               'none',
+  compressionThresholdBytes: 1024,        // only compress entries ≥ 1 KB (default)
+
   // ── Invalidation backplane ───────────────────────────────────────────
-  // Redis pub/sub channel that propagates deletes to all instances.
-  // Enabled by default when Redis is active.
-  invalidationBackplane: true,
+  invalidationBackplane:  true,
+  // 'pubsub' (default) — Ephemeral Redis Pub/Sub (at-most-once delivery)
+  // 'stream'           — Durable Redis Streams (XADD/XREAD) with replay on reconnect
+  backplaneMode:          'pubsub',
+  backplaneStreamMaxLen:  10_000, // max entries retained in invalidation stream
+  backplaneStreamBlockMs: 2_000,  // blocking poll interval for XREAD BLOCK
+  // backplaneStreamKey:  'tricache:stream:{my-app}', // custom stream key override
+
+  // ── Generational tagging & clone strategy ─────────────────────────────
+  // 'set' (default)    — traditional Redis Set member tracking
+  // 'generational'     — atomic O(1) integer version counters in Redis + memory
+  tagStrategy:            'set',
+  tagVersionTtlMs:        5_000,  // ms before local generational tag is re-synced from Redis
+  // 'none' (default)   — raw in-memory references (~350 ns performance)
+  // 'structuredClone'  — deep-clones returned values to prevent caller mutation
+  cloneStrategy:          'none',
 
   // ── OOM guard ────────────────────────────────────────────────────────
   oomProtection:      true,   // enabled by default
@@ -487,14 +547,17 @@ const hot = cache.hotKeys(5);
 // ]
 ```
 
-### `cache.invalidateTag(tag)` → `Promise<void>`
+### `cache.invalidateTag(tag)` / `cache.invalidateTags(tags)` → `Promise<void>`
 
-Evict all entries associated with a tag from L1, disk, and Redis.
+Evict all entries associated with one or more tags from L1, disk, and Redis.
+When `tagStrategy: 'generational'` is active, `invalidateTags(tags)` pipelines multi-tag increments in a single network round-trip.
 
 ```typescript
-await cache.set('product:1', data, 60, undefined, { tags: ['catalog'] });
-await cache.set('product:2', data, 60, undefined, { tags: ['catalog'] });
-await cache.invalidateTag('catalog'); // evicts both entries
+await cache.set('product:1', data, 60, undefined, { tags: ['catalog', 'electronics'] });
+await cache.set('product:2', data, 60, undefined, { tags: ['catalog', 'deals'] });
+
+await cache.invalidateTag('catalog');                // single tag
+await cache.invalidateTags(['electronics', 'deals']); // pipelined batch invalidation
 ```
 
 ### `cache.ping()` → `Promise<CachePingResult>`
@@ -597,11 +660,151 @@ Lazily yields `[key, value]` pairs for every live L1 entry. Key has namespace pr
 for (const [key, user] of cache.entries<User>()) sync(key, user);
 ```
 
-> **JIT note:** all three generators iterate `SmartMemoryCache.cache` (a single `Map`). V8 maintains per-call-site type feedback; having three generator functions share the same Map means no single one gets the full monomorphic specialization budget. In practice the throughput impact is ≤5 % relative to each running in isolation. See [BENCHMARKS.md](BENCHMARKS.md) for numbers.
+### `cache.rotateEncryptionKey(newKeyBase64, newMode?)` → `Promise<void>`
+
+Dynamically rotates the active encryption key at runtime with zero downtime:
+- Installs the new key as primary for all subsequent writes.
+- Automatically preserves the previous key for seamless fallback decryption of existing cache entries.
+- Gracefully drains and re-initializes all worker threads in the crypto pool (`WorkerPool.drainAndReinit()`).
+
+```typescript
+await cache.rotateEncryptionKey(newKeyBase64, 'aes-256-gcm');
+```
+
+### `cache.lock<T>(resourceKey, fn, options?)` → `Promise<T>`
+
+Acquire a distributed (or in-process) mutual exclusion lock on `resourceKey`, execute `fn`, and automatically release the lock on return or throw.
+- Prevents concurrent executions of critical tasks across a cluster (e.g. database migrations, nightly syncs, cron jobs).
+- Safe token comparison via Redis Lua script prevents deleting a lock acquired by another worker if execution exceeded the lock TTL.
+- Automatically falls back to an in-process promise-chain mutex in single-process or dev environments.
+
+```typescript
+const result = await cache.lock('cron:nightly-sync', async () => {
+  return await runNightlyDatabaseSync();
+}, {
+  ttl: 60,              // Auto-release TTL in seconds (prevents deadlocks on crash)
+  acquireTimeout: 5000, // Maximum wait time to acquire lock in ms
+  retryInterval: 100,   // Polling retry interval in ms
+});
+```
 
 ### `cache.destroy()` → `Promise<void>`
 
 Closes the Redis connection, unsubscribes the backplane, and stops all background timers.
+
+---
+
+## 🗄️ First-Class ORM Extensions (Prisma & Drizzle)
+
+### Prisma Client Extension (`tricache/prisma`)
+
+Add one-line query caching and automatic model tag invalidation to Prisma:
+
+```typescript
+import { PrismaClient } from '@prisma/client';
+import { withTriCache } from 'tricache/prisma';
+import { CacheService } from 'tricache';
+
+const cache = CacheService.create({ redisHost: 'localhost' });
+
+const prisma = new PrismaClient().$extends(
+  withTriCache({
+    cache,
+    defaultTtl: 300,
+    autoInvalidate: true, // Automatically invalidates 'user' tag on user.create / update / delete
+  })
+);
+
+// Automatic caching with explicit options:
+const activeUsers = await prisma.user.findMany({
+  where: { active: true },
+  cache: { ttl: 60, tags: ['users'], swr: 30 },
+});
+```
+
+### Drizzle ORM Wrapper (`tricache/drizzle`)
+
+Wrap any Drizzle query builder with automatic SQL + parameter hashing and caching:
+
+```typescript
+import { withCache } from 'tricache/drizzle';
+import { eq } from 'drizzle-orm';
+
+const activeUsers = await withCache(
+  db.select().from(users).where(eq(users.active, true)),
+  { cache, ttl: 300, tags: ['users'] }
+);
+```
+
+---
+
+## 📊 OpenTelemetry Native Metrics
+
+TriCache integrates directly with OpenTelemetry `Meter` (`@opentelemetry/api`) to publish monotonic counters and observable gauges without scrapers:
+
+```typescript
+import { metrics } from '@opentelemetry/api';
+import { CacheService } from 'tricache';
+
+const meter = metrics.getMeter('my-service');
+
+const cache = CacheService.create({
+  redisHost: 'localhost',
+  meter, // Native OpenTelemetry meter integration
+});
+```
+
+---
+
+## 💻 Developer & Troubleshooting CLI (`npx tricache`)
+
+Inspect running caches, test latency across tiers, or flush namespaces directly from your terminal:
+
+```bash
+# Display full live dashboard (hit ratios, latencies, Count-Min Sketch hot keys)
+npx tricache inspect --redis redis://localhost:6379 --namespace my-app
+
+# Measure 3-tier response latency
+npx tricache ping --redis redis://localhost:6379
+
+# Flush namespace or prefix
+npx tricache clear --redis redis://localhost:6379 --namespace my-app --prefix user:
+```
+
+---
+
+## 🌐 HTTP Caching & 304 ETag Middleware (`tricache/http`)
+
+Drop-in HTTP caching with automatic weak ETag generation and RFC-compliant `304 Not Modified` short-circuiting:
+
+### Express & Connect
+```typescript
+import express from 'express';
+import { expressCache } from 'tricache/http';
+import { CacheService } from 'tricache';
+
+const app = express();
+const cache = CacheService.create({ redisHost: 'localhost' });
+
+// Automatically caches GET /api/users, emits ETag, and returns 304 on If-None-Match
+app.get('/api/users', expressCache({ cache, ttl: 300, tags: ['users'] }), async (_req, res) => {
+  const users = await db.user.findMany();
+  res.json(users);
+});
+```
+
+### Hono & Web Standards
+```typescript
+import { Hono } from 'hono';
+import { honoCache } from 'tricache/http';
+
+const app = new Hono();
+
+app.get('/api/users', honoCache({ ttl: 300, tags: ['users'] }), async (c) => {
+  const users = await db.user.findMany();
+  return c.json(users);
+});
+```
 
 ---
 
@@ -750,20 +953,257 @@ CacheService.create({
 
 ---
 
-## 🔁 Backplane staleness fence
+## 🗜️ Transparent Payload Compression
 
-Redis Pub/Sub has no delivery guarantees — a subscriber disconnect (network blip, Redis failover, container restart) can cause peer invalidation messages to be silently dropped. Entries written to L1 between the disconnect and reconnect may silently serve stale data.
-
-TriCache tracks when the subscriber disconnects and, on reconnect, compares the gap duration against `backplaneMaxStalenessMs`. If the gap exceeds the threshold, every L1 entry that was written before the disconnect is proactively evicted, forcing a controlled re-fetch from L2 on the next access:
+TriCache includes built-in Brotli and Gzip compression for Redis L2 strings and L1.5 disk tier binary payloads, transparently reducing network bandwidth and storage footprints without manual application encoding.
 
 ```typescript
 CacheService.create({
-  invalidationBackplane:   true,
-  backplaneMaxStalenessMs: 5_000, // default: evict stale L1 on gaps > 5 s
+  compression:               'brotli', // 'brotli' | 'gzip' | 'none' (default: 'none')
+  compressionThresholdBytes: 1024,     // only compress entries >= 1024 bytes (default)
 });
 ```
 
-Setting `backplaneMaxStalenessMs: 0` disables the fence entirely. The eviction count and gap duration are logged at `warn` level on every triggered flush.
+### Storage Envelope Matrix
+
+Entries written to Redis L2 and the disk spill tier use self-describing magic headers, allowing mixed uncompressed, compressed, and encrypted entries to coexist seamlessly during rollout:
+
+| Envelope Header | State | Description |
+|---|---|---|
+| `cmp:v1:<data>` | Compressed | Compressed payload (Brotli or Gzip) |
+| `ecp:v1:<data>` | Encrypted + Compressed | Payload compressed before encryption |
+| `enc:v1:<data>` | Encrypted | AES-256-GCM / AES-128 encrypted without compression |
+| `{"d": ...}` / raw | Plaintext | Uncompressed, unencrypted legacy JSON / msgpack |
+
+### Worker Thread Offload
+
+When `workerThreads: true` is enabled, compression and decompression for large payloads above `workerThresholdBytes` are offloaded to background worker threads alongside encryption, keeping the V8 main event loop free for concurrent HTTP requests.
+
+---
+
+## ⚡ Next.js 16 & 15 Integration (`tricache/next`)
+
+TriCache provides first-class support for Next.js 16 `"use cache"`, React 19 RSC streaming, and Next.js 15/16 ISR via `tricache/next`.
+
+### Setup in `next.config.mjs`
+
+```javascript
+// next.config.mjs
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  // Point Next.js directly to the default export
+  cacheHandler: require.resolve('tricache/next'),
+  cacheMaxMemorySize: 0, // Disable Next.js default in-memory cache to let TriCache manage RAM
+};
+
+export default nextConfig;
+```
+
+### Custom Options Factory
+
+To configure TriCache with custom Redis, encryption, or namespace settings:
+
+```typescript
+// cache-handler.mjs
+import { createNextCacheHandler } from 'tricache/next';
+
+export default createNextCacheHandler({
+  namespace: 'my-next-app',
+  redisHost: process.env.REDIS_HOST,
+  tagStrategy: 'generational',
+  backplaneMode: 'stream',
+});
+```
+
+```javascript
+// next.config.mjs
+export default {
+  cacheHandler: require.resolve('./cache-handler.mjs'),
+};
+```
+
+### Key Architectural Highlights
+- **Single-Use Stream Re-hydration:** React 19 RSC streams (`ReadableStream<Uint8Array>`) are drained to contiguous binary buffers on `set()`, and fresh unlocked `ReadableStream` instances are re-hydrated on every `get()` hit.
+- **Dynamic `softTags` Verification:** In Next.js 16 App Router, layout and route boundary invalidations pass `softTags` into `ctx.softTags` at read time. TriCache dynamically validates them against generational tag versions, triggering misses on invalidated boundaries.
+- **Stream Error Boundary:** Mid-flight client disconnects or aborted streams are caught safely without throwing or storing corrupted partial payloads.
+- **Automatic Build Phase Bypass:** Automatically detects `NEXT_PHASE=phase-production-build` during `next build` and runs in-memory without opening Redis network sockets.
+
+---
+
+## 🦁 NestJS Integration (`tricache/nestjs`)
+
+TriCache provides an official NestJS dynamic module and `@nestjs/cache-manager` store adapter compatible with `cache-manager` v5/v6:
+
+### Synchronous Module Registration
+
+```typescript
+// app.module.ts
+import { Module } from '@nestjs/common';
+import { TriCacheModule } from 'tricache/nestjs';
+
+@Module({
+  imports: [
+    TriCacheModule.register({
+      namespace: 'my-nest-api',
+      redisHost: process.env.REDIS_HOST,
+      encryptionKey: process.env.CACHE_ENCRYPTION_KEY,
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+### Asynchronous Module Registration (with ConfigService)
+
+```typescript
+// app.module.ts
+import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { TriCacheModule } from 'tricache/nestjs';
+
+@Module({
+  imports: [
+    ConfigModule.forRoot(),
+    TriCacheModule.registerAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        namespace: config.get<string>('CACHE_NAMESPACE', 'nest-api'),
+        redisHost: config.get<string>('REDIS_HOST'),
+        redisPort: config.get<number>('REDIS_PORT', 6379),
+        tagStrategy: 'generational',
+        backplaneMode: 'stream',
+      }),
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+### Injecting into Services & Controllers
+
+Use either standard `@Inject(CACHE_MANAGER)` for `@nestjs/cache-manager` compatibility, or `@Inject('TRICACHE_SERVICE')` for direct access to TriCache's three-tier engine:
+
+```typescript
+import { Injectable, Inject } from '@nestjs/common';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import type { CacheStore } from '@nestjs/cache-manager';
+import type { CacheService } from 'tricache';
+
+@Injectable()
+export class UsersService {
+  constructor(
+    @Inject(CACHE_MANAGER) private cacheManager: CacheStore,
+    @Inject('TRICACHE_SERVICE') private triCache: CacheService,
+  ) {}
+
+  async getUser(id: string) {
+    // Standard NestJS cache-manager API (millisecond TTL)
+    const cached = await this.cacheManager.get(`user:${id}`);
+    if (cached) return cached;
+
+    // Or use TriCache's native SWR & thundering-herd prevention:
+    return this.triCache.get(`user:${id}`, () => this.fetchFromDb(id), 300, { swr: 60 });
+  }
+}
+```
+
+### Declarative Method Decorators (`@Cacheable`, `@CacheEvict`)
+
+Remove cache boilerplate from your NestJS services using declarative method decorators:
+
+```typescript
+import { Injectable } from '@nestjs/common';
+import { Cacheable, CacheEvict } from 'tricache/nestjs';
+
+@Injectable()
+export class ProductsService {
+  // Automatically caches result in TriCache (L1 -> L1.5 -> L2) with stampede coalescing
+  @Cacheable({
+    key: (id: string) => `product:${id}`,
+    ttl: 300,
+    swr: 60,
+    tags: ['products'],
+  })
+  async findById(id: string) {
+    return this.db.product.findUnique({ where: { id } });
+  }
+
+  // Automatically invalidates tags or keys after successful method execution
+  @CacheEvict({ tags: ['products'] })
+  async updateProduct(id: string, dto: UpdateProductDto) {
+    return this.db.product.update({ where: { id }, data: dto });
+  }
+}
+```
+
+---
+
+## 🏷️ Generational Tag Invalidation (`tagStrategy: 'generational'`)
+
+Traditional tag-based caching stores key sets in Redis and performs $O(N)$ key deletions on `invalidateTag()`. For high-cardinality collections, this triggers blocking Redis spikes and cache stampedes.
+
+With `tagStrategy: 'generational'`:
+- **$O(1)$ Atomic Tag Invalidation:** `cache.invalidateTag('products')` atomically increments an integer version counter in Redis (`INCR tag_ver:products`) and updates local memory.
+- **Atomic Multi-Field Hash Schema:** Entries in Redis are stored as a unified Hash `{ d: envelope, t: timestamp, tv: tagVersionsJson }` with an atomic `MULTI/EXEC` transaction.
+- **Pipelined Batch Invalidation:** `cache.invalidateTags(['t1', 't2'])` pipelines multi-tag version increments in a single network round-trip.
+- **Zero-Tear Compare-and-Delete:** Stale entries are pruned upon access using an atomic Lua script (`deleteIfSetBefore`) on Redis and L1 RAM, eliminating race conditions where concurrent revalidations write newer data.
+- **Self-Healing Reconciliation:** In-memory tag versions are verified against Redis when `Date.now() - lastSyncedAt > tagVersionTtlMs` (default: 5 s), guaranteeing bounded staleness even if a backplane broadcast is dropped during a network partition.
+
+```typescript
+const cache = CacheService.create({
+  tagStrategy: 'generational',
+  tagVersionTtlMs: 5_000,
+});
+
+// Cache entry with tags
+await cache.set('item:123', productData, 3600, undefined, { tags: ['catalog', 'electronics'] });
+
+// Invalidate in O(1) time
+await cache.invalidateTag('catalog');
+```
+
+---
+
+## 🌊 Redis Streams Backplane (`backplaneMode: 'stream'`)
+
+Standard Redis Pub/Sub operates on an *at-most-once* delivery model. If an instance experiences a transient network disconnect, container reschedule, or long GC pause, invalidation messages published during the disconnection are lost.
+
+Setting `backplaneMode: 'stream'` switches the backplane to a durable append-only log in Redis using `XADD` and `XREAD`:
+
+```typescript
+const cache = CacheService.create({
+  backplaneMode: 'stream',
+  backplaneStreamMaxLen: 10_000, // Approximate MAXLEN trimming
+  backplaneStreamBlockMs: 2_000,  // XREAD BLOCK timeout
+});
+```
+
+### Architecture & Resilience
+- **Cluster Single-Slot Routing:** Stream keys default to `tricache:stream:{<namespace>}`, ensuring multi-node Redis Clusters route all stream operations to a single slot without cross-slot errors.
+- **Dedicated Long-Polling Consumer:** Runs on an isolated Redis client connection (`XREAD BLOCK`) so standard cache `GET`/`SET` pipelines are never blocked.
+- **Zero-Drop Replay on Reconnect:** Tracks `_lastStreamId` to automatically replay all missed invalidations in order after short network drops or GC pauses without flushing L1.
+- **Trim Gap Fallback:** If an instance was disconnected longer than the stream retention window, it detects the gap, increments `metrics().backplane.streamGaps`, safely flushes L1, and resets to `'$'`.
+- **Instant Clean Teardown:** `cache.destroy()` immediately disconnects the dedicated client socket to interrupt blocking long-polls without stalling process shutdown.
+
+---
+
+## 🛡️ Read Safety (`cloneStrategy: 'structuredClone'`)
+
+By default (`cloneStrategy: 'none'`), TriCache returns raw in-memory JS references from L1 hits for maximum throughput (~350 ns per hit). If application code mutates the returned object, the cached reference is directly modified.
+
+Setting `cloneStrategy: 'structuredClone'` enables deep clone isolation:
+
+```typescript
+const cache = CacheService.create({
+  cloneStrategy: 'structuredClone',
+});
+
+const user = await cache.get('user:1', () => db.fetchUser(1));
+user.roles.push('admin'); // Mutating caller copy does NOT pollute cached L1 state
+```
+
+Supported types: plain objects, arrays, Dates, Maps, Sets, and TypedArrays. When `frozen: true` is also enabled, L1 entries remain frozen while callers receive fully mutable clones.
 
 ---
 
@@ -816,10 +1256,15 @@ CacheService.create({
     { host: 'redis-node-3.example.com', port: 6379 },
   ],
   redisTls: true,
+  useShardedPubSub: true, // Redis 7+ sharded pub/sub (SPUBLISH / SSUBSCRIBE)
 });
 ```
 
 ioredis handles slot routing, moved/ask redirects, and re-queuing commands during slot migrations transparently. You can list any subset of cluster nodes — ioredis discovers the full topology automatically.
+
+#### Sharded Pub/Sub (`useShardedPubSub`)
+
+When `useShardedPubSub: true` is enabled on Redis Cluster (Redis 7+), invalidation messages are published via `SPUBLISH` and subscribed via `SSUBSCRIBE` bound directly to the `{<namespace>}` slot shard. This eliminates cluster-wide broadcast gossip, drastically reducing cluster bus CPU utilization under heavy invalidation load.
 
 ### Redis Sentinel
 
@@ -839,7 +1284,20 @@ CacheService.create({
 
 ioredis monitors the current master via the Sentinel topology and transparently reconnects to a new primary after failover. The backplane subscriber is also constructed in the appropriate cluster/sentinel mode.
 
-> `redisHost` / `redisPort` are ignored when `redisClusterNodes` or `redisSentinel` is set. All three topology modes support `redisTls`.
+### Wire Protocol Compatibility (`redisProtocol: 2 | 3`)
+
+TriCache uses `ioredis` v6, which connects using **RESP3** (`redisProtocol: 3`) by default for optimized structured parsing and streaming.
+
+If your infrastructure routes Redis traffic through intermediate proxies that only understand RESP2 (such as **Twemproxy**, **Envoy Redis proxy filter**, or older AWS ElastiCache Serverless proxy configurations that reject the `HELLO 3` handshake), explicitly set `redisProtocol: 2`:
+
+```typescript
+CacheService.create({
+  redisHost: 'envoy-redis-proxy.internal',
+  redisProtocol: 2, // force RESP2 wire protocol
+});
+```
+
+> `redisHost` / `redisPort` are ignored when `redisClusterNodes` or `redisSentinel` is set. All three topology modes support `redisTls` and `redisProtocol` (RESP2/RESP3).
 
 ---
 

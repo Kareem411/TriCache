@@ -6,3 +6,5 @@ dist/
 .env.local
 /tmp/
 /.idea
+/.vscode
+.pnpm-store/

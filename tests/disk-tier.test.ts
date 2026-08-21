@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { DiskTier } from '../src/disk-tier';
-import { CachePriority } from '../src/types';
+import { CachePriority, consoleLogger } from '../src/types';
 import type { SmartCacheEntry } from '../src/types';
+import { CacheEncryption } from '../src/encryption';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import fs, { rmSync } from 'fs';
-import { consoleLogger } from '../src/types';
 import { pack, unpack } from 'msgpackr';
 
 function tempDir() {
@@ -86,11 +86,12 @@ describe('DiskTier', () => {
     expect(unpack(disk2.load('shared-key')!.data as Buffer)).toBe('shared-value');
   });
 
-  it('encrypts and decrypts when encryptionKey is supplied', async () => {
-    const keyBuf = Buffer.from('00'.repeat(32), 'hex'); // 32 zero bytes
-    const enc = new DiskTier({ dir: tempDir(), maxBytes: 10 * 1024 * 1024, entryMaxBytes: 1024 * 1024, forbiddenPrefixes: [], encryptionKey: keyBuf, logger: consoleLogger });
-    await enc.save('secret', makeEntry('sensitive-data'));
-    expect(unpack(enc.load('secret')!.data as Buffer)).toBe('sensitive-data');
+  it('encrypts and decrypts when encryption is supplied', async () => {
+    const keyBase64 = Buffer.from('00'.repeat(32), 'hex').toString('base64');
+    const enc = new CacheEncryption(keyBase64, consoleLogger, 'aes-256-gcm');
+    const diskTier = new DiskTier({ dir: tempDir(), maxBytes: 10 * 1024 * 1024, entryMaxBytes: 1024 * 1024, forbiddenPrefixes: [], encryption: enc, logger: consoleLogger });
+    await diskTier.save('secret', makeEntry('sensitive-data'));
+    expect(unpack(diskTier.load('secret')!.data as Buffer)).toBe('sensitive-data');
   });
 
   it('stats reflects stored files', async () => {
@@ -119,7 +120,7 @@ describe('DiskTier', () => {
 
     const origStatSync = fs.statSync;
     let thrown = false;
-    const statSpy = vi.spyOn(fs, 'statSync').mockImplementation((filePath, options) => {
+    const statSpy = vi.spyOn(fs, 'statSync').mockImplementation((filePath: any, options?: any) => {
       const stat = origStatSync(filePath, options as any);
       if (!stat.isDirectory() && !thrown) {
         thrown = true;
@@ -147,11 +148,11 @@ describe('DiskTier', () => {
     });
 
     it('removes expired entries across a full 256-bucket cycle', async () => {
-      await disk.save('expire-me', makeEntry('gone',  1));        // 1 ms TTL
+      await disk.save('expire-me', makeEntry('gone',  20));       // 20 ms TTL
       await disk.save('keep-me',   makeEntry('here',  60_000));  // 60s TTL
       expect(disk.stats.files).toBe(2);
 
-      await new Promise(r => setTimeout(r, 30)); // let TTL expire
+      await new Promise(r => setTimeout(r, 50)); // let TTL expire
 
       let purged = 0;
       for (let i = 0; i < 256; i++) purged += disk.purgeNextBucket();
@@ -185,6 +186,34 @@ describe('DiskTier', () => {
       // No files saved — every bucket directory is absent
       const result = disk.purgeNextBucket();
       expect(result).toBe(0);
+    });
+
+    it('cleans up orphaned .tmp files older than 5 minutes during purgeNextBucket', async () => {
+      await disk.save('some-key', makeEntry('live-data', 60_000));
+      // Artificially create a stale .tmp file in the bucket directory
+      const bucket0 = join(dir, '00');
+      fs.mkdirSync(bucket0, { recursive: true });
+      const staleTmp = join(bucket0, 'orphaned-file.1234.123456789.abc.tmp');
+      fs.writeFileSync(staleTmp, 'stale payload');
+      // Set mtime to 10 minutes ago
+      const tenMinsAgo = (Date.now() - 10 * 60 * 1000) / 1000;
+      fs.utimesSync(staleTmp, tenMinsAgo, tenMinsAgo);
+
+      expect(fs.existsSync(staleTmp)).toBe(true);
+      for (let i = 0; i < 256; i++) disk.purgeNextBucket();
+      expect(fs.existsSync(staleTmp)).toBe(false);
+    });
+
+    it('leaves active .tmp files younger than 5 minutes untouched', async () => {
+      const bucket0 = join(dir, '00');
+      fs.mkdirSync(bucket0, { recursive: true });
+      const freshTmp = join(bucket0, 'fresh-file.1234.123456789.abc.tmp');
+      fs.writeFileSync(freshTmp, 'in-flight payload');
+
+      expect(fs.existsSync(freshTmp)).toBe(true);
+      for (let i = 0; i < 256; i++) disk.purgeNextBucket();
+      expect(fs.existsSync(freshTmp)).toBe(true);
+      try { fs.unlinkSync(freshTmp); } catch {}
     });
   });
 });

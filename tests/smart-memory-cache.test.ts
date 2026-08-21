@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { SmartMemoryCache } from '../src/smart-memory-cache';
 import { CachePriority } from '../src/types';
 import { consoleLogger } from '../src/types';
@@ -288,7 +288,7 @@ describe('SmartMemoryCache.scan()', () => {
   let cache: SmartMemoryCache;
   const opts = {
     maxEntries: 100,
-    maxSizeBytes: 10 * 1024 * 1024,
+    maxBytes: 10 * 1024 * 1024,
     categories: { default: { maxEntries: 100, maxSizeBytes: 10 * 1024 * 1024 } },
     logger: consoleLogger,
   };

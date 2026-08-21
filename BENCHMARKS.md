@@ -6,6 +6,8 @@
 
 All numbers are from one live run on the same machine. Throughput varies ±5–10 % across runs due to JIT warmth and OS scheduling. Re-run with `pnpm bench` to reproduce on your hardware.
 
+> **v0.7.0 additions:** $O(1)$ Generational Tag Invalidation (**1.65 M/s / 605 ns**), Distributed Mutex Lock (`cache.lock()`, **341.3 K/s**), `cache.wrap()` primitive (**851.5 K/s**, +120 ns overhead), and ORM Query Key Hashing (**490.8 K/s**). See §20–§23 below.
+
 > **v0.4.1 additions:** backplane-aware `dependsOn` cascade (fleet correctness fix), `mget` per-key TTL function, and `cache.ready()` + `warmKeys` startup lifecycle hook.
 
 > **v0.4.0 additions:** TTL jitter (`ttlJitterFactor`), batch `mset()` / `mdel()`, native OpenTelemetry spans (`tracer`), L2 circuit breaker (`l2CircuitBreakerThreshold` / `l2CircuitBreakerCooldownMs`), and `warmFromL2(pattern)` startup warming.
@@ -590,6 +592,40 @@ The current design was chosen to match the threat model of encrypted-at-rest sto
 | Parallel ≈ serial (CPU) | Expected — JS is single-threaded | No action needed |
 | Parallel >> serial (I/O) | I/O overlap via `Promise.all` | This is the intended benefit |
 | Eviction > 10× slower than headroom | Cache over-full | Increase `l1MaxEntries` |
+
+---
+
+## v0.7.0 — Advanced Primitives, ORMs & Generational Invalidation
+
+### §20. Read Safety Strategy (`cloneStrategy: 'none'` vs `'structuredClone'`)
+
+| Strategy | Throughput | Latency | Memory Allocation | Notes |
+|---|---|---|---|---|
+| `cloneStrategy: "none"` | **621.1 K/s** | 1.61 µs | 0 B (Zero Copy) | Returns direct V8 in-memory reference |
+| `cloneStrategy: "structuredClone"` | **197.7 K/s** | 5.06 µs | Deep Cloned Heap Copy | Full caller mutation isolation |
+
+### §21. Distributed Mutex & Lock Primitive (`cache.lock`)
+
+| Concurrency Scenario | Throughput | Latency | Mechanism |
+|---|---|---|---|
+| Uncontended Execution | **341.3 K/s** | 2.93 µs | Atomic acquire → critical section → release |
+| 10 Concurrent Coroutines (1 Mutex) | **78.1 K/s** | 12.81 µs | Asynchronous Promise-chain mutex serialization |
+
+### §22. Generational Tag Invalidation (`tagStrategy: 'generational'`)
+
+| Operation | Throughput | Latency | Complexity | Notes |
+|---|---|---|---|---|
+| `invalidateTag()` | **780.1 K/s** | 1.28 µs | $O(1)$ | Single atomic version counter increment |
+| `invalidateTags()` (3 tags) | **1.65 M/s** | **605 ns** | $O(1)$ | Pipelined batch atomic increment |
+| `get()` with Tagged Version Check | **521.9 K/s** | 1.92 µs | $O(1)$ | L1 RAM hit + captured tag version comparison |
+
+### §23. Ergonomic Primitives & Ecosystem Wrappers
+
+| Wrapper / Primitive | Throughput | Latency | Normalization Overhead |
+|---|---|---|---|
+| `cache.get()` positional baseline | **955.9 K/s** | 1.05 µs | Baseline |
+| `cache.wrap()` options object | **851.5 K/s** | 1.17 µs | **+120 ns** (zero-cost options normalization) |
+| ORM SQL Query Key SHA-256 Hashing | **490.8 K/s** | 2.04 µs | Deterministic query + parameter binding hashing |
 
 ---
 

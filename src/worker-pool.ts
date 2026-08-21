@@ -28,6 +28,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import os from 'os';
 import type { EncryptionMode } from './encryption.js';
+import type { CompressionAlgorithm } from './compression.js';
 
 // Locate the serialize-worker entry point.
 // Production: tsup emits compile .js files as flat siblings → use .js path.
@@ -68,64 +69,52 @@ export interface WorkerPoolOptions {
   mode:           EncryptionMode;
   prevKeyBase64?: string;
   prevMode?:      EncryptionMode;
+  compression?:   CompressionAlgorithm;
+  compressionThresholdBytes?: number;
   /** Number of worker threads. Default: min(4, availableCPUs). */
   size?:          number;
 }
 
 type PendingEntry = { resolve: (v: string) => void; reject: (e: Error) => void };
 
+/**
+ * Safely extracts or allocates a transferable ArrayBuffer for worker_threads postMessage.
+ *
+ * Prevents detach corruption on Node's shared 8 KB internal Buffer pool (Buffer.poolSize):
+ * - If the buffer owns the entire underlying ArrayBuffer (byteOffset === 0 && byteLength === buffer.byteLength),
+ *   it can be transferred directly with zero copies.
+ * - For large pooled slices (>= 128 KB), copies to an isolated ArrayBuffer so transferring it
+ *   detaches only the copy and never the main-thread pooled slab.
+ * - For smaller pooled slices (< 128 KB), returns null to let structured cloning handle it without transfer.
+ */
+export function getTransferableArrayBuffer(buf: Buffer | Uint8Array): ArrayBuffer | null {
+  if (buf.buffer instanceof ArrayBuffer) {
+    if (buf.byteOffset === 0 && buf.byteLength === buf.buffer.byteLength) {
+      return buf.buffer;
+    }
+  }
+
+  if (buf.byteLength >= 131_072) {
+    const copy = new ArrayBuffer(buf.byteLength);
+    new Uint8Array(copy).set(new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength));
+    return copy;
+  }
+
+  return null;
+}
+
 export class WorkerPool {
-  private readonly workers:  Worker[] = [];
-  private readonly pending:  Map<number, PendingEntry>[] = [];
+  private workers:  Worker[] = [];
+  private pending:  Map<number, PendingEntry>[] = [];
   private _nextId            = 0;
   private _robin             = 0;
   private _available         = false;
 
   constructor(opts: WorkerPoolOptions) {
-    const size = Math.max(1, opts.size ?? Math.min(4, availableCpus()));
-    const workerData = {
-      keyBase64:     opts.keyBase64,
-      mode:          opts.mode,
-      prevKeyBase64: opts.prevKeyBase64 ?? '',
-      prevMode:      opts.prevMode,
-    };
-
     try {
-      for (let i = 0; i < size; i++) {
-        const worker  = new Worker(_workerFile, {
-          workerData,
-          execArgv: _workerExecArgv.length > 0 ? _workerExecArgv : undefined,
-        });
-        const pending = new Map<number, PendingEntry>();
-
-        worker.on('message', (msg: { id: number; result?: string; error?: string }) => {
-          const entry = pending.get(msg.id);
-          if (!entry) return;
-          pending.delete(msg.id);
-          // Unref the worker once its queue is empty so idle workers don't
-          // prevent the process from exiting (e.g. CLI scripts, benchmarks).
-          if (pending.size === 0) worker.unref();
-          if (msg.error !== undefined) {
-            entry.reject(new Error(msg.error));
-          } else {
-            entry.resolve(msg.result!);
-          }
-        });
-
-        worker.on('error', (err: Error) => {
-          // On unhandled worker error, reject all in-flight requests for this worker.
-          for (const [, entry] of pending) entry.reject(err);
-          pending.clear();
-          worker.unref();
-        });
-
-        // Workers start unreffed; they are re-reffed in _dispatch while a task
-        // is in flight, then unreffed again once the pending queue drains.
-        worker.unref();
-
-        this.workers.push(worker);
-        this.pending.push(pending);
-      }
+      const { workers, pending } = this._spawnWorkers(opts);
+      this.workers = workers;
+      this.pending = pending;
       this._available = true;
     } catch {
       // Worker creation failed (e.g., missing file, restricted runtime).
@@ -134,31 +123,156 @@ export class WorkerPool {
     }
   }
 
+  private _spawnWorkers(opts: WorkerPoolOptions): { workers: Worker[]; pending: Map<number, PendingEntry>[] } {
+    const size = Math.max(1, opts.size ?? Math.min(4, availableCpus()));
+    const workerData = {
+      keyBase64:     opts.keyBase64,
+      mode:          opts.mode,
+      prevKeyBase64: opts.prevKeyBase64 ?? '',
+      prevMode:      opts.prevMode,
+      compression:   opts.compression ?? 'none',
+      compressionThresholdBytes: opts.compressionThresholdBytes ?? 1024,
+    };
+
+    const workers: Worker[] = [];
+    const pendingList: Map<number, PendingEntry>[] = [];
+
+    const createWorker = (index: number): Worker => {
+      const worker = new Worker(_workerFile, {
+        workerData,
+        execArgv: _workerExecArgv.length > 0 ? _workerExecArgv : undefined,
+      });
+      const pending = pendingList[index] ?? new Map<number, PendingEntry>();
+      if (!pendingList[index]) pendingList[index] = pending;
+
+      worker.on('message', (msg: { id: number; result?: string | Uint8Array; error?: string; isTransfer?: boolean }) => {
+        const entry = pending.get(msg.id);
+        if (!entry) return;
+        pending.delete(msg.id);
+        if (pending.size === 0) worker.unref();
+        if (msg.error !== undefined) {
+          entry.reject(new Error(msg.error));
+        } else if (msg.result !== undefined) {
+          if (typeof msg.result === 'string') {
+            entry.resolve(msg.result);
+          } else {
+            entry.resolve(Buffer.from(msg.result.buffer, msg.result.byteOffset, msg.result.byteLength).toString('utf8'));
+          }
+        }
+      });
+
+      worker.on('error', (err: Error) => {
+        for (const [, entry] of pending) entry.reject(err);
+        pending.clear();
+        worker.unref();
+      });
+
+      worker.on('exit', (exitCode: number) => {
+        for (const [, entry] of pending) {
+          entry.reject(new Error(`Worker thread exited unexpectedly with code ${exitCode}`));
+        }
+        pending.clear();
+        worker.unref();
+
+        // If pool is still active and worker exited with non-zero code, auto-replace
+        if (this._available && exitCode !== 0 && workers[index] === worker) {
+          try {
+            workers[index] = createWorker(index);
+          } catch { /* ok */ }
+        }
+      });
+
+      worker.unref();
+      return worker;
+    };
+
+    for (let i = 0; i < size; i++) {
+      const worker = createWorker(i);
+      workers.push(worker);
+    }
+
+    return { workers, pending: pendingList };
+  }
+
+  /**
+   * Gracefully drain in-flight tasks and re-initialize workers with updated key material.
+   * Atomically swaps workers so new requests immediately route to new workers,
+   * while existing in-flight operations complete on old workers before termination.
+   */
+  async drainAndReinit(opts: WorkerPoolOptions): Promise<void> {
+    const { workers: newWorkers, pending: newPending } = this._spawnWorkers(opts);
+
+    // Atomically swap references
+    const oldWorkers = this.workers;
+    const oldPending = this.pending;
+    this.workers = newWorkers;
+    this.pending = newPending;
+    this._robin = 0;
+    this._available = true;
+
+    // Await drain of in-flight tasks on old workers
+    const start = Date.now();
+    while (oldPending.some(m => m.size > 0)) {
+      if (Date.now() - start > 5_000) break; // 5s timeout guard
+      await new Promise(r => setTimeout(r, 10));
+    }
+
+    // Cleanly terminate old workers
+    for (let i = 0; i < oldWorkers.length; i++) {
+      for (const [, entry] of oldPending[i] ?? []) {
+        entry.reject(new Error('WorkerPool replaced during key rotation'));
+      }
+      oldPending[i]?.clear();
+      oldWorkers[i]?.terminate().catch(() => {});
+    }
+  }
+
   get isAvailable(): boolean { return this._available; }
 
-  /** Encrypt a JSON string in a worker thread. Returns the same encrypted envelope string as CacheEncryption.encrypt(). */
-  encrypt(payload: string): Promise<string> {
+  /** Encrypt a string or buffer in a worker thread. Returns the encrypted envelope string. */
+  encrypt(payload: string | Buffer | Uint8Array): Promise<string> {
     return this._dispatch('encrypt', payload);
   }
 
-  /** Decrypt an encrypted envelope string in a worker thread. Returns the original JSON string. */
-  decrypt(payload: string): Promise<string> {
+  /** Decrypt an encrypted envelope string or buffer in a worker thread. Returns the original JSON string. */
+  decrypt(payload: string | Buffer | Uint8Array): Promise<string> {
     return this._dispatch('decrypt', payload);
   }
 
-  private _dispatch(type: 'encrypt' | 'decrypt', payload: string): Promise<string> {
+  private _dispatch(type: 'encrypt' | 'decrypt', payload: string | Buffer | Uint8Array): Promise<string> {
+    if (!this._available || this.workers.length === 0) {
+      return Promise.reject(new Error('WorkerPool is not available'));
+    }
     const id      = this._nextId++;
     const idx     = this._robin;
     const worker  = this.workers[idx];
     const pending = this.pending[idx];
     this._robin   = (this._robin + 1) % this.workers.length;
 
+    let transferable: ArrayBuffer | null = null;
+    let dataToSend: string | Uint8Array = typeof payload === 'string' ? payload : payload;
+
+    if (typeof payload !== 'string') {
+      transferable = getTransferableArrayBuffer(payload);
+      if (transferable) {
+        dataToSend = new Uint8Array(transferable);
+      }
+    } else if (payload.length >= 131_072) {
+      const buf = Buffer.from(payload, 'utf8');
+      transferable = getTransferableArrayBuffer(buf);
+      if (transferable) {
+        dataToSend = new Uint8Array(transferable);
+      }
+    }
+
+    const transferList = transferable ? [transferable] : [];
+
     return new Promise<string>((resolve, reject) => {
       pending.set(id, { resolve, reject });
       // Re-ref the worker while this request is in flight so the event loop
       // stays alive even in short-lived scripts (benchmarks, CLI tools).
       worker.ref();
-      worker.postMessage({ id, type, payload });
+      worker.postMessage({ id, type, payload: dataToSend }, transferList);
     });
   }
 

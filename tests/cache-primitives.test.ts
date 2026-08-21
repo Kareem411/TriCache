@@ -32,7 +32,7 @@ import { tmpdir } from 'os';
 import { CacheService }      from '../src/cache-service';
 import { SmartMemoryCache }  from '../src/smart-memory-cache';
 import { CacheEncryption }   from '../src/encryption';
-import { CachePriority, consoleLogger } from '../src/types';
+import { consoleLogger } from '../src/types';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -318,7 +318,7 @@ describe('cache.getIfFresh()', () => {
     // (staleAt check depends on the key being in stale state)
     void staleAt; // suppress unused warning
     // After natural TTL expiry it's definitely null
-    const result = svc.getIfFresh('swr-key');
+    void svc.getIfFresh('swr-key');
     // It might be fresh or null depending on timing — just confirm no fetch triggered
     const fetchCallsBefore = fetch.mock.calls.length;
     svc.getIfFresh('swr-key');
