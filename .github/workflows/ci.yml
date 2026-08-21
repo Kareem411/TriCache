@@ -11,6 +11,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  NODE_OPTIONS: '--max-old-space-size=8192'
+
 jobs:
   validate:
     name: Lint & Typecheck (Node 22)
