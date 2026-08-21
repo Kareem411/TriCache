@@ -65,9 +65,22 @@ const MUTATION_OPERATIONS = new Set([
   'deleteMany',
 ]);
 
+/** Recursively sorts object keys for deterministic serialization of nested query filters */
+function deterministicStringify(val: unknown): string {
+  if (val === null || typeof val !== 'object') {
+    return JSON.stringify(val);
+  }
+  if (Array.isArray(val)) {
+    return `[${val.map(deterministicStringify).join(',')}]`;
+  }
+  const obj = val as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys.map(k => `${JSON.stringify(k)}:${deterministicStringify(obj[k])}`).join(',')}}`;
+}
+
 /** Generate a deterministic SHA-256 hash key for a Prisma query. */
 export function generatePrismaCacheKey(model: string, operation: string, args: unknown): string {
-  const normalized = JSON.stringify({ model, operation, args }, Object.keys((args as object) ?? {}).sort());
+  const normalized = deterministicStringify({ model, operation, args });
   const hash = crypto.createHash('sha256').update(normalized, 'utf8').digest('hex').slice(0, 32);
   return `prisma:${model.toLowerCase()}:${operation}:${hash}`;
 }
@@ -93,7 +106,7 @@ export function withTriCache(options: PrismaTriCacheOptions) {
           // Auto-invalidation on write operations
           if (autoInvalidate && MUTATION_OPERATIONS.has(operation)) {
             const result = await query(args);
-            void cache.invalidateTag(modelTag);
+            await cache.invalidateTag(modelTag);
             return result;
           }
 

@@ -98,11 +98,11 @@ export class TriCacheHandler {
           process.env.NEXT_PHASE === 'phase-export'));
 
     this.cache = CacheService.create({
+      ...options,
       namespace: options.namespace ?? 'next',
       tagStrategy: options.tagStrategy ?? 'generational',
       cloneStrategy: options.cloneStrategy ?? 'none',
       disableRedis: isBuildPhase ? true : options.disableRedis,
-      ...options,
     });
   }
 

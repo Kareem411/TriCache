@@ -28,7 +28,15 @@ export function compressBuffer(buf: Buffer, algorithm: CompressionAlgorithm): Bu
 
 export function decompressBuffer(buf: Buffer, algorithm: CompressionAlgorithm = 'brotli'): Buffer {
   if (algorithm === 'gzip') {
-    return zlib.gunzipSync(buf);
+    try {
+      return zlib.gunzipSync(buf);
+    } catch {
+      try {
+        return zlib.brotliDecompressSync(buf);
+      } catch {
+        return buf;
+      }
+    }
   }
   try {
     return zlib.brotliDecompressSync(buf);

@@ -16,8 +16,8 @@ export class TriCacheStore implements NestCacheStore {
    * Returns undefined on miss (matching cache-manager v5/v6 contract).
    */
   async get<T>(key: string): Promise<T | undefined> {
-    const val = await this.cache.get<T | null>(key, async () => null, 0);
-    return val !== null ? (val as T) : undefined;
+    const val = await this.cache.peek<T>(key);
+    return val !== null ? val : undefined;
   }
 
   /**

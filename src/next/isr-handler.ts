@@ -22,11 +22,11 @@ export class TriCacheISRHandler {
           process.env.NEXT_PHASE === 'phase-export'));
 
     this.cache = CacheService.create({
+      ...options,
       namespace: options.namespace ?? 'next-isr',
       tagStrategy: options.tagStrategy ?? 'generational',
       cloneStrategy: options.cloneStrategy ?? 'none',
       disableRedis: isBuildPhase ? true : options.disableRedis,
-      ...options,
     });
   }
 

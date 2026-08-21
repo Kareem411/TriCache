@@ -2275,6 +2275,77 @@ export class CacheService {
   }
 
   /**
+   * Pure read across cache tiers (L1 RAM → L1.5 Disk → L2 Redis) without invoking a fetcher.
+   * Returns the cached value if found and valid, or `null` if absent / expired.
+   * Does not write dummy entries on misses or trigger side-effects.
+   *
+   * @example
+   * const val = await cache.peek<User>('user:123');
+   */
+  async peek<T = unknown>(cacheKey: string): Promise<T | null> {
+    const k = this.nk(cacheKey);
+
+    // 1. L1 RAM
+    const l1Hit = this.l1.get(k);
+    if (l1Hit !== null) {
+      this.counters.gets++;
+      this.counters.l1Hits++;
+      const val = l1Hit.value as T;
+      if (this.opts.frozen) deepFreeze(val);
+      return (this.opts.cloneStrategy === 'structuredClone' && val != null && typeof val === 'object')
+        ? structuredClone(val)
+        : val;
+    }
+
+    // 2. L1.5 Disk
+    if (!this._diskDisabled) {
+      const diskHit = this.disk.load(k);
+      if (diskHit !== null) {
+        const promoted = this.l1.importEntries(
+          [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
+          this.opts.forbiddenSnapshotPrefixes,
+        );
+        if (promoted > 0) {
+          const l1Check = this.l1.get(k);
+          if (l1Check !== null) {
+            this.counters.gets++;
+            this.counters.diskHits++;
+            const val = l1Check.value as T;
+            if (this.opts.frozen) deepFreeze(val);
+            return (this.opts.cloneStrategy === 'structuredClone' && val != null && typeof val === 'object')
+              ? structuredClone(val)
+              : val;
+          }
+        }
+      }
+    }
+
+    // 3. L2 Redis
+    if (!this._redisDisabled && !this.cb.isOpen) {
+      try {
+        const client = await this.getRedis();
+        const raw = await client.get(k);
+        if (raw !== null) {
+          const parsed = await this._decryptAndDeserialize<T>(raw);
+          this.l1.set(k, parsed, 60_000, inferPriority(cacheKey));
+          this.counters.gets++;
+          this.counters.l2Hits++;
+          this.cb.onSuccess();
+          if (this.opts.frozen) deepFreeze(parsed);
+          return (this.opts.cloneStrategy === 'structuredClone' && parsed != null && typeof parsed === 'object')
+            ? structuredClone(parsed)
+            : parsed;
+        }
+      } catch (err) {
+        this.cb.onFailure();
+        this.logger.debug('peek: Redis read failed', { cacheKey, error: (err as Error).message });
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Batch get — fetches multiple keys, using L1 where hot and calling `fetchFn` for misses.
    * Preserves input ordering. Uses inflight coalescing per key.
    *
