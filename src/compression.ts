@@ -27,26 +27,19 @@ export function compressBuffer(buf: Buffer, algorithm: CompressionAlgorithm): Bu
 }
 
 export function decompressBuffer(buf: Buffer, algorithm: CompressionAlgorithm = 'brotli'): Buffer {
-  if (algorithm === 'gzip') {
-    try {
-      return zlib.gunzipSync(buf);
-    } catch {
-      try {
-        return zlib.brotliDecompressSync(buf);
-      } catch {
-        return buf;
-      }
-    }
+  // Try the configured algorithm first, then the other one as recovery (covers
+  // entries written under a different compression setting). If BOTH fail, the
+  // payload is corrupt: THROW instead of returning the raw bytes. Returning raw
+  // surfaced corruption as garbage JSON.parse errors deep downstream; every
+  // call site maps a thrown error to a clean cache miss instead.
+  const tryBrotli = (): Buffer | null => { try { return zlib.brotliDecompressSync(buf); } catch { return null; } };
+  const tryGzip   = (): Buffer | null => { try { return zlib.gunzipSync(buf); }          catch { return null; } };
+
+  const result = algorithm === 'gzip' ? (tryGzip() ?? tryBrotli()) : (tryBrotli() ?? tryGzip());
+  if (result === null) {
+    throw new Error(`tricache: corrupt compressed payload (${buf.length} bytes, algorithm=${algorithm})`);
   }
-  try {
-    return zlib.brotliDecompressSync(buf);
-  } catch {
-    try {
-      return zlib.gunzipSync(buf);
-    } catch {
-      return buf;
-    }
-  }
+  return result;
 }
 
 export function compressWithHeader(buf: Buffer, algorithm: CompressionAlgorithm): Buffer {

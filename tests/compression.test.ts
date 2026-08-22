@@ -44,6 +44,18 @@ describe('Payload Compression (Redis L2 & Disk Tier)', () => {
       const decompressed = decompressBuffer(compressed, 'gzip');
       expect(decompressed.toString('utf8')).toBe(payload.toString('utf8'));
     });
+
+    it('throws on corrupt payloads instead of returning raw bytes', () => {
+      // Old contract silently returned the input buffer when BOTH algorithms
+      // failed — corruption surfaced as garbage downstream instead of a miss.
+      const garbage = Buffer.alloc(64, 0xa5);
+      expect(() => decompressBuffer(garbage, 'brotli')).toThrow(/corrupt compressed payload/);
+      expect(() => decompressBuffer(garbage, 'gzip')).toThrow(/corrupt compressed payload/);
+      // Cross-algorithm recovery still works: brotli data decompressed under
+      // the 'gzip' setting must come back intact.
+      const brotliData = compressBuffer(Buffer.from('cross-algo recovery'), 'brotli');
+      expect(decompressBuffer(brotliData, 'gzip').toString('utf8')).toBe('cross-algo recovery');
+    });
   });
 
   describe('Envelope matrix & storage formats', () => {

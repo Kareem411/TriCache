@@ -599,7 +599,7 @@ export class DiskTier {
         }
         const raw = fs.readFileSync(filePath);
         let dec: Buffer;
-        try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); this.fileCount = Math.max(0, this.fileCount - 1); purged++; continue; }
+        try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size); this.fileCount = Math.max(0, this.fileCount - 1); purged++; continue; }
         const payload = unpack(dec) as DiskPayload;
         if (!payload || payload.version !== DISK_TIER_VERSION || payload.entry.expiresAt <= now) {
           fs.unlinkSync(filePath);
@@ -758,7 +758,7 @@ export class DiskTier {
         }
         const raw = fs.readFileSync(filePath);
         let dec: Buffer;
-        try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); this.fileCount = Math.max(0, this.fileCount - 1); purged++; continue; }
+        try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size); this.fileCount = Math.max(0, this.fileCount - 1); purged++; continue; }
         const payload = unpack(dec) as DiskPayload;
         if (!payload || payload.version !== DISK_TIER_VERSION || payload.entry.expiresAt <= now) {
           fs.unlinkSync(filePath);
