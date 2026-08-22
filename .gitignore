@@ -8,3 +8,4 @@ dist/
 /.idea
 /.vscode
 .pnpm-store/
+test-output.log
