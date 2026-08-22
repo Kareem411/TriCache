@@ -74,6 +74,8 @@ export class CacheEncryption {
   private _key:     Buffer    | null = null;  // raw bytes — used only for XOR
   private _keyObj:  KeyObject | null = null;  // parsed KeyObject — used for all AES modes
   private _mode: EncryptionMode;
+  /** Fail-closed on invalid key material when opted in via constructor opts. */
+  private readonly _strictKeyValidation: boolean;
   private _prevKey:    Buffer    | null = null;
   private _prevKeyObj: KeyObject | null = null;
   private _prevMode: EncryptionMode = 'aes-256-gcm';
@@ -160,6 +162,7 @@ export class CacheEncryption {
     mode: EncryptionMode = 'aes-256-gcm',
     previousKeyBase64?: string,
     previousMode?: EncryptionMode,
+    opts?: { strictKeyValidation?: boolean },
   ) {
     const logger: ILogger = (typeof loggerOrMode === 'object' && loggerOrMode !== null)
       ? loggerOrMode
@@ -167,9 +170,11 @@ export class CacheEncryption {
     const resolvedMode: EncryptionMode = typeof loggerOrMode === 'string'
       ? loggerOrMode
       : mode;
+    this._strictKeyValidation = opts?.strictKeyValidation ?? false;
 
     this._mode = resolvedMode;
-    if (!keyBase64) {
+    if (keyBase64 === undefined || keyBase64 === null) {
+      // Key not configured at all — warn (prod) and run without encryption.
       if (process.env.NODE_ENV === 'production') {
         logger.warn(
           'SECURITY: encryption key not set — cache data stored unencrypted at rest',
@@ -178,11 +183,19 @@ export class CacheEncryption {
       }
       return;
     }
+    if (keyBase64 === '') {
+      // Key EXPLICITLY configured but empty — always a configuration mistake.
+      // Strict mode fails closed; default logs loudly and continues unencrypted.
+      const err = new Error('Encryption key is empty — set encryptionKey option or CACHE_ENCRYPTION_KEY');
+      if (this._strictKeyValidation) throw err;
+      logger.error('Empty encryption key — falling back to plaintext', {}, err);
+      return;
+    }
     try {
       const buf = Buffer.from(keyBase64, 'base64');
       const requiredLen = resolvedMode === 'aes-256-gcm' ? 32 : (resolvedMode === 'aes-128-gcm' || resolvedMode === 'aes-128-ctr') ? 16 : 0;
       if (requiredLen > 0 && buf.length !== requiredLen) {
-        throw new Error(`${mode} requires exactly ${requiredLen} bytes (got ${buf.length})`);
+        throw new Error(`${resolvedMode} requires exactly ${requiredLen} bytes (got ${buf.length})`);
       }
       if (buf.length < 1) {
         throw new Error('XOR key must be at least 1 byte');
@@ -209,6 +222,13 @@ export class CacheEncryption {
         logger.debug(`Cache encryption enabled (${mode.toUpperCase()})`);
       }
     } catch (err) {
+      // Fail-open by default (backward compat): log loudly and continue WITHOUT
+      // encryption rather than crashing every process that typo'd a key.
+      // strictKeyValidation opts into fail-closed for deployments where serving
+      // plaintext at rest is worse than failing startup (PCI/HIPAA-style bars).
+      if (this._strictKeyValidation) {
+        throw err;
+      }
       logger.error('Invalid encryption key — falling back to plaintext', {}, err as Error);
     }
 

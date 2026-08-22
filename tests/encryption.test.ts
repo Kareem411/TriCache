@@ -223,4 +223,33 @@ describe('CacheEncryption unit tests', () => {
       expect(init.prevMode).toBe('aes-128-gcm');
     });
   });
+
+  describe('Invalid-key handling — strict mode', () => {
+    it('throws at construction on a wrong-length AES key when strictKeyValidation is set', () => {
+      // 16-byte key supplied for an aes-256-gcm mode — must fail CLOSED.
+      expect(
+        () => new CacheEncryption(key128, silentLogger, 'aes-256-gcm', undefined, undefined, { strictKeyValidation: true }),
+      ).toThrow(/requires exactly 32 bytes/);
+    });
+
+    it('throws at construction on an undersized XOR key when strictKeyValidation is set', () => {
+      // Empty base64 payload — XOR requires ≥ 1 byte.
+      expect(
+        () => new CacheEncryption('', silentLogger, 'xor', undefined, undefined, { strictKeyValidation: true }),
+      ).toThrow();
+    });
+
+    it('default remains fail-open with a logged error (backward compat)', () => {
+      const errorCalls: unknown[][] = [];
+      const logger: ILogger = {
+        debug: () => {},
+        info: () => {},
+        warn: () => {},
+        error: (...args: unknown[]) => { errorCalls.push(args); },
+      };
+      const enc = new CacheEncryption(makeKey(5, 'q'), logger, 'aes-256-gcm');
+      expect(enc.isEnabled).toBe(false);
+      expect(errorCalls.length).toBeGreaterThan(0);
+    });
+  });
 });

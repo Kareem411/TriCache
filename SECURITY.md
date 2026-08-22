@@ -28,4 +28,12 @@ node -e "console.log(require('crypto').randomBytes(16).toString('base64'))"
 
 Store the key in `CACHE_ENCRYPTION_KEY` environment variable — never hardcode it in source.
 
+**Invalid key handling (fail-open vs fail-closed):** By default, a *malformed* key (wrong length for the selected mode, or empty) logs an error and continues **without** at-rest encryption — plaintext at rest, clearly flagged in the log. Deployments where that downgrade is unacceptable (PCI/HIPAA-style bars) can set:
+
+```ts
+new CacheService({ encryptionKey, strictKeyValidation: true })
+```
+
+With `strictKeyValidation: true`, an invalid or empty key throws at construction instead of silently disabling encryption. A key that is simply *not configured* never throws in either mode — tricache runs unencrypted by design when no key is supplied.
+
 **Key rotation:** Plaintext values are read transparently during rotation. Deploy the new key, then run a cache warm-up pass to re-encrypt. There is no dual-key overlap window needed.

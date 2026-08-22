@@ -370,6 +370,15 @@ export interface CacheOptions {
   previousEncryptionKey?: string;
   /** Encryption mode that was used with `previousEncryptionKey`. Defaults to `encryptionMode`. */
   previousEncryptionMode?: 'aes-256-gcm' | 'aes-128-gcm' | 'aes-128-ctr' | 'xor';
+  /**
+   * Fail closed when `encryptionKey` is present but INVALID (wrong length for the
+   * selected `encryptionMode`, or empty). Default: `false` — tricache logs an error
+   * and continues with at-rest encryption DISABLED (fail-open, backward compatible).
+   * Set to `true` for deployments where serving plaintext at rest is unacceptable:
+   * the constructor then throws instead of silently downgrading security.
+   * Has no effect when no key is configured at all (encryption stays off, by design).
+   */
+  strictKeyValidation?: boolean;
 
   // ── Compression ──────────────────────────────────────────────────────────
   /**
