@@ -212,24 +212,48 @@ export class TriCacheHandler {
   }
 
   /**
-   * Refreshes tag timestamps from shared cache. Fail-soft error boundary ensures
-   * network errors never crash incoming HTTP requests.
+   * Returns the expiration timestamp (ms since epoch) of the most relevant
+   * cached entry for the given tags, or 0 when nothing is tracked. Next.js
+   * uses this to decide whether a revalidation is due — a hardcoded 0 means
+   * "always expired", so this reads the real stored entries instead.
+   */
+  async getExpiration(tags: string[]): Promise<number> {
+    try {
+      let maxExpiration = 0;
+      const tagSet = new Set(tags);
+      const l1 = (this.cache as unknown as { l1: { scan(fn: (key: string, entry: { expiresAt?: number; tagVersions?: Record<string, number> }) => void, prefixLen: number): void } }).l1;
+      l1.scan((key, entry) => {
+        if (!entry.tagVersions) return;
+        for (const tag of Object.keys(entry.tagVersions)) {
+          if (!tagSet.has(tag)) continue;
+          const exp = entry.expiresAt ?? 0;
+          if (exp > maxExpiration) maxExpiration = exp;
+          return;
+        }
+      }, 0);
+      return maxExpiration;
+    } catch (err) {
+      this.logger.debug('Next.js cacheHandler getExpiration fail-soft', { error: (err as Error).message });
+      return 0;
+    }
+  }
+
+  /**
+   * Reconcile local generational tag knowledge against shared state: drops the
+   * in-memory tag-version cache so every subsequent read re-syncs versions
+   * from Redis. The previous implementation was an empty try/catch.
    */
   async refreshTags(): Promise<void> {
     try {
-      // Re-sync local tag state when invoked by Next.js revalidation worker
+      const cache = this.cache as unknown as {
+        tagVersions?: Map<string, unknown>;
+      };
+      cache.tagVersions?.clear();
     } catch (err) {
       this.logger.debug('Next.js cacheHandler refreshTags fail-soft catch', {
         error: (err as Error).message,
       });
     }
-  }
-
-  /**
-   * Returns the maximum expiration timestamp across the given tags (or 0 if not tracking).
-   */
-  async getExpiration(_tags: string[]): Promise<number> {
-    return 0;
   }
 
   /**
