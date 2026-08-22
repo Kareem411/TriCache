@@ -1082,28 +1082,7 @@ export class CacheService {
                 for (const [id, fields] of entries) {
                   this._lastStreamId = id;
                   this.counters.streamEntriesReceived++;
-
-                  let op = '';
-                  let key = '';
-                  let src = '';
-                  let tagVersion: number | undefined;
-
-                  for (let i = 0; i < fields.length; i += 2) {
-                    const f = fields[i];
-                    const v = fields[i + 1];
-                    if (f === 'op') op = v;
-                    else if (f === 'key') key = v;
-                    else if (f === 'src') src = v;
-                    else if (f === 'tagVersion') tagVersion = parseInt(v, 10);
-                  }
-
-                  if (src === this.instanceId) {
-                    this.counters.invSkipped++;
-                    continue;
-                  }
-
-                  this.counters.invReceived++;
-                  this._applyInvalidationEvent(op, key, tagVersion);
+                  this._processStreamEntry(fields);
                 }
               }
             }
@@ -1125,6 +1104,58 @@ export class CacheService {
     };
 
     void runLoop();
+  }
+
+  /**
+   * Validate + apply one XREAD stream entry. `fields` is the flat ioredis
+   * shape [name, value, name, value, …]. Mirrors the schema rules of the
+   * pubsub path (`_handleBackplaneMessage`): op must be a known operation,
+   * key/src must be non-empty strings, tagVersion must parse to a finite
+   * number. Invalid entries are logged and dropped — never applied.
+   */
+  /** @internal Exposed for testing. */
+  _processStreamEntry(fields: string[]): void {
+    let op = '';
+    let key = '';
+    let src = '';
+    let tagVersionRaw: string | undefined;
+
+    for (let i = 0; i + 1 < fields.length; i += 2) {
+      const f = fields[i];
+      const v = fields[i + 1];
+      if (f === 'op') op = v;
+      else if (f === 'key') key = v;
+      else if (f === 'src') src = v;
+      else if (f === 'tagVersion') tagVersionRaw = v;
+    }
+
+    const validOp = op === 'del' || op === 'del-glob' || op === 'tag_incr';
+    if (!validOp || typeof key !== 'string' || !key || typeof src !== 'string') {
+      this.logger.warn('Backplane: rejected invalid stream entry', {
+        op: String(op).slice(0, 40),
+        key: typeof key === 'string' ? key.slice(0, 100).replace(/[\r\n\t]/g, ' ') : String(key),
+      });
+      return;
+    }
+
+    // parseInt('12abc34') → NaN — reject instead of poisoning the version map.
+    let tagVersion: number | undefined;
+    if (tagVersionRaw !== undefined) {
+      const parsed = parseInt(tagVersionRaw, 10);
+      if (!Number.isFinite(parsed)) {
+        this.logger.warn('Backplane: rejected stream entry with non-numeric tagVersion', { key });
+        return;
+      }
+      tagVersion = parsed;
+    }
+
+    if (src === this.instanceId) {
+      this.counters.invSkipped++;
+      return;
+    }
+
+    this.counters.invReceived++;
+    this._applyInvalidationEvent(op, key, tagVersion);
   }
 
   private _applyInvalidationEvent(op: string, key: string, tagVersion?: number): void {
