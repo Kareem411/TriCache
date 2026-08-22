@@ -61,9 +61,19 @@ describe('Disk Spill Saturation & Full Recovery Test', () => {
     expect(stats.disk.files).toBeGreaterThan(0);
     expect(stats.disk.sizeKB).toBeLessThanOrEqual((diskMaxBytes / 1024) * 1.5);
 
-    // Verify no orphaned temporary lock files (.tmp) remain in the directory
-    const files = readdirSync(diskDir, { recursive: true }) as string[];
-    const tmpFiles = files.filter(f => typeof f === 'string' && f.endsWith('.tmp'));
+    // Verify no orphaned temporary lock files (.tmp) remain in the directory.
+    // Transient .tmp staging files exist BY DESIGN while spill writes are in
+    // flight (write-to-tmp → atomic rename); under a loaded parallel suite the
+    // final eviction batch can still be mid-rename when the first data file
+    // becomes visible, so drain the pipeline before asserting. A genuinely
+    // stuck/orphaned tmp would never clear and fails after the 5 s budget.
+    let tmpFiles: string[] = [];
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const files = readdirSync(diskDir, { recursive: true }) as string[];
+      tmpFiles = files.filter(f => typeof f === 'string' && f.endsWith('.tmp'));
+      if (tmpFiles.length === 0) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
     expect(tmpFiles.length).toBe(0);
 
     // Most recent entries should remain intact and accessible

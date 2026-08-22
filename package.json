@@ -1,6 +1,6 @@
 {
   "name": "tricache",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Three-tier Node.js cache: L1 smart RAM (adaptive LFU/LRU + Count-Min Sketch) → L1.5 NVMe disk spill → L2 Redis/Valkey. Includes AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, and thundering-herd prevention.",
   "keywords": [
     "cache",
@@ -80,6 +80,7 @@
     "typecheck:all": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "lint": "oxlint src tests",
     "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:watch": "vitest",
     "bench": "node --expose-gc --max-old-space-size=8192 --import tsx/esm bench/benchmark.ts"
   },
@@ -104,6 +105,7 @@
     "@nestjs/core": "^11.0.0",
     "@types/node": "^26.2.0",
     "oxlint": "^1.79.0",
+    "redis": "^6.2.1",
     "tsup": "^8.5.1",
     "tsx": "^4.23.12",
     "typescript": "^6.0.3",

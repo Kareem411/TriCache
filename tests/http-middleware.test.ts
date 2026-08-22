@@ -179,4 +179,166 @@ describe('HTTP Caching Middleware & ETag 304 (tricache/http)', () => {
       expect(reply2.send).toHaveBeenCalled();
     });
   });
+
+  describe('error responses must never be cached (status gate)', () => {
+    it('expressCache: a 500 response bypasses the cache and is refetched', async () => {
+      cache = new CacheService({
+        namespace: `http-err-${Date.now()}`,
+        disableRedis: true,
+      });
+      const middleware = expressCache({ cache, ttl: 60 });
+
+      let handlerCalls = 0;
+      const runRequest = async () => {
+        const req = { method: 'GET', url: '/api/flaky', headers: {} };
+        let body: unknown = null;
+        const res: any = {
+          // Real Express tracks the response code on the res object itself.
+          statusCode: 200,
+          setHeader: () => {},
+          getHeader: () => undefined,
+          status: function (code: number) { this.statusCode = code; return this; },
+          json: (data: unknown) => { body = data; },
+          send: (data: unknown) => { body = data; },
+          end: () => {},
+          headersSent: false,
+        };
+        await middleware(req, res, () => {
+          handlerCalls++;
+          if (handlerCalls === 1) {
+            res.status(500);
+            res.json({ error: 'upstream down' });
+          } else {
+            res.json({ message: 'recovered' });
+          }
+        });
+        return { statusCode: res.statusCode as number, body };
+      };
+
+      const r1 = await runRequest();
+      expect(r1.statusCode).toBe(500);
+
+      const r2 = await runRequest();
+      // THE invariant: the 500 must NOT have been cached — the handler re-runs
+      // and its recovered 200 payload is served. (Bug: r2 replayed the error.)
+      expect(handlerCalls).toBe(2);
+      expect(r2.body).toEqual({ message: 'recovered' });
+    });
+
+    it('honoCache: a 500 response bypasses the cache and is refetched', async () => {
+      cache = new CacheService({
+        namespace: `hono-err-${Date.now()}`,
+        disableRedis: true,
+      });
+      const middleware = honoCache({ cache, ttl: 60 });
+
+      let controllerCalls = 0;
+      const makeCtx = () => ({
+        req: {
+          method: 'GET',
+          url: 'https://example.com/api/flaky',
+          header: (_name: string) => undefined,
+        },
+        res: {
+          status: 200 as number,
+          clone: () => ({
+            text: async () => JSON.stringify(
+              controllerCalls === 1 ? { error: 'upstream down' } : { item: 'ok' },
+            ),
+          }),
+          headers: new Map([['content-type', 'application/json']]),
+        },
+        body: vi.fn(),
+      });
+
+      const c1 = makeCtx();
+      await middleware(c1, async () => { controllerCalls++; c1.res.status = 500; });
+
+      const c2 = makeCtx();
+      await middleware(c2, async () => { controllerCalls++; c2.res.status = 200; });
+
+      // Bug: request 2 was served the cached error payload without running the
+      // controller. Fix: the 500 bypassed the cache entirely, the controller
+      // re-ran, and its fresh 200 payload is what reaches the response.
+      expect(controllerCalls).toBe(2);
+      expect(c2.body).not.toHaveBeenCalledWith(
+        expect.stringContaining('error'),
+        200,
+        expect.anything(),
+      );
+    });
+
+    it('fastifyCache: a 500 response bypasses the cache and is refetched', async () => {
+      cache = new CacheService({
+        namespace: `ff-err-${Date.now()}`,
+        disableRedis: true,
+      });
+      const middleware = fastifyCache({ cache, ttl: 60 });
+      let routeCalls = 0;
+
+      // Request 1: route replies 500
+      const req1 = { method: 'GET', url: '/api/flaky', headers: {} };
+      const reply1: any = {
+        sent: false,
+        statusCode: 200,
+        header: () => {},
+        getHeader: () => undefined,
+        code: function (c: number) { this.statusCode = c; return this; },
+        send: function () { this.sent = true; return this; },
+      };
+      await middleware(req1, reply1);
+      if (!reply1.sent) {
+        routeCalls++;
+        reply1.code(500);
+        reply1.send({ error: 'upstream down' });
+      }
+
+      // Request 2: route would now succeed
+      const req2 = { method: 'GET', url: '/api/flaky', headers: {} };
+      let body2: unknown = null;
+      const reply2: any = {
+        sent: false,
+        statusCode: 200,
+        header: () => {},
+        getHeader: () => undefined,
+        code: function (c: number) { this.statusCode = c; return this; },
+        send: function (b: unknown) { body2 = b; this.sent = true; return this; },
+      };
+      await middleware(req2, reply2);
+      if (!reply2.sent) {
+        routeCalls++;
+        reply2.code(200);
+        reply2.send({ product: 'fresh' });
+      }
+
+      expect(routeCalls).toBe(2);
+      expect(body2).toEqual({ product: 'fresh' });
+    });
+
+    it('expressCache: resolves when the handler answers via res.end() (no hang)', async () => {
+      cache = new CacheService({
+        namespace: `http-end-${Date.now()}`,
+        disableRedis: true,
+      });
+      const middleware = expressCache({ cache, ttl: 60 });
+
+      const req = { method: 'GET', url: '/api/empty', headers: {} };
+      const res: any = {
+        setHeader: () => {},
+        getHeader: () => undefined,
+        status: undefined,
+        json: undefined,
+        send: undefined,
+        end: () => {},
+        headersSent: false,
+      };
+
+      // Bug: fetchFn's promise never settles because only res.json/res.send
+      // were intercepted — awaiting the middleware hangs forever.
+      await Promise.race([
+        middleware(req, res, () => { res.end('done'); }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('middleware hung on res.end()')), 1000)),
+      ]);
+    });
+  });
 });

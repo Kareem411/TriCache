@@ -15,10 +15,6 @@
 import { pack, unpack } from 'msgpackr';
 import type { CacheHit, CachePriority, CategoryLimit, SmartCacheEntry, ILogger, EvictionReason } from './types';
 
-// Reusable return object for get() — eliminates one heap allocation per hot read.
-// Safe because JS is single-threaded: callers consume all fields before the next get().
-const _hit: CacheHit = { value: undefined, isStale: false, expiresAt: 0, ttlMs: undefined, delta: undefined, fetchedAt: 0, tagVersions: undefined, setAt: undefined };
-
 /**
  * Packed-byte threshold above which the live JS object is NOT stored alongside the
  * serialised buffer.  For entries above this size, the double-heap overhead (both the
@@ -531,15 +527,21 @@ export class SmartMemoryCache {
     // value is cached at write time — hot reads return the live object directly,
     // skipping unpack. Falls back to decode for entries restored from disk/snapshot.
     const value = entry.value !== undefined ? entry.value : unpack(entry.data as Buffer);
-    _hit.value    = value;
-    _hit.isStale  = entry.staleAt !== undefined && now > entry.staleAt;
-    _hit.expiresAt = entry.expiresAt;
-    _hit.ttlMs    = entry.ttlMs;
-    _hit.delta    = entry.delta;
-    _hit.fetchedAt = now;
-    _hit.tagVersions = entry.tagVersions;
-    _hit.setAt    = entry.setAt;
-    return _hit;
+    // Fresh object per call — never a shared/reusable one. Callers hold this result
+    // across await boundaries (CacheService.get() awaits tag-version checks between
+    // the L1 hit and the return); a shared object would let a concurrent get()
+    // repurpose those fields for another key (silent cross-key data corruption).
+    const hit: CacheHit = {
+      value,
+      isStale:   entry.staleAt !== undefined && now > entry.staleAt,
+      expiresAt: entry.expiresAt,
+      ttlMs:     entry.ttlMs,
+      delta:     entry.delta,
+      fetchedAt: now,
+      tagVersions: entry.tagVersions,
+      setAt:     entry.setAt,
+    };
+    return hit;
   }
 
   set(

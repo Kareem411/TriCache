@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] — 2026-08-22
+
+### Fixed
+- **P0 — Cross-key data corruption under concurrent generational reads**: `SmartMemoryCache.get()` returned a shared, module-level reusable hit object. `CacheService.get()` awaits tag-version checks between the L1 hit and the return, so two concurrent `get()` calls for distinct tagged keys (under `tagStrategy: 'generational'`) could receive each other's payloads with no error. `get()` now returns a fresh per-call object; regression-tested with a 20-key interleaved concurrency suite (`tests/concurrency-aliasing.test.ts`).
+- **P0 — `cache.lock()` executed the critical section twice on business failure**: when the locked function threw (or the Lua release failed), the error was swallowed by the Redis-fallback `catch` and the task re-ran under the in-process mutex *after* the distributed lock had already been released. Lock acquisition and task execution are now decoupled: a business exception propagates exactly once and is never retried (`tests/distributed-lock.test.ts`).
+- **HTTP middleware cached 4xx/5xx responses** — a transient upstream 500 poisoned its cache key for the whole TTL window across Express, Hono, and Fastify adapters. All three now gate persistence on 2xx status and evict error responses immediately.
+- **Express middleware hung forever on `res.end()`** — only `res.json`/`res.send` were intercepted as completion signals; handlers answering via `res.end()` never resolved the fetch promise. `end()` is now a third completion signal.
+- **`ttl: 0` created instantly-expired entries** — the NestJS `TriCacheStore` contract documents "0 = indefinite", but expiry was computed as `now + 0ms`. TTL 0 now maps to a far-future expiry in both L1 and L2 write paths.
+- **Prisma extension forwarded the `cache` pseudo-option to the query engine on mutations** — the read path stripped it, the write path passed it verbatim; both paths now send clean args.
+- **Disk tier leaked byte accounting on corrupt entries** — the legacy decrypt-failure purge path deleted files without releasing their size from `diskUsageBytes`, causing phantom "disk cap reached" states in file-only mode (`tests/disk-accounting.test.ts`).
+- **Strict decompression** — corrupt compressed payloads previously fell through both zlib attempts and returned raw bytes (corruption surfaced as garbage downstream). Decompression failure now throws and every call site maps it to a clean cache miss; cross-algorithm recovery is preserved.
+
+### Changed
+- **Library no longer hijacks host shutdown**: the SIGTERM/SIGINT handler flushes the cold-start snapshot but no longer calls `process.exit(0)` — that decision belongs to the host application (Kubernetes graceful drain, NestJS `onApplicationShutdown`, pool drains).
+- **`redisHost` / cluster / sentinel configuration is now honored outside production** — L2 was silently disabled whenever `NODE_ENV !== 'production'` even with explicit connectivity config. The `REDIS_HOST` env fallback still does not auto-enable L2 in tests. Documented precedence: explicit `disableRedis` wins over everything; otherwise any explicit connection config enables Redis.
+- **`cache.options` getter redacts `encryptionKey`** as `[REDACTED]` instead of exposing raw key material to diagnostic dumps, and now also reports `encryptionMode`.
+- **README badge/test-count drift is CI-enforced** via `scripts/check-test-badge.mjs` (runs after the suite in all six OS×Node matrix legs).
+- Documentation accuracy: corrected the msgpackr serialization claim (L2 string values are JSON-serialised before encryption), documented invalid-key fail-open vs fail-closed behavior in SECURITY.md, fixed the disk-spill saturation test's race against in-flight `.tmp` staging writes, updated the test-count badge to reflect this release.
+
+### Added
+- **`strictKeyValidation` option (fail-closed encryption config)** — an invalid or empty `encryptionKey` previously logged an error and continued with at-rest encryption silently disabled (fail-open; still the default). Set `strictKeyValidation: true` to throw at construction instead — for deployments where serving plaintext at rest is unacceptable. A key that is simply not configured never throws in either mode.
+- New regression suites: concurrent generational reads (`concurrency-aliasing`), distributed-lock single-execution semantics (`distributed-lock`), HTTP error-response caching + `res.end()` handling (`http-middleware`), shutdown/config-precedence contracts (`lifecycle-config`), disk byte accounting (`disk-accounting`), strict decompression (`compression`), invalid-key strict mode (`encryption`). Test count: 484 → 511 (unit) plus a live-Redis integration suite (`pnpm test:integration`, requires Docker/Redis).
+
 ## [0.7.0] — 2026-08-21
 
 ### Added

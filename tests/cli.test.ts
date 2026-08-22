@@ -1,11 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runCli } from '../src/cli.js';
+import pkg from '../package.json' with { type: 'json' };
 
 describe('TriCache CLI (src/cli.ts)', () => {
   it('prints version number when called with --version', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     await runCli(['--version']);
-    expect(logSpy).toHaveBeenCalledWith('tricache v0.7.0');
+    // Read from package.json — a hardcoded literal drifts on every release.
+    expect(logSpy).toHaveBeenCalledWith(`tricache v${pkg.version}`);
     logSpy.mockRestore();
   });
 

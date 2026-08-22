@@ -68,6 +68,8 @@ return 0
 
 const SNAPSHOT_VERSION         = 1;
 const DEFAULT_SNAPSHOT_MAX_AGE = 2 * 60 * 60 * 1000; // 2 hours
+/** ttl 0 ("indefinite", per the NestJS store contract) maps to a 1-year expiry. */
+const INDEFINITE_TTL_SECONDS   = 31_536_000;
 const SNAPSHOT_MAX_FILE_BYTES  = 220 * 1024 * 1024;   // 220 MB guard
 
 // ─── Default category limits ──────────────────────────────────────────────────
@@ -361,7 +363,7 @@ export class CacheService {
     forbiddenSnapshotPrefixes: readonly string[];
     diskCacheDir: string; diskMaxBytes: number; diskEntryMaxBytes: number;
     redisHost: string; redisPort: number; redisTls: boolean; disableRedis: boolean;
-    encryptionKey: string | undefined; snapshotPath: string; snapshotMaxAgeMs: number;
+    encryptionKey: string | undefined; encryptionMode: 'aes-256-gcm' | 'aes-128-gcm' | 'aes-128-ctr' | 'xor' | undefined; snapshotPath: string; snapshotMaxAgeMs: number;
     invalidationBackplane: boolean;
     oomProtection: boolean; oomHeapThreshold: number;
     oomCheckIntervalMs: number; oomEvictPercent: number;
@@ -491,6 +493,7 @@ export class CacheService {
       options.encryptionMode,
       options.previousEncryptionKey,
       options.previousEncryptionMode,
+      { strictKeyValidation: options.strictKeyValidation ?? false },
     );
 
     // When a namespace is active, scope the forbidden prefixes so that
@@ -517,8 +520,20 @@ export class CacheService {
       redisHost:                options.redisHost  ?? process.env.REDIS_HOST ?? '',
       redisPort:                options.redisPort  ?? 6379,
       redisTls:                 options.redisTls   ?? (process.env.NODE_ENV === 'production'),
-      disableRedis:             options.disableRedis ?? (process.env.NODE_ENV !== 'production'),
+      disableRedis:            options.disableRedis ?? (() => {
+        // Auto-disable L2 only when the caller passed NO connectivity config at
+        // all (and we're outside production). An explicitly provided host /
+        // cluster / sentinel must enable Redis regardless of NODE_ENV — the old
+        // env-only check silently ignored a configured redisHost in dev/staging.
+        // The REDIS_HOST env fallback does NOT count as explicit: CI exports it
+        // globally and unit tests rely on L2 staying off unless asked for.
+        const explicitConfig = Boolean(
+          options.redisHost || options.redisClusterNodes?.length || options.redisSentinel,
+        );
+        return !explicitConfig && process.env.NODE_ENV !== 'production';
+      })(),
       encryptionKey:            encKeyRaw,
+      encryptionMode:           options.encryptionMode,
       snapshotPath:             options.snapshotPath ?? path.join(
         os.tmpdir(), ns ? `tricache-snapshot-${ns}.msgpack` : 'tricache-snapshot.msgpack'),
       snapshotMaxAgeMs:         options.snapshotMaxAgeMs ?? DEFAULT_SNAPSHOT_MAX_AGE,
@@ -638,8 +653,10 @@ export class CacheService {
       if (!this._diskDisabled) this.loadSnapshot(); // Fix 3: skip in ephemeral environments
     }
 
-    // Graceful shutdown: persist L1 to disk
-    this._shutdownHandler = () => { if (!this._diskDisabled) this.writeSnapshot(); process.exit(0); };
+    // Graceful shutdown: persist L1 to disk. The library must NEVER call
+    // process.exit() — that decision belongs to the host application (kills
+    // Kubernetes graceful drain, NestJS onApplicationShutdown, pool drains).
+    this._shutdownHandler = () => { if (!this._diskDisabled) this.writeSnapshot(); };
     process.once('SIGTERM', this._shutdownHandler);
     process.once('SIGINT',  this._shutdownHandler);
 
@@ -832,14 +849,17 @@ export class CacheService {
       disableRedis:        this._redisDisabled,
       redisClusterNodes:   o.redisClusterNodes,
       redisSentinel:       o.redisSentinel,
-      encryptionKey:       o.encryptionKey,
+      // Never surface key material through diagnostics — a JSON.stringify of
+      // this object previously leaked the raw encryption key.
+      encryptionKey:       o.encryptionKey ? '[REDACTED]' : undefined,
+      encryptionMode:      o.encryptionMode,
       l2WriteMode:         o.l2WriteMode,
       instanceName:        o.instanceName,
       frozen:              o.frozen,
       adaptiveTtl:         o.adaptiveTtl,
       invalidationBackplane: o.invalidationBackplane,
       strictSingleton:     o.strictSingleton,
-    };
+    } as CacheOptions;
   }
 
   /**
@@ -1062,28 +1082,7 @@ export class CacheService {
                 for (const [id, fields] of entries) {
                   this._lastStreamId = id;
                   this.counters.streamEntriesReceived++;
-
-                  let op = '';
-                  let key = '';
-                  let src = '';
-                  let tagVersion: number | undefined;
-
-                  for (let i = 0; i < fields.length; i += 2) {
-                    const f = fields[i];
-                    const v = fields[i + 1];
-                    if (f === 'op') op = v;
-                    else if (f === 'key') key = v;
-                    else if (f === 'src') src = v;
-                    else if (f === 'tagVersion') tagVersion = parseInt(v, 10);
-                  }
-
-                  if (src === this.instanceId) {
-                    this.counters.invSkipped++;
-                    continue;
-                  }
-
-                  this.counters.invReceived++;
-                  this._applyInvalidationEvent(op, key, tagVersion);
+                  this._processStreamEntry(fields);
                 }
               }
             }
@@ -1105,6 +1104,58 @@ export class CacheService {
     };
 
     void runLoop();
+  }
+
+  /**
+   * Validate + apply one XREAD stream entry. `fields` is the flat ioredis
+   * shape [name, value, name, value, …]. Mirrors the schema rules of the
+   * pubsub path (`_handleBackplaneMessage`): op must be a known operation,
+   * key/src must be non-empty strings, tagVersion must parse to a finite
+   * number. Invalid entries are logged and dropped — never applied.
+   */
+  /** @internal Exposed for testing. */
+  _processStreamEntry(fields: string[]): void {
+    let op = '';
+    let key = '';
+    let src = '';
+    let tagVersionRaw: string | undefined;
+
+    for (let i = 0; i + 1 < fields.length; i += 2) {
+      const f = fields[i];
+      const v = fields[i + 1];
+      if (f === 'op') op = v;
+      else if (f === 'key') key = v;
+      else if (f === 'src') src = v;
+      else if (f === 'tagVersion') tagVersionRaw = v;
+    }
+
+    const validOp = op === 'del' || op === 'del-glob' || op === 'tag_incr';
+    if (!validOp || typeof key !== 'string' || !key || typeof src !== 'string') {
+      this.logger.warn('Backplane: rejected invalid stream entry', {
+        op: String(op).slice(0, 40),
+        key: typeof key === 'string' ? key.slice(0, 100).replace(/[\r\n\t]/g, ' ') : String(key),
+      });
+      return;
+    }
+
+    // parseInt('12abc34') → NaN — reject instead of poisoning the version map.
+    let tagVersion: number | undefined;
+    if (tagVersionRaw !== undefined) {
+      const parsed = parseInt(tagVersionRaw, 10);
+      if (!Number.isFinite(parsed)) {
+        this.logger.warn('Backplane: rejected stream entry with non-numeric tagVersion', { key });
+        return;
+      }
+      tagVersion = parsed;
+    }
+
+    if (src === this.instanceId) {
+      this.counters.invSkipped++;
+      return;
+    }
+
+    this.counters.invReceived++;
+    this._applyInvalidationEvent(op, key, tagVersion);
   }
 
   private _applyInvalidationEvent(op: string, key: string, tagVersion?: number): void {
@@ -1901,7 +1952,11 @@ export class CacheService {
   async set<T>(cacheKey: string, data: T, ttlSeconds = 300, priority?: CachePriority, opts?: { tags?: string[]; dependsOn?: string[] }): Promise<void> {
     const span  = this._startSpan('tricache.set');
     if (this.opts.tracer) span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
-    const ttlMs = this._jitterTtl(ttlSeconds * 1_000);
+    // ttl 0 = indefinite (documented contract, used by the NestJS store): map to
+    // a far-future expiry instead of computing expiresAt = now + 0ms, which
+    // created an instantly-expired entry that could never be read.
+    const effectiveTtlSeconds = ttlSeconds > 0 ? ttlSeconds : (ttlSeconds === 0 ? INDEFINITE_TTL_SECONDS : ttlSeconds);
+    const ttlMs = this._jitterTtl(effectiveTtlSeconds * 1_000);
     const p     = priority ?? inferPriority(cacheKey);
     const k     = this.nk(cacheKey);
     this.counters.sets++;
@@ -2857,8 +2912,14 @@ export class CacheService {
     let acquired = false;
 
     if (!this._redisDisabled) {
+      // ── Acquire phase ONLY. Redis-side failures here may fall back to the
+      // in-process mutex below. fn() is deliberately NOT inside this try: a
+      // business exception must propagate to the caller exactly once — the old
+      // control flow caught it HERE and re-ran fn() under the weaker local lock
+      // AFTER the distributed lock had already been released (double side-effects).
+      let client: AnyRedisClient | null = null;
       try {
-        const client = await this.getRedis();
+        client = await this.getRedis();
         while (Date.now() <= deadline) {
           const res = await client.set(lockKey, token, 'EX', ttlSeconds, 'NX');
           if (res === 'OK') {
@@ -2873,7 +2934,19 @@ export class CacheService {
         if (!acquired) {
           throw new Error(`Failed to acquire lock for resource "${resourceKey}" within ${acquireTimeout}ms`);
         }
+      } catch (err) {
+        if ((err as Error).message.startsWith('Failed to acquire lock')) throw err;
+        this.logger.debug('Distributed lock: Redis error, falling back to in-process mutex', {
+          resourceKey, error: (err as Error).message,
+        });
+        client = null;
+      }
 
+      if (client !== null && acquired) {
+        // ── Execution phase: OUTSIDE every fallback catch. An error thrown by
+        // fn() propagates directly to the caller and is NEVER retried under the
+        // local mutex. Release always runs; the TTL is the safety net if the
+        // release call itself fails.
         try {
           return await fn();
         } finally {
@@ -2886,13 +2959,8 @@ export class CacheService {
               end
             `;
             await client.eval(LUA_RELEASE_LOCK, 1, lockKey, token);
-          } catch { /* ok */ }
+          } catch { /* ok — TTL expiry covers us */ }
         }
-      } catch (err) {
-        if ((err as Error).message.startsWith('Failed to acquire lock')) throw err;
-        this.logger.debug('Distributed lock: Redis error, falling back to in-process mutex', {
-          resourceKey, error: (err as Error).message,
-        });
       }
     }
 

@@ -54,19 +54,23 @@ export function expressCache(options: HttpCacheOptions = {}) {
     const ifNoneMatch = req.headers ? req.headers['if-none-match'] : undefined;
 
     try {
-      const cached = await activeCache.get<{ body: unknown; contentType?: string; etag?: string }>(
+      const cached = await activeCache.get<{ body: unknown; contentType?: string; etag?: string; status?: number }>(
         key,
         async () => {
           return new Promise((resolve) => {
             const origJson = res.json?.bind(res);
             const origSend = res.send?.bind(res);
+            const origEnd  = res.end?.bind(res);
+            const statusOf = () => (res as { statusCode?: number }).statusCode;
 
             if (origJson) {
               res.json = (body: any) => {
                 const bodyEtag = etag ? generateETag(body) : undefined;
-                resolve({ body, contentType: 'application/json; charset=utf-8', etag: bodyEtag });
+                resolve({ body, contentType: 'application/json; charset=utf-8', etag: bodyEtag, status: statusOf() });
                 if (ifNoneMatch && ifNoneMatch === bodyEtag) {
-                  return res.status(304).end();
+                  res.status?.(304);
+                  origEnd?.();
+                  return;
                 }
                 if (bodyEtag && res.setHeader) res.setHeader('ETag', bodyEtag);
                 return origJson(body);
@@ -76,12 +80,25 @@ export function expressCache(options: HttpCacheOptions = {}) {
             if (origSend) {
               res.send = (body: any) => {
                 const bodyEtag = etag ? generateETag(body) : undefined;
-                resolve({ body, contentType: res.getHeader ? res.getHeader('content-type') : undefined, etag: bodyEtag });
+                resolve({ body, contentType: res.getHeader ? (res.getHeader('content-type') as string | undefined) : undefined, etag: bodyEtag, status: statusOf() });
                 if (ifNoneMatch && ifNoneMatch === bodyEtag) {
-                  return res.status(304).end();
+                  res.status?.(304);
+                  origEnd?.();
+                  return;
                 }
                 if (bodyEtag && res.setHeader) res.setHeader('ETag', bodyEtag);
                 return origSend(body);
+              };
+            }
+
+            // Handlers that answer via res.end() (empty bodies, strings, buffers)
+            // previously never resolved the fetchFn promise — the middleware hung
+            // forever. end() is a third completion signal alongside json/send.
+            if (origEnd) {
+              res.end = (body?: unknown) => {
+                const bodyEtag = etag && body != null ? generateETag(body) : undefined;
+                resolve({ body, contentType: res.getHeader ? (res.getHeader('content-type') as string | undefined) : undefined, etag: bodyEtag, status: statusOf() });
+                return origEnd(body as never);
               };
             }
 
@@ -91,6 +108,16 @@ export function expressCache(options: HttpCacheOptions = {}) {
         ttl,
         { swr, tags }
       );
+
+      // Status gate: error responses must never be cached. get() has already
+      // stored whatever the handler produced — evict it immediately so the next
+      // request re-runs the handler instead of replaying a transient 4xx/5xx
+      // for the whole TTL window.
+      const respStatus = (cached as { status?: number }).status;
+      if (typeof respStatus === 'number' && (respStatus < 200 || respStatus >= 300)) {
+        await activeCache.delete(key).catch(() => {});
+        return;
+      }
 
       if (!res.headersSent) {
         if (cached.etag) {
@@ -132,7 +159,7 @@ export function honoCache(options: HttpCacheOptions = {}) {
     const key = keyGenerator ? keyGenerator(c.req) : `http:${c.req.method}:${c.req.url}`;
     const ifNoneMatch = c.req.header ? c.req.header('if-none-match') : undefined;
 
-    const cached = await activeCache.get<{ body: unknown; contentType?: string; etag?: string }>(
+    const cached = await activeCache.get<{ body: unknown; contentType?: string; etag?: string; status?: number }>(
       key,
       async () => {
         await next();
@@ -143,11 +170,21 @@ export function honoCache(options: HttpCacheOptions = {}) {
           body: text,
           contentType: res.headers.get('content-type') ?? 'text/plain',
           etag: bodyEtag,
+          status: typeof (res as { status?: unknown }).status === 'number'
+            ? (res as { status: number }).status
+            : undefined,
         };
       },
       ttl,
       { swr, tags }
     );
+
+    // Status gate: never replay a transient 4xx/5xx from cache — evict and let
+    // the (already-dispatched) live response stand for this request.
+    if (typeof cached.status === 'number' && (cached.status < 200 || cached.status >= 300)) {
+      await activeCache.delete(key).catch(() => {});
+      return;
+    }
 
     if (cached.etag && ifNoneMatch === cached.etag) {
       return c.body(null, 304, { ETag: cached.etag });
@@ -208,7 +245,12 @@ export function fastifyCache(options: HttpCacheOptions = {}) {
         if (payload !== undefined && payload !== null) {
           const payloadEtag = etag ? generateETag(payload) : undefined;
           const contentType = (reply.getHeader && reply.getHeader('content-type')) || (typeof payload === 'object' ? 'application/json' : 'text/plain');
-          activeCache!.set(key, { body: payload, contentType, etag: payloadEtag }, ttl, undefined, { tags }).catch(() => {});
+          // Status gate: only cache 2xx. A transient 4xx/5xx must not poison
+          // this key for the whole TTL window.
+          const respStatus = reply.statusCode ?? reply.raw?.statusCode;
+          if (respStatus === undefined || (respStatus >= 200 && respStatus < 300)) {
+            activeCache!.set(key, { body: payload, contentType, etag: payloadEtag }, ttl, undefined, { tags }).catch(() => {});
+          }
           if (ifNoneMatch && ifNoneMatch === payloadEtag) {
             if (reply.code) reply.code(304);
             else if (reply.status) reply.status(304);

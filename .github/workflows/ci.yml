@@ -71,7 +71,17 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Run test suite
-        run: pnpm test
+        shell: bash
+        run: |
+          pnpm test 2>&1 | tee test-output.log
+          node scripts/check-test-badge.mjs test-output.log
+        env:
+          REDIS_HOST: '127.0.0.1'
+          REDIS_PORT: 6379
+
+      - name: Live-Redis integration tests (service container)
+        shell: bash
+        run: pnpm run test:integration
         env:
           REDIS_HOST: '127.0.0.1'
           REDIS_PORT: 6379
@@ -106,7 +116,10 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Run test suite
-        run: pnpm test
+        shell: bash
+        run: |
+          pnpm test 2>&1 | tee test-output.log
+          node scripts/check-test-badge.mjs test-output.log
 
       - name: Build
         run: pnpm build
