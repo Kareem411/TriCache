@@ -1,6 +1,8 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { CacheService } from '../src/cache-service.js';
 
+const silentLogger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+
 describe('Distributed Mutex & Lock Primitive (cache.lock)', () => {
   let cache: CacheService | null = null;
 
@@ -90,5 +92,45 @@ describe('Distributed Mutex & Lock Primitive (cache.lock)', () => {
     ).rejects.toThrow(/Failed to acquire lock for resource "resource:slow" within 100ms/);
 
     await longRunning;
+  });
+
+  it('REDIS PATH: runs fn exactly once when fn throws — never falls back to local re-execution', async () => {
+    // Real-looking host so the Redis branch executes; getRedis() is stubbed so
+    // no network happens. (disableRedis would skip the buggy path entirely.)
+    cache = new CacheService({
+      namespace: `lock-redis-${Date.now()}`,
+      redisHost: '127.0.0.1',
+      disableRedis: false,
+      invalidationBackplane: false,
+      logger: silentLogger,
+    });
+
+    const calls: string[] = [];
+    const fakeClient = {
+      set: async (..._a: unknown[]) => { calls.push('acquire'); return 'OK'; },
+      eval: async () => { calls.push('release'); return 1; },
+    };
+    (cache as unknown as { getRedis: () => Promise<unknown> }).getRedis =
+      async () => fakeClient;
+
+    let executions = 0;
+
+    await expect(
+      cache.lock('resource:billing-cron', async () => {
+        executions++;
+        throw new Error('Database transaction aborted');
+      }, { acquireTimeout: 1000, retryInterval: 10 }),
+    ).rejects.toThrow('Database transaction aborted');
+
+    // THE invariant: a business failure must execute the critical section
+    // EXACTLY once and propagate its error. The old control flow fell through
+    // to the in-process mutex fallback and ran fn() a second time AFTER the
+    // distributed lock had already been released (probe: "fn executed 2 time(s)").
+    expect(executions).toBe(1);
+    // Acquire + release happened on the Redis client…
+    expect(calls.filter(c => c === 'acquire')).toHaveLength(1);
+    expect(calls.filter(c => c === 'release')).toHaveLength(1);
+    // …and release is the LAST operation — no second acquire may follow it.
+    expect(calls[calls.length - 1]).toBe('release');
   });
 });
