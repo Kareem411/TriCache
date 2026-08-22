@@ -80,7 +80,7 @@
     "typecheck:all": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "lint": "oxlint src tests",
     "test": "vitest run",
-    "test:integration": "vitest run tests/integration",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:watch": "vitest",
     "bench": "node --expose-gc --max-old-space-size=8192 --import tsx/esm bench/benchmark.ts"
   },

@@ -79,6 +79,13 @@ jobs:
           REDIS_HOST: '127.0.0.1'
           REDIS_PORT: 6379
 
+      - name: Live-Redis integration tests (service container)
+        shell: bash
+        run: pnpm run test:integration
+        env:
+          REDIS_HOST: '127.0.0.1'
+          REDIS_PORT: 6379
+
       - name: Build
         run: pnpm build
 

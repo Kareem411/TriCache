@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **`strictKeyValidation` option (fail-closed encryption config)** — an invalid or empty `encryptionKey` previously logged an error and continued with at-rest encryption silently disabled (fail-open; still the default). Set `strictKeyValidation: true` to throw at construction instead — for deployments where serving plaintext at rest is unacceptable. A key that is simply not configured never throws in either mode.
-- New regression suites: concurrent generational reads (`concurrency-aliasing`), distributed-lock single-execution semantics (`distributed-lock`), HTTP error-response caching + `res.end()` handling (`http-middleware`), shutdown/config-precedence contracts (`lifecycle-config`), disk byte accounting (`disk-accounting`), strict decompression (`compression`), invalid-key strict mode (`encryption`). Test count: 484 → 506.
+- New regression suites: concurrent generational reads (`concurrency-aliasing`), distributed-lock single-execution semantics (`distributed-lock`), HTTP error-response caching + `res.end()` handling (`http-middleware`), shutdown/config-precedence contracts (`lifecycle-config`), disk byte accounting (`disk-accounting`), strict decompression (`compression`), invalid-key strict mode (`encryption`). Test count: 484 → 511 (unit) plus a live-Redis integration suite (`pnpm test:integration`, requires Docker/Redis).
 
 ## [0.7.0] — 2026-08-21
 
