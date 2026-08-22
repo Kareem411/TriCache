@@ -16,7 +16,9 @@ if (!file) {
 
 const out = readFileSync(file, 'utf8');
 // Strip ANSI colour/dim codes — vitest emits e.g. "\x1b[2m Tests \x1b[22m \x1b[1m\x1b[32m506 passed".
-const clean = out.replace(/\x1B\[[0-9;]*m/g, '');
+// Matching U+001B here is intentional; escaped as \u001B per the rule's guidance.
+// oxlint-disable-next-line eslint/no-control-regex
+const clean = out.replace(/\u001B\[[0-9;]*m/g, '');
 const match = clean.match(/Tests\s+(\d+)\s+passed/);
 if (!match) {
   console.error('check-test-badge: could not find a "Tests <N> passed" summary in the provided output.');
