@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-484%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-506%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 22](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org)
@@ -17,7 +17,7 @@ tricache is a three-tier Node.js cache library — in-memory (L1), local disk sp
 
 ## 🏆 What Makes TriCache a "No-Brainer"
 
-| Dimension | Industry Standard (`keyv`, `@neshca/cache-handler`, `cache-manager`) | **TriCache v0.7.0** |
+| Dimension | Industry Standard (`keyv`, `@neshca/cache-handler`, `cache-manager`) | **TriCache v0.7.1** |
 |:---|:---|:---|
 | **Storage Hierarchy** | Single-tier (RAM or Redis or Disk) | **Three-Tier (RAM → NVMe Disk → Redis/Valkey)** |
 | **Thundering-Herd** | Unhandled / requires external single-flight libraries | **Built-in Inflight Promise Coalescing (10k tested)** |
@@ -49,7 +49,7 @@ tricache is a three-tier Node.js cache library — in-memory (L1), local disk sp
 | **Adaptive eviction** | LFU × LRU × priority score + Count-Min Sketch cross-eviction frequency; reservoir-sampled O(1) hot path; category limits prevent any prefix monopolising RAM |
 | **Count-Min Sketch** | 4 × 512 `Uint16Array` (4 KB) tracks historical access frequency across eviction boundaries — same-priority burst keys cannot displace long-resident entries; **84 % survival rate** in benchmark flood tests |
 | **WASM Bloom filter** | 562-byte binary inlined as Base64 — O(k=7) guaranteed-miss detection, no filesystem access, pure-JS fallback |
-| **msgpackr serialization** | All entries packed with msgpackr — uniform binary format, no JSON at any payload size |
+| **msgpackr serialization** | L1 and disk-tier entries packed with msgpackr — uniform binary format, no JSON on hot paths; L2 (Redis) string values are JSON-serialised before encryption |
 | **Stale-While-Revalidate** | Serve stale instantly, revalidate in background — zero added latency on cache hit |
 | **Stale-if-error** | Extend a stale entry's TTL when SWR revalidation fails — no errors served during upstream outages |
 | **Thundering-herd prevention** | Inflight `Promise` registry — only one `fetchFn` call per key regardless of concurrency (10,000 tested) |

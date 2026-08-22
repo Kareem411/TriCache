@@ -44,7 +44,7 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
   }
 
   if (values.version || command === 'version') {
-    console.log('tricache v0.7.0');
+    console.log('tricache v0.7.1');
     return;
   }
 
