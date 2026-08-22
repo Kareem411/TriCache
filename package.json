@@ -80,6 +80,7 @@
     "typecheck:all": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "lint": "oxlint src tests",
     "test": "vitest run",
+    "test:integration": "vitest run tests/integration",
     "test:watch": "vitest",
     "bench": "node --expose-gc --max-old-space-size=8192 --import tsx/esm bench/benchmark.ts"
   },
@@ -104,6 +105,7 @@
     "@nestjs/core": "^11.0.0",
     "@types/node": "^26.2.0",
     "oxlint": "^1.79.0",
+    "redis": "^6.2.1",
     "tsup": "^8.5.1",
     "tsx": "^4.23.12",
     "typescript": "^6.0.3",
