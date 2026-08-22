@@ -1,0 +1,42 @@
+name: 💡 Feature Request
+description: Propose a new feature, adapter, or enhancement for TriCache
+labels: ['enhancement']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for suggesting an idea to make TriCache even better!
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Is your feature request related to a problem?
+      description: A clear and concise description of what problem this solves.
+      placeholder: I am frustrated when...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the solution you'd like or the API shape you envision.
+      placeholder: |
+        ```typescript
+        // Proposed API or configuration
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any alternative solutions or workarounds you've considered.
+
+  - type: checkboxes
+    id: willing-to-pr
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to submit a pull request implementing this feature.

@@ -11,7 +11,7 @@
 
 tricache is a three-tier Node.js cache library — in-memory (L1), local disk spill, and Redis/Valkey (L2). Warm L1 reads run at 2.81 million operations per second on a single thread (356 ns/op) — well below any network round-trip, including a local Redis call. When L1 fills, evicted entries spill to disk instead of being dropped, keeping hit rates high without unbounded RAM growth. Misses that reach L2 are coalesced across concurrent callers, so a spike of simultaneous requests for the same key triggers exactly one fetchFn call, not one per caller. See the performance section for full numbers. Optional configuration adds Stale-While-Revalidate, at-rest encryption (AES-256-GCM by default), pub/sub fleet-wide invalidation, an OOM guard, cold-start snapshots, and Prometheus metrics — none of it required to get started.
 
-<img src="https://raw.githubusercontent.com/Kareem411/TriCache/master/public/SmartMemoryCache_DiskTier.jpeg" width="600" alt="tricache architecture" />
+<img src="https://raw.githubusercontent.com/Kareem411/TriCache/main/public/SmartMemoryCache_DiskTier.jpeg" width="600" alt="tricache architecture" />
 
 ---
 
@@ -1404,14 +1404,14 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the full breakdown: bloom filter cost, se
 
 ## 🤝 Contributing
 
-Bug reports and pull requests are welcome!
+Contributions of all kinds are welcome! Please check out our [Contributing Guide](CONTRIBUTING.md) and [Code of Conduct](CODE_OF_CONDUCT.md) for detailed instructions on development setup, testing, benchmarking, and PR submission.
 
-1. Fork the repo and create a feature branch
-2. Run `pnpm test` — all tests must pass
+1. Fork the repo and create a feature branch (`git checkout -b feat/my-feature`)
+2. Run `pnpm lint`, `pnpm typecheck:all`, and `pnpm test` — all checks must pass
 3. Run `pnpm bench` if you touch a hot path and include before/after numbers in your PR
-4. Open your PR against `master`
+4. Open your PR against `main`
 
-> New to the codebase? Start with [src/cache-service.ts](src/cache-service.ts) for the public API and [src/smart-memory-cache.ts](src/smart-memory-cache.ts) for the L1 engine.
+> New to the codebase? Start with [src/cache-service.ts](src/cache-service.ts) for the public API and [src/smart-memory-cache.ts](src/smart-memory-cache.ts) for the L1 engine. See [CONTRIBUTING.md](CONTRIBUTING.md#codebase-architecture) for full architecture notes.
 
 ---
 

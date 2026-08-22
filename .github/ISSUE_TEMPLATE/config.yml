@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security Vulnerabilities
+    url: https://github.com/Kareem411/TriCache/security/advisories/new
+    about: Please report security vulnerabilities privately.
+  - name: Questions & Discussions
+    url: https://github.com/Kareem411/TriCache/discussions
+    about: Ask questions and discuss with the community.

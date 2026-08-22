@@ -1,0 +1,77 @@
+name: 🐛 Bug Report
+description: Report a bug or unexpected behavior in TriCache
+labels: ['bug', 'triage']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report!
+        Please verify the issue hasn't already been reported in open issues.
+
+  - type: input
+    id: version
+    attributes:
+      label: TriCache Version
+      description: What version of TriCache are you using?
+      placeholder: e.g. 0.7.0
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment Info
+      description: Node.js version, OS, and package manager
+      placeholder: e.g. Node v22.13.0, Ubuntu 24.04 / macOS Sonoma / Windows 11, pnpm 10.5
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the Bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal Reproduction
+      description: |
+        Provide a minimal code snippet or link to a repository reproducing the issue.
+      placeholder: |
+        ```typescript
+        import { createCache } from 'tricache';
+
+        const cache = createCache({
+          // config
+        });
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error Logs or Stack Trace
+      description: If applicable, add stack traces or console output.
+      render: shell
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues to ensure this is not a duplicate.
+          required: true
+        - label: This is not a security vulnerability (see SECURITY.md).
+          required: true
