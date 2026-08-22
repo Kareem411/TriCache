@@ -79,6 +79,32 @@ describe('First-Class ORM Adapters (Prisma & Drizzle)', () => {
       expect(res3).toHaveLength(2);
       expect(dbFindManyCalls).toBe(2); // Re-fetched fresh data from DB
     });
+
+    it('strips the cache pseudo-option from args on MUTATION operations too', async () => {
+      cache = new CacheService({
+        namespace: `prisma-mut-${Date.now()}`,
+        disableRedis: true,
+      });
+      const extension = withTriCache({ cache, autoInvalidate: true });
+
+      let receivedArgs: unknown = undefined;
+      const mockCreate = vi.fn(async (args: unknown) => {
+        receivedArgs = args;
+        return { id: 9 };
+      });
+
+      await extension.query.$allModels.$allOperations!({
+        model: 'User',
+        operation: 'create',
+        // A caller that attaches `cache` config to a write must not leak that
+        // pseudo-option into the Prisma query engine.
+        args: { data: { name: 'Delta' }, cache: { ttl: 60 } } as Record<string, unknown>,
+        query: mockCreate as never,
+      });
+
+      expect(mockCreate).toHaveBeenCalledTimes(1);
+      expect(receivedArgs).toEqual({ data: { name: 'Delta' } });
+    });
   });
 
   describe('Drizzle ORM Wrapper (withCache)', () => {

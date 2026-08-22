@@ -105,7 +105,10 @@ export function withTriCache(options: PrismaTriCacheOptions) {
 
           // Auto-invalidation on write operations
           if (autoInvalidate && MUTATION_OPERATIONS.has(operation)) {
-            const result = await query(args);
+            // Strip the cache pseudo-option here too — the read path removes it,
+            // but the mutation path forwarded it verbatim to the Prisma engine.
+            const { cache: _cacheOpt, ...cleanMutationArgs } = (args ?? {}) as Record<string, unknown>;
+            const result = await query(cleanMutationArgs);
             await cache.invalidateTag(modelTag);
             return result;
           }
