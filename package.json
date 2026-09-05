@@ -98,7 +98,7 @@
   },
   "dependencies": {
     "ioredis": "6.0.0",
-    "msgpackr": "2.0.5"
+    "msgpackr": "2.1.0"
   },
   "devDependencies": {
     "@nestjs/common": "^11.0.0",
