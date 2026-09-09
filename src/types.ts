@@ -348,6 +348,33 @@ export interface CacheOptions {
   diskMaxBytes?: number;
   /** Max bytes for a single disk entry. Default: 10 MB */
   diskEntryMaxBytes?: number;
+  /**
+   * Maximum concurrent asynchronous filesystem writes permitted in-flight for disk spills.
+   * Protects against libuv threadpool (UV_THREADPOOL_SIZE=4) saturation during cloud I/O throttling.
+   * Default: Math.min(4, Math.max(1, Math.floor(os.availableParallelism() / 4)))
+   */
+  diskMaxConcurrentWrites?: number;
+  /**
+   * Maximum queued spill writes awaiting execution before shedding kicks in.
+   * Once pending writes hit this limit, incoming spills are dropped without touching libuv.
+   * Default: 512
+   */
+  diskMaxPendingWrites?: number;
+  /**
+   * Maximum time permitted for an individual write before timing out and tripping backpressure.
+   * Default: 500 ms
+   */
+  diskWriteTimeoutMs?: number;
+  /**
+   * Number of consecutive slow or failed disk writes before tripping the disk circuit breaker to OPEN.
+   * Default: 5
+   */
+  diskCircuitBreakerThreshold?: number;
+  /**
+   * Cooldown time in ms before transitioning the disk circuit breaker from OPEN to HALF-OPEN for canary probing.
+   * Default: 5000 ms
+   */
+  diskCircuitBreakerCooldownMs?: number;
 
   // ── L2 (Redis) ────────────────────────────────────────────────────────────
   /**
@@ -358,6 +385,18 @@ export interface CacheOptions {
   redisHost?: string;
   /** Redis port. Default: 6379 */
   redisPort?: number;
+  /**
+   * Strict per-command timeout for Redis operations.
+   * When expired, triggers connection reset / socket destruction to prevent RESP multiplexing desync.
+   * Default: 2500 ms
+   */
+  redisCommandTimeoutMs?: number;
+  /**
+   * Clock skew tolerance window in milliseconds across cluster nodes / containers.
+   * Allows timestamps within this tolerance ahead of the local clock to prevent premature eviction anomalies.
+   * Default: 250 ms
+   */
+  clockSkewToleranceMs?: number;
   /**
    * Whether to enable TLS for the Redis connection. Default: true in production,
    * false otherwise.
@@ -1023,4 +1062,15 @@ export interface IRedisDriver {
   once?(event: string, listener: (...args: any[]) => void): this | unknown;
   isOpen?: boolean;
   connect?(): Promise<unknown>;
+}
+
+/**
+ * Real-time telemetry and state for the disk tier backpressure queue.
+ */
+export interface DiskBackpressureStats {
+  activeWrites: number;
+  pendingWrites: number;
+  spillsDropped: number;
+  circuitState: 'closed' | 'open' | 'half-open';
+  lastTripTimestamp: number;
 }

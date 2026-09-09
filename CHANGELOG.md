@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.0] — 2026-09-09
 
 ### Added
+- **`BoundedDiskQueue` & Cloud NVMe Backpressure Guard (`src/disk-tier.ts`)** — Concurrency-controlled disk spill spooler protecting against libuv threadpool (`UV_THREADPOOL_SIZE=4`) saturation during cloud NVMe / AWS EBS latency spikes (0.4ms to 450ms):
+  - Limits active async fs operations to `diskMaxConcurrentWrites` (default `Math.min(4, Math.max(1, Math.floor(os.availableParallelism() / 4)))`), preventing DNS lookups, zlib compression, and crypto operations from starving.
+  - Fast-sheds incoming spills when pending writes hit `diskMaxPendingWrites` (default 512) before touching libuv, bounding heap memory and preserving main-thread latency.
+  - Three-state Disk Circuit Breaker (`closed` → `open` → `half-open`) with strict single-canary probing upon cooldown expiry, preventing recovering disk controllers from being re-flooded.
+  - Real-time backpressure telemetry surfaced in `stats().disk.backpressure` (`activeWrites`, `pendingWrites`, `spillsDropped`, `circuitState`).
+- **Coordinate vs. Monotonic Time Separation & Epsilon-Fencing** — Strict separation between wall-clock coordinate timestamps and node-local monotonic intervals:
+  - Migrated `L2CircuitBreaker`, local generational tag cache TTL checks (`_getTagVersion`), SWR debounce windows, and latency profiling to `performance.now()`, making internal invariants immune to NTP step adjustments, leap seconds, and container clock skew.
+  - Added `clockSkewToleranceMs` (default `250ms`) with $\epsilon$-fencing in `loadSnapshot` and `loadRemoteSnapshot`, clamping negative durations ($\Delta t = \max(0, \text{now} - \text{remoteWrittenAt})$) and accepting valid cross-node snapshots within the skew tolerance window.
+- **Redis Multiplexing Desync Defense (`redisCommandTimeoutMs`)** — Enforced strict per-command timeouts (default `2,500ms`) with immediate socket destruction and reconnection across Redis Cluster, Sentinel, and standalone clients, preventing delayed server responses from being assigned to subsequent FIFO pipelined requests (eliminating response byte poisoning).
+- **In-Process Chaos Engineering Test Harness (`tests/chaos/`)** — Zero-dependency programmatic chaos harness built purely on `node:net`:
+  - `ChaosTcpProxy` (`tests/chaos/chaos-tcp-proxy.ts`): Simulates network partitions, jittered latency, packet blackholes, and abrupt TCP RST (`socket.destroy(new Error('ECONNRESET'))`) mid-pipeline without Docker or external Toxiproxy daemons.
+  - `DiskChaosInjector` (`tests/chaos/disk-chaos-injector.ts`): Simulates multi-tenant NVMe stalls and intermittent `EIO` / `ENOSPC` disk controller faults.
+  - `tests/chaos/fleet-chaos.test.ts`: 13 comprehensive chaos scenarios validating backpressure shedding, canary circuit-breaker recovery, clock skew tolerance, and network partition resilience.
 - **Node 20 LTS Engine Compatibility (`engines: ">=20.10.0"`)** — Lowered the supported runtime floor from Node $\ge 22.13.0$ to Node $\ge 20.10.0$ by adding safe dynamic module probing in `disk-tier.ts` and `availableParallelism` fallback in `worker-pool.ts`.
 - **`ProcessTerminationBus` with Idle Listener Teardown (`src/cache-service.ts`)** — Centralized OS `SIGTERM`/`SIGINT` handling through a single static bus. Eliminates `MaxListenersExceededWarning` across multi-tenant microservices and ephemeral test runners, and automatically detaches process listeners when the active instance registry drops to zero to prevent test runner event loop hangs.
 - **OpenTelemetry Semantic Conventions & Batch Spans** — Full alignment with OTEL Cache Semantic Conventions:
@@ -24,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Removed Node.js `Buffer` dependency in `src/wasm/bloom-filter-wasm.ts` via chunked `base64ToUint8Array`, making the WASM Bloom filter 100% universal across Cloudflare Workers, Fastly Compute, Vercel Edge, and browsers.
   - Created `Murmur3BloomFilter` and `murmur3_32` (`src/edge/utils/murmur3.ts`) implementing standard 32-bit MurmurHash3 double-hashing with Kirsch-Mitzenmacher bitset probing over a pure `Uint8Array` bit-array.
   - Integrated Bloom filter into `EdgeCacheService` (`bloomFilter: boolean | IEdgeBloomFilter`): ~300ns in-isolate miss rejection completely prevents expensive, metered HTTP subrequests to remote storage (Upstash Redis REST, Cloudflare KV) on 404 routes and randomized bot crawler keys.
-- **Expanded Test Suite** — Added 2 new test suites (`tests/node-redis-adapter.test.ts`, `tests/edge-bloom-filter.test.ts`), bringing the full test suite to **671 passing tests across 61 test files**.
+- **Expanded Test Suite** — Expanded to **684 passing tests across 62 test files** with 100% test pass rate.
 - **`CacheCodec` abstraction (`src/codec.ts`)** — Centralized msgpackr binary serialization engine with built-in record structure deduplication (`useRecords: true`), rich type preservation (`moreTypes: true` for `Set`, `TypedArray`, `Date`, etc.), and strict plain-object map decoding (`mapsAsObjects: true`).
 - **`serializeToJSON` option in `CacheOptions`** — Configurable flag (defaults to `true`) leveraging msgpackr 2.1.0's `useToJSON` capability. Setting `serializeToJSON: false` preserves the object's actual internal properties in durable cache tiers without invoking `.toJSON()`, avoiding accidental HTTP response projections on cached domain entities.
 - **Dedicated test suites** — Added comprehensive coverage for previously untested integration layers, bringing the test suite to 554 tests passing:

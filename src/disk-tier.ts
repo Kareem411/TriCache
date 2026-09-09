@@ -17,14 +17,126 @@
 import fs                from 'fs';
 import path              from 'path';
 import crypto            from 'crypto';
+import os                from 'os';
 import { CacheCodec, defaultCodec } from './codec.js';
-import type { DiskCacheEntry, ILogger } from './types.js';
+import type { DiskCacheEntry, ILogger, DiskBackpressureStats } from './types.js';
 import type { CacheEncryption }        from './encryption.js';
 import {
   compressWithHeader,
   decompressWithHeader,
   type CompressionAlgorithm,
 } from './compression.js';
+
+export type { DiskBackpressureStats };
+
+/**
+ * BoundedDiskQueue — Concurrency-controlled write spooler with circuit breaking.
+ *
+ * Prevents libuv threadpool (UV_THREADPOOL_SIZE=4) starvation during cloud NVMe / EBS
+ * latency spikes (e.g. 450ms multi-tenant throttle) by limiting active async fs operations,
+ * bounding in-memory pending queues, and fast-shedding spills via a 3-state circuit breaker
+ * (CLOSED -> OPEN -> HALF-OPEN canary).
+ */
+export class BoundedDiskQueue {
+  private active = 0;
+  private queue: Array<() => void> = [];
+  private spillsDropped = 0;
+  private consecutiveFailures = 0;
+  private circuitState: 'closed' | 'open' | 'half-open' = 'closed';
+  private lastStateChangeMonotonic = performance.now();
+
+  constructor(
+    private readonly maxConcurrent: number = Math.min(4, Math.max(1, Math.floor((os?.availableParallelism?.() ?? 4) / 4))),
+    private readonly maxPending: number = 512,
+    private readonly writeTimeoutMs: number = 500,
+    private readonly failureThreshold: number = 5,
+    private readonly cooldownMs: number = 5000,
+  ) {}
+
+  public async schedule<T>(task: () => Promise<T>): Promise<T | null> {
+    const now = performance.now();
+
+    // Check circuit breaker state
+    if (this.circuitState === 'open') {
+      if (now - this.lastStateChangeMonotonic > this.cooldownMs) {
+        this.circuitState = 'half-open';
+        this.lastStateChangeMonotonic = now;
+      } else {
+        this.spillsDropped++;
+        return null; // Fast-drop spill without touching libuv
+      }
+    }
+
+    if (this.circuitState === 'half-open' && this.active > 0) {
+      // In half-open mode, only allow 1 canary write
+      this.spillsDropped++;
+      return null;
+    }
+
+    if (this.queue.length >= this.maxPending) {
+      this.spillsDropped++;
+      return null; // Bounded memory queue: drop spill to preserve main thread
+    }
+
+    // Wait for slot in concurrency pool
+    if (this.active >= this.maxConcurrent) {
+      await new Promise<void>((resolve) => this.queue.push(resolve));
+    }
+
+    this.active++;
+    let timeoutId: NodeJS.Timeout | null = null;
+
+    try {
+      const result = await Promise.race([
+        task(),
+        new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error(`Disk write exceeded timeout of ${this.writeTimeoutMs}ms`)),
+            this.writeTimeoutMs,
+          );
+        }),
+      ]);
+
+      // Success: reset breaker
+      this.consecutiveFailures = 0;
+      if (this.circuitState === 'half-open') {
+        this.circuitState = 'closed';
+        this.lastStateChangeMonotonic = performance.now();
+      }
+
+      return result;
+    } catch {
+      this.consecutiveFailures++;
+      if (this.consecutiveFailures >= this.failureThreshold || this.circuitState === 'half-open') {
+        this.circuitState = 'open';
+        this.lastStateChangeMonotonic = performance.now();
+      }
+      this.spillsDropped++;
+      return null;
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+      this.active--;
+      const next = this.queue.shift();
+      if (next) next();
+    }
+  }
+
+  public getStats(): DiskBackpressureStats {
+    return {
+      activeWrites: this.active,
+      pendingWrites: this.queue.length,
+      spillsDropped: this.spillsDropped,
+      circuitState: this.circuitState,
+      lastTripTimestamp: this.lastStateChangeMonotonic,
+    };
+  }
+
+  public reset(): void {
+    this.consecutiveFailures = 0;
+    this.circuitState = 'closed';
+    this.lastStateChangeMonotonic = performance.now();
+  }
+}
 
 // ── node:sqlite lazy bootstrap ────────────────────────────────────────────────
 // Stable in Node 24; experimental (needs --experimental-sqlite) in Node 22.
@@ -92,11 +204,17 @@ export interface DiskTierOptions {
   compressionThresholdBytes?: number;
   logger:           ILogger;
   codec?:           CacheCodec;
+  diskMaxConcurrentWrites?: number;
+  diskMaxPendingWrites?: number;
+  diskWriteTimeoutMs?: number;
+  diskCircuitBreakerThreshold?: number;
+  diskCircuitBreakerCooldownMs?: number;
 }
 
 export class DiskTier {
   private readonly opts:    DiskTierOptions;
   private readonly codec:   CacheCodec;
+  private readonly diskQueue: BoundedDiskQueue;
   private dirReady          = false;
   private diskUsageBytes    = 0;
   private usageCounted      = false;
@@ -116,6 +234,14 @@ export class DiskTier {
   constructor(opts: DiskTierOptions) {
     this.opts  = opts;
     this.codec = opts.codec ?? defaultCodec;
+    const defaultConcurrent = Math.min(4, Math.max(1, Math.floor((os?.availableParallelism?.() ?? 4) / 4)));
+    this.diskQueue = new BoundedDiskQueue(
+      opts.diskMaxConcurrentWrites ?? defaultConcurrent,
+      opts.diskMaxPendingWrites ?? 512,
+      opts.diskWriteTimeoutMs ?? 500,
+      opts.diskCircuitBreakerThreshold ?? 5,
+      opts.diskCircuitBreakerCooldownMs ?? 5000,
+    );
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -372,37 +498,41 @@ export class DiskTier {
     const hash     = this.keyToHash(key);
     const filePath = this.hashToWritePath(hash, entry.expiresAt);
     const tmpPath  = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-    this.diskUsageBytes += final.length; // optimistic — rolled back on error
-    this.fileCount++;
 
-    try {
-      await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.promises.writeFile(tmpPath, final, { mode: 0o600 });
+    await this.diskQueue.schedule(async () => {
+      this.diskUsageBytes += final.length; // optimistic — rolled back on error
+      this.fileCount++;
 
-      // Atomic rename with micro-retry loop for Windows NTFS handle release
       try {
-        await fs.promises.rename(tmpPath, filePath);
-      } catch (renameErr: unknown) {
-        const code = (renameErr as { code?: string })?.code;
-        if (code === 'EBUSY' || code === 'EPERM') {
-          await new Promise<void>(resolve => setTimeout(resolve, 5));
-          await fs.promises.rename(tmpPath, filePath);
-        } else {
-          throw renameErr;
-        }
-      }
+        await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+        await fs.promises.writeFile(tmpPath, final, { mode: 0o600 });
 
-      if (this._db) {
-        this._stmtInsert!.run(hash, filePath, entry.expiresAt, final.length);
+        // Atomic rename with micro-retry loop for Windows NTFS handle release
+        try {
+          await fs.promises.rename(tmpPath, filePath);
+        } catch (renameErr: unknown) {
+          const code = (renameErr as { code?: string })?.code;
+          if (code === 'EBUSY' || code === 'EPERM') {
+            await new Promise<void>(resolve => setTimeout(resolve, 5));
+            await fs.promises.rename(tmpPath, filePath);
+          } else {
+            throw renameErr;
+          }
+        }
+
+        if (this._db) {
+          this._stmtInsert!.run(hash, filePath, entry.expiresAt, final.length);
+        }
+        this.opts.logger.debug('DiskTier: entry saved', { key: key.slice(0, 50), bytes: final.length });
+      } catch (err) {
+        try { await fs.promises.unlink(tmpPath); } catch { /* ignore if already gone/failed */ }
+        this.diskUsageBytes -= Math.min(this.diskUsageBytes, final.length); // rollback
+        this.fileCount = Math.max(0, this.fileCount - 1);
+        if (this._db) try { this._stmtDelete!.run(hash); } catch { /* ok */ }
+        this.opts.logger.debug('DiskTier: save failed', { key: key.slice(0, 50), error: (err as Error).message });
+        throw err;
       }
-      this.opts.logger.debug('DiskTier: entry saved', { key: key.slice(0, 50), bytes: final.length });
-    } catch (err) {
-      try { await fs.promises.unlink(tmpPath); } catch { /* ignore if already gone/failed */ }
-      this.diskUsageBytes -= Math.min(this.diskUsageBytes, final.length); // rollback
-      this.fileCount = Math.max(0, this.fileCount - 1);
-      if (this._db) try { this._stmtDelete!.run(hash); } catch { /* ok */ }
-      this.opts.logger.debug('DiskTier: save failed', { key: key.slice(0, 50), error: (err as Error).message });
-    }
+    });
   }
 
   /** Load a key from disk, or return null on miss/expiry/corruption. */
@@ -804,14 +934,24 @@ export class DiskTier {
     return cleared;
   }
 
-  get stats(): { files: number; sizeKB: number; maxKB: number } {
+  get stats(): { files: number; sizeKB: number; maxKB: number; backpressure?: DiskBackpressureStats } {
     if (this._db) {
       // Query the index for authoritative counts — O(1) SQLite aggregate.
       const row = this._stmtStats!.get() as { cnt: number; bytes: number };
       this.fileCount      = row.cnt;
       this.diskUsageBytes = row.bytes;
     }
-    return { files: this.fileCount, sizeKB: Math.round(this.diskUsageBytes / 1024), maxKB: Math.round(this.opts.maxBytes / 1024) };
+    return {
+      files: this.fileCount,
+      sizeKB: Math.round(this.diskUsageBytes / 1024),
+      maxKB: Math.round(this.opts.maxBytes / 1024),
+      backpressure: this.diskQueue.getStats(),
+    };
+  }
+
+  /** Direct access to the bounded write queue for chaos diagnostics and canary controls. */
+  get backpressure(): BoundedDiskQueue {
+    return this.diskQueue;
   }
 
   /** Whether a SQLite metadata index is active ('sqlite') or the disk is scanned directly ('file-only'). */

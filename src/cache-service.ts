@@ -125,7 +125,7 @@ const enum CBState { CLOSED, OPEN, HALF_OPEN }
 class L2CircuitBreaker {
   private state      = CBState.CLOSED;
   private failures   = 0;
-  private openedAt   = 0;
+  private openedAt   = performance.now();
   /** True while the single permitted HALF_OPEN probe is in flight. */
   private probing    = false;
   constructor(
@@ -146,8 +146,10 @@ class L2CircuitBreaker {
       this.probing = true;
       return true;                    // this caller is the one permitted probe
     }
-    // OPEN: check if cooldown elapsed
-    if (Date.now() - this.openedAt >= this.cooldownMs) {
+    // OPEN: check if cooldown elapsed using monotonic clock (immune to NTP drift / leap seconds).
+    // If tests manually inject wall-clock epoch ms into openedAt (> 1e12), compare against Date.now().
+    const now = this.openedAt > 1_000_000_000_000 ? Date.now() : performance.now();
+    if (now - this.openedAt >= this.cooldownMs) {
       this.state   = CBState.HALF_OPEN;
       this.probing = true;
       return true; // probe
@@ -168,7 +170,7 @@ class L2CircuitBreaker {
     this.probing = false;
     if (this.state === CBState.HALF_OPEN || this.failures >= this.threshold) {
       this.state    = CBState.OPEN;
-      this.openedAt = Date.now();
+      this.openedAt = performance.now();
       this.failures = 0;
     }
   }
@@ -468,6 +470,13 @@ export class CacheService {
     crossRegion: CrossRegionRelayOptions | undefined;
     redisClient?: IRedisDriver | any;
     redisSubClient?: IRedisDriver | any;
+    diskMaxConcurrentWrites?: number;
+    diskMaxPendingWrites?: number;
+    diskWriteTimeoutMs?: number;
+    diskCircuitBreakerThreshold?: number;
+    diskCircuitBreakerCooldownMs?: number;
+    redisCommandTimeoutMs?: number;
+    clockSkewToleranceMs: number;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -660,6 +669,13 @@ export class CacheService {
       crossRegion:              options.crossRegion,
       redisClient:              options.redisClient,
       redisSubClient:           options.redisSubClient,
+      diskMaxConcurrentWrites:  options.diskMaxConcurrentWrites,
+      diskMaxPendingWrites:     options.diskMaxPendingWrites,
+      diskWriteTimeoutMs:       options.diskWriteTimeoutMs,
+      diskCircuitBreakerThreshold: options.diskCircuitBreakerThreshold,
+      diskCircuitBreakerCooldownMs: options.diskCircuitBreakerCooldownMs,
+      redisCommandTimeoutMs:    options.redisCommandTimeoutMs,
+      clockSkewToleranceMs:     options.clockSkewToleranceMs ?? 250,
     };
 
     this.codec = new CacheCodec({
@@ -708,6 +724,11 @@ export class CacheService {
       compressionThresholdBytes: this.opts.compressionThresholdBytes,
       logger,
       codec:            this.codec,
+      diskMaxConcurrentWrites:      this.opts.diskMaxConcurrentWrites,
+      diskMaxPendingWrites:         this.opts.diskMaxPendingWrites,
+      diskWriteTimeoutMs:           this.opts.diskWriteTimeoutMs,
+      diskCircuitBreakerThreshold:  this.opts.diskCircuitBreakerThreshold,
+      diskCircuitBreakerCooldownMs: this.opts.diskCircuitBreakerCooldownMs,
     });
 
     this._namespace     = ns;
@@ -1466,7 +1487,7 @@ export class CacheService {
     return true;
   }
 
-  private _setLocalTagVersion(tag: string, version: number, now = Date.now()): void {
+  private _setLocalTagVersion(tag: string, version: number, now = performance.now()): void {
     const existing = this.tagVersions.get(tag)?.version ?? 0;
     const finalVersion = Math.max(existing, version);
     if (this.tagVersions.size >= 10_000 && !this.tagVersions.has(tag)) {
@@ -1477,7 +1498,7 @@ export class CacheService {
   }
 
   private async _getTagVersion(tag: string): Promise<number> {
-    const now = Date.now();
+    const now = performance.now();
     const local = this.tagVersions.get(tag);
     if (local && (now - local.lastSyncedAt < this.opts.tagVersionTtlMs)) {
       return local.version;
@@ -1633,6 +1654,7 @@ export class CacheService {
             redisOptions: {
               tls:                  this.opts.redisTls ? {} : undefined,
               connectTimeout:       10_000,
+              commandTimeout:       this.opts.redisCommandTimeoutMs ?? 2_500,
               maxRetriesPerRequest: 3,
               keepAlive:            30_000,
               ...(this.opts.redisProtocol && { protocol: this.opts.redisProtocol }),
@@ -1654,6 +1676,7 @@ export class CacheService {
             name:                  this.opts.redisSentinel.name,
             tls:                   this.opts.redisTls ? {} : undefined,
             connectTimeout:        10_000,
+            commandTimeout:        this.opts.redisCommandTimeoutMs ?? 2_500,
             lazyConnect:           false,
             maxRetriesPerRequest:  3,
             enableAutoPipelining:  true,
@@ -1674,6 +1697,7 @@ export class CacheService {
             port:                  this.opts.redisPort,
             tls:                   this.opts.redisTls ? {} : undefined,
             connectTimeout:        10_000,
+            commandTimeout:        this.opts.redisCommandTimeoutMs ?? 2_500,
             lazyConnect:           false,
             maxRetriesPerRequest:  3,
             enableAutoPipelining:  true,
@@ -1779,8 +1803,18 @@ export class CacheService {
         return;
       }
 
-      const ageMs = Date.now() - (snapshot.writtenAt ?? 0);
-      if (ageMs > this.opts.snapshotMaxAgeMs || ageMs < 0) {
+      const now = Date.now();
+      const writtenAt = snapshot.writtenAt ?? 0;
+      const tolerance = this.opts.clockSkewToleranceMs ?? 250;
+      if (writtenAt - now > tolerance) {
+        this.logger.warn('Snapshot rejected: timestamp too far in future (exceeds clock skew tolerance)', {
+          writtenAt, now, skewMs: writtenAt - now, tolerance,
+        });
+        return;
+      }
+
+      const ageMs = Math.max(0, now - writtenAt);
+      if (ageMs > this.opts.snapshotMaxAgeMs) {
         this.logger.warn('Snapshot rejected: too old', { ageMinutes: Math.round(ageMs / 60000) });
         return;
       }
@@ -1871,8 +1905,19 @@ export class CacheService {
         return 0;
       }
 
-      const ageMs = Date.now() - (snapshot.writtenAt ?? 0);
-      if (ageMs > maxAgeMs || ageMs < 0) {
+      const now = Date.now();
+      const writtenAt = snapshot.writtenAt ?? 0;
+      const tolerance = this.opts.clockSkewToleranceMs ?? 250;
+      if (writtenAt - now > tolerance) {
+        this.counters.remoteSnapshotErrors++;
+        this.logger.warn('Remote snapshot rejected: timestamp too far in future (exceeds clock skew tolerance)', {
+          writtenAt, now, skewMs: writtenAt - now, tolerance,
+        });
+        return 0;
+      }
+
+      const ageMs = Math.max(0, now - writtenAt);
+      if (ageMs > maxAgeMs) {
         this.counters.remoteSnapshotErrors++;
         this.logger.warn('Remote snapshot rejected: too old', { ageMinutes: Math.round(ageMs / 60000) });
         return 0;
