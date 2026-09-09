@@ -67,6 +67,14 @@
       "types": "./dist/dashboard/index.d.ts",
       "import": "./dist/dashboard/index.js",
       "require": "./dist/dashboard/index.cjs"
+    },
+    "./edge": {
+      "edge-light": "./dist/edge/index.js",
+      "workerd": "./dist/edge/index.js",
+      "types": "./dist/edge/index.d.ts",
+      "import": "./dist/edge/index.js",
+      "require": "./dist/edge/index.cjs",
+      "default": "./dist/edge/index.js"
     }
   },
   "files": [
@@ -78,7 +86,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup src/index.ts src/cli.ts src/serialize-worker.ts src/next/index.ts src/nestjs/index.ts src/prisma/index.ts src/drizzle/index.ts src/http/index.ts src/dashboard/index.ts --format esm,cjs --dts --clean",
+    "build": "tsup src/index.ts src/cli.ts src/serialize-worker.ts src/next/index.ts src/nestjs/index.ts src/prisma/index.ts src/drizzle/index.ts src/http/index.ts src/dashboard/index.ts src/edge/index.ts --format esm,cjs --dts --clean",
     "postbuild": "node --input-type=module -e \"import{readdirSync,rmSync,statSync}from'fs';import{join}from'path';function clean(d){for(const f of readdirSync(d)){const p=join(d,f);if(statSync(p).isDirectory())clean(p);else if(p.endsWith('.d.cts'))rmSync(p,{force:true});}}clean('dist');\"",
     "dev": "tsup src/index.ts src/serialize-worker.ts --format esm,cjs --dts --watch",
     "typecheck": "tsc --noEmit",

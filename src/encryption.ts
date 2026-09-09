@@ -201,20 +201,20 @@ export class CacheEncryption {
         throw new Error('XOR key must be at least 1 byte');
       }
       this._key = buf;
-      if (mode !== 'xor') {
+      if (resolvedMode !== 'xor') {
         this._keyObj = createSecretKey(buf);
         // Pre-warm OpenSSL's lazy key-schedule cache: first use of a KeyObject is slower
         // because OpenSSL initialises internal state on demand. Paying that cost now
         // (at construction) guarantees every production encrypt/decrypt call is fast.
         const _wc = createCipheriv(
-          mode,
+          resolvedMode,
           this._keyObj,
-          Buffer.alloc(mode === 'aes-128-ctr' ? CTR_IV_BYTES : IV_BYTES),
+          Buffer.alloc(resolvedMode === 'aes-128-ctr' ? CTR_IV_BYTES : IV_BYTES),
         );
         _wc.update(Buffer.alloc(0));
         _wc.final();
       }
-      if (mode === 'xor') {
+      if (resolvedMode === 'xor') {
         logger.warn(
           'Cache obfuscation enabled (XOR). WARNING: XOR is NOT cryptographic — use only for dev or non-sensitive data.',
         );

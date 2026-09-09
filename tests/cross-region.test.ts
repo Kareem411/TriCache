@@ -274,8 +274,11 @@ describe('Multi-Cluster / Cross-Region Invalidation Relay (Gap 4)', () => {
       // Invalidate on US cache -> should POST to EU webhook -> evicts on EU cache
       await cacheUS.delete('user:500');
 
-      // Allow event loop tick for HTTP dispatch
-      await new Promise(r => setTimeout(r, 50));
+      // Allow event loop ticks for HTTP dispatch
+      for (let i = 0; i < 30; i++) {
+        if ((cacheEU.metrics().crossRegion?.received ?? 0) >= 1) break;
+        await new Promise(r => setTimeout(r, 25));
+      }
 
       let euFetched = false;
       await cacheEU.get('user:500', async () => {
