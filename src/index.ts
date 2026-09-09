@@ -24,6 +24,14 @@ export { DiskTier }            from './disk-tier';
 export { WasmBloomFilter }     from './wasm/bloom-filter-wasm';
 export { type CompressionAlgorithm } from './compression';
 export { CacheCodec, defaultCodec, type CacheCodecOptions } from './codec';
+export {
+  createHttpSnapshotAdapter,
+  createCustomSnapshotAdapter,
+  createMemorySnapshotAdapter,
+  type IRemoteSnapshotAdapter,
+  type RemoteSnapshotOptions,
+  type HttpSnapshotAdapterOptions,
+} from './remote-snapshot';
 
 export {
   CachePriority,

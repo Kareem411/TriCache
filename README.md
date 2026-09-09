@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-554%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-563%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 22](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org)
@@ -354,6 +354,15 @@ CacheService.create({
   snapshotMaxAgeMs:          2 * 60 * 60 * 1000,  // 2 hours (default)
   forbiddenSnapshotPrefixes: ['auth:', 'session:', 'mfa:', 'rate_limit:'],
 
+  // ── Remote blob snapshot (stateless containers / Kubernetes / Cloud Run) ─
+  // Hydrates L1 from S3, Cloudflare R2, GCS, or HTTP before accepting traffic.
+  // remoteSnapshot: {
+  //   adapter: createHttpSnapshotAdapter({ getUrl: 'https://s3.amazonaws.com/...presigned-get' }),
+  //   maxAgeMs: 2 * 60 * 60 * 1000,
+  //   saveOnShutdown: true,
+  //   intervalMs: 5 * 60 * 1000, // periodic background sync every 5 min
+  // },
+
   // ── Metrics callback ─────────────────────────────────────────────────
   metricsIntervalMs: 60_000,                       // emit every 60 s (default)
   onMetrics: (m) => myMonitoring.record(m),        // optional push callback
@@ -643,6 +652,30 @@ process.on('SIGTERM', async () => {
   await cache.writeSnapshot(`/backups/cache-${Date.now()}.snap`);
   process.exit(0);
 });
+```
+
+### `await cache.ready()` → `Promise<void>`
+
+Waits until cold-start hydration (remote blob snapshot hydration and/or `warmKeys` L2 warming) completes. Gate your HTTP listener or Kubernetes readiness probe on this promise to guarantee zero cold-cache traffic spikes.
+
+```typescript
+const cache = CacheService.create({ remoteSnapshot: { adapter: httpAdapter } });
+
+// Gate HTTP traffic until L1 is fully hydrated from remote blob storage
+await cache.ready();
+app.listen(3000);
+```
+
+### `await cache.writeRemoteSnapshot()` → `Promise<boolean>` / `await cache.loadRemoteSnapshot()` → `Promise<number>`
+
+Explicitly export/import L1 snapshots to/from remote blob storage (S3, Cloudflare R2, GCS, Azure, HTTP). Useful for Kubernetes `preStop` hooks or NestJS `onApplicationShutdown` lifecycle events:
+
+```typescript
+// NestJS graceful shutdown lifecycle hook
+async onApplicationShutdown() {
+  await cache.writeRemoteSnapshot();
+  await cache.destroy();
+}
 ```
 
 ### `cache.keys()` → `Generator<string>`
@@ -1248,6 +1281,78 @@ When disk is disabled:
 - `loadSnapshot()` and `writeSnapshot()` are skipped.
 - The background disk janitor timer is not started.
 - `metrics().disk.disabled` is `true`.
+
+### 🚀 Remote Blob Storage Cold-Start Hydration (S3, Cloudflare R2, GCS, HTTP)
+
+In modern container architectures (Kubernetes, AWS ECS/Fargate, Google Cloud Run, Fly.io), local filesystems are ephemeral and wiped across rolling deployments.
+
+TriCache provides **Remote Snapshot Hydration** to persist L1 RAM snapshots to remote object storage and restore them in milliseconds during new pod/container spin-up:
+
+```typescript
+import { CacheService, createHttpSnapshotAdapter } from 'tricache';
+
+// Zero-dependency HTTP adapter (Node 22 native fetch)
+// Works directly with S3/R2 presigned URLs or internal storage webhooks
+const httpAdapter = createHttpSnapshotAdapter({
+  getUrl: process.env.SNAPSHOT_GET_PRESIGNED_URL!,
+  putUrl: process.env.SNAPSHOT_PUT_PRESIGNED_URL!,
+});
+
+const cache = CacheService.create({
+  disableDisk: true, // stateless container
+  remoteSnapshot: {
+    adapter: httpAdapter,
+    maxAgeMs: 2 * 60 * 60 * 1000, // reject snapshots older than 2 hours
+    saveOnShutdown: true,          // trigger async upload on SIGTERM/SIGINT
+    intervalMs: 5 * 60 * 1000,     // background periodic upload every 5 minutes
+  },
+});
+
+// Gate your Kubernetes readiness probe or HTTP listener until L1 RAM is warm!
+await cache.ready();
+app.listen(3000);
+```
+
+#### Custom Cloud SDK Adapter (AWS S3, Google Cloud Storage, Azure Blob)
+
+To use your existing `@aws-sdk/client-s3` or `@google-cloud/storage` clients directly:
+
+```typescript
+import { CacheService, createCustomSnapshotAdapter } from 'tricache';
+import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+
+const s3 = new S3Client({ region: 'us-east-1' });
+
+const s3Adapter = createCustomSnapshotAdapter({
+  async get() {
+    try {
+      const res = await s3.send(new GetObjectCommand({
+        Bucket: 'my-cache-snapshots',
+        Key: 'production-l1.snap',
+      }));
+      const ab = await res.Body?.transformToByteArray();
+      return ab ? Buffer.from(ab) : null;
+    } catch (e: any) {
+      if (e.name === 'NoSuchKey') return null;
+      throw e;
+    }
+  },
+  async put(data: Buffer) {
+    await s3.send(new PutObjectCommand({
+      Bucket: 'my-cache-snapshots',
+      Key: 'production-l1.snap',
+      Body: data,
+    }));
+  },
+});
+
+const cache = CacheService.create({
+  remoteSnapshot: { adapter: s3Adapter },
+});
+```
+
+- **Encryption at rest**: When `encryptionKey` is configured, remote snapshots are automatically encrypted with AES-256-GCM before upload, keeping your remote storage compliant with SOC2/HIPAA.
+- **Fail-safe**: If the remote blob is missing (first deploy) or corrupted, TriCache logs a warning, starts cold, and continues serving requests without interruption.
 
 ---
 

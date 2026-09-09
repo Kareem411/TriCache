@@ -18,6 +18,7 @@
 
 import { Redis as RedisClient, Cluster as RedisCluster } from 'ioredis';
 import { CacheCodec } from './codec.js';
+import type { RemoteSnapshotOptions } from './remote-snapshot.js';
 import crypto from 'crypto';
 import os    from 'os';
 import { WorkerPool } from './worker-pool.js';
@@ -407,6 +408,7 @@ export class CacheService {
     backplaneStreamBlockMs: number;
     backplaneStreamKey?: string;
     serializeToJSON: boolean;
+    remoteSnapshot: RemoteSnapshotOptions | undefined;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -437,6 +439,7 @@ export class CacheService {
   private diskJanitorInterval: ReturnType<typeof setInterval> | null = null;
   private oomInterval:         ReturnType<typeof setInterval> | null = null;
   private metricsInterval:     ReturnType<typeof setInterval> | null = null;
+  private remoteSnapshotInterval: ReturnType<typeof setInterval> | null = null;
   private _shutdownHandler:    (() => void) | null = null;
   private latencyTracker: LatencyTracker | null = null;
   private readonly instanceId:       string;
@@ -473,6 +476,11 @@ export class CacheService {
     startedAt:        Date.now(),
     bloomChecks:      0,
     bloomFalsePositives: 0,
+    remoteSnapshotUploads:    0,
+    remoteSnapshotDownloads:  0,
+    remoteSnapshotErrors:     0,
+    remoteSnapshotLastUploadedAt:   null as number | null,
+    remoteSnapshotLastDownloadedAt: null as number | null,
   };
 
   /** One-time guard so the in-process increment() fallback warning fires only once. */
@@ -583,6 +591,7 @@ export class CacheService {
       backplaneStreamBlockMs:   options.backplaneStreamBlockMs ?? 2_000,
       backplaneStreamKey:       options.backplaneStreamKey,
       serializeToJSON:          options.serializeToJSON ?? true,
+      remoteSnapshot:           options.remoteSnapshot,
     };
 
     this.codec = new CacheCodec({
@@ -667,7 +676,12 @@ export class CacheService {
     // Graceful shutdown: persist L1 to disk. The library must NEVER call
     // process.exit() — that decision belongs to the host application (kills
     // Kubernetes graceful drain, NestJS onApplicationShutdown, pool drains).
-    this._shutdownHandler = () => { if (!this._diskDisabled) this.writeSnapshot(); };
+    this._shutdownHandler = () => {
+      if (!this._diskDisabled) this.writeSnapshot();
+      if (this.opts.remoteSnapshot && this.opts.remoteSnapshot.saveOnShutdown !== false) {
+        void this.writeRemoteSnapshot();
+      }
+    };
     process.once('SIGTERM', this._shutdownHandler);
     process.once('SIGINT',  this._shutdownHandler);
 
@@ -743,15 +757,30 @@ export class CacheService {
       if (this.metricsInterval.unref) this.metricsInterval.unref();
     }
 
+    // Periodic remote snapshot upload (if configured)
+    if (this.opts.remoteSnapshot?.intervalMs && this.opts.remoteSnapshot.intervalMs > 0) {
+      this.remoteSnapshotInterval = setInterval(() => {
+        void this.writeRemoteSnapshot();
+      }, this.opts.remoteSnapshot.intervalMs);
+      if (this.remoteSnapshotInterval.unref) this.remoteSnapshotInterval.unref();
+    }
+
     // Backplane: assign instance ID + channel + streamKey, then subscribe
     this.instanceId         = crypto.randomBytes(8).toString('hex');
     this.backplaneChannel   = `tricache:inv${ns ? ':' + ns : ''}`;
     this.backplaneStreamKey = options.backplaneStreamKey ?? `tricache:stream:{${ns || 'default'}}`;
     this.initBackplane();
 
-    // Auto-warm from L2 if warmKeys is configured; ready() waits for completion.
+    // Auto-warm from remote snapshot or L2 if configured; ready() waits for completion.
+    const startupPromises: Promise<void>[] = [];
+    if (this.opts.remoteSnapshot) {
+      startupPromises.push(this.loadRemoteSnapshot().then(() => undefined));
+    }
     if (this.opts.warmKeys) {
-      this._readyPromise = this.warmFromL2(this.opts.warmKeys).then(() => undefined);
+      startupPromises.push(this.warmFromL2(this.opts.warmKeys).then(() => undefined));
+    }
+    if (startupPromises.length > 0) {
+      this._readyPromise = Promise.all(startupPromises).then(() => undefined);
     }
 
     // Native OpenTelemetry metrics integration
@@ -870,6 +899,7 @@ export class CacheService {
       adaptiveTtl:         o.adaptiveTtl,
       invalidationBackplane: o.invalidationBackplane,
       strictSingleton:     o.strictSingleton,
+      remoteSnapshot:      o.remoteSnapshot,
     } as CacheOptions;
   }
 
@@ -1561,6 +1591,105 @@ export class CacheService {
     } catch (err) {
       this.logger.warn('Snapshot load failed — starting cold', { error: (err as Error).message });
       try { fs.unlinkSync(snapshotPath); } catch { /* ok */ }
+    }
+  }
+
+  // ── Remote Snapshot (cold-start persistence for stateless containers) ───────
+
+  /**
+   * Persists the cold-start snapshot to remote blob storage (S3, GCS, R2, HTTP).
+   * Can be awaited during graceful application shutdown (e.g. Kubernetes preStop or NestJS shutdown).
+   * Returns true if a snapshot was successfully exported and written; false otherwise.
+   */
+  async writeRemoteSnapshot(): Promise<boolean> {
+    if (!this.opts.remoteSnapshot) return false;
+    try {
+      const entries = this.l1.exportEntries(this.opts.forbiddenSnapshotPrefixes);
+      if (entries.length === 0) return false;
+
+      const payload = { version: SNAPSHOT_VERSION, writtenAt: Date.now(), entries };
+      const packed  = this.codec.encode(payload);
+      const final   = this.enc.isEnabled ? this.enc.encryptBuffer(packed) : packed;
+
+      await this.opts.remoteSnapshot.adapter.put(final);
+      this.counters.remoteSnapshotUploads++;
+      this.counters.remoteSnapshotLastUploadedAt = Date.now();
+      this.logger.info('Remote cache snapshot uploaded', {
+        entries:   entries.length,
+        sizeKB:    Math.round(final.length / 1024),
+        encrypted: this.enc.isEnabled,
+      });
+      return true;
+    } catch (err) {
+      this.counters.remoteSnapshotErrors++;
+      this.logger.warn('Remote cache snapshot upload failed', { error: (err as Error).message });
+      return false;
+    }
+  }
+
+  /**
+   * Hydrates L1 memory from remote blob storage (S3, GCS, R2, HTTP).
+   * Called automatically during startup (chained into `cache.ready()`).
+   * Returns the number of entries successfully imported.
+   */
+  async loadRemoteSnapshot(): Promise<number> {
+    if (!this.opts.remoteSnapshot) return 0;
+    const maxAgeMs = this.opts.remoteSnapshot.maxAgeMs ?? this.opts.snapshotMaxAgeMs ?? DEFAULT_SNAPSHOT_MAX_AGE;
+    try {
+      const raw = await this.opts.remoteSnapshot.adapter.get();
+      if (!raw || raw.length === 0) {
+        this.logger.debug('Remote snapshot not found or empty — starting cold');
+        return 0;
+      }
+
+      const rawBuf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+      let buf: Buffer;
+      try {
+        buf = this.enc.decryptBuffer(rawBuf);
+      } catch (e) {
+        this.counters.remoteSnapshotErrors++;
+        this.logger.warn('Remote snapshot rejected: decryption failed', { error: (e as Error).message });
+        return 0;
+      }
+
+      const snapshot = this.codec.decode(buf) as {
+        version?: number;
+        writtenAt?: number;
+        entries?: Array<{ key: string; entry: SmartCacheEntry }>;
+      };
+
+      if (!snapshot || snapshot.version !== SNAPSHOT_VERSION) {
+        this.counters.remoteSnapshotErrors++;
+        this.logger.warn('Remote snapshot rejected: version mismatch', { got: snapshot?.version });
+        return 0;
+      }
+
+      const ageMs = Date.now() - (snapshot.writtenAt ?? 0);
+      if (ageMs > maxAgeMs || ageMs < 0) {
+        this.counters.remoteSnapshotErrors++;
+        this.logger.warn('Remote snapshot rejected: too old', { ageMinutes: Math.round(ageMs / 60000) });
+        return 0;
+      }
+
+      if (!Array.isArray(snapshot.entries)) {
+        this.counters.remoteSnapshotErrors++;
+        this.logger.warn('Remote snapshot rejected: entries is not an array');
+        return 0;
+      }
+
+      const loaded = this.l1.importEntries(snapshot.entries, this.opts.forbiddenSnapshotPrefixes);
+      this.counters.remoteSnapshotDownloads++;
+      this.counters.remoteSnapshotLastDownloadedAt = Date.now();
+      this.logger.info('Remote cache snapshot loaded (L1 hydrated)', {
+        loaded,
+        total:  snapshot.entries.length,
+        sizeKB: this.l1.getStats().sizeKB,
+      });
+      return loaded;
+    } catch (err) {
+      this.counters.remoteSnapshotErrors++;
+      this.logger.warn('Remote snapshot load failed — starting cold', { error: (err as Error).message });
+      return 0;
     }
   }
 
@@ -3195,6 +3324,16 @@ export class CacheService {
         evictions:       c.oomEvictions,
         lastTriggeredAt: c.oomLastAt,
       },
+      ...(this.opts.remoteSnapshot && {
+        remoteSnapshot: {
+          enabled: true,
+          uploads: c.remoteSnapshotUploads,
+          downloads: c.remoteSnapshotDownloads,
+          errors: c.remoteSnapshotErrors,
+          lastUploadedAt: c.remoteSnapshotLastUploadedAt,
+          lastDownloadedAt: c.remoteSnapshotLastDownloadedAt,
+        },
+      }),
 
       l1: {
         entries:   l1s.entries,
@@ -3274,6 +3413,11 @@ export class CacheService {
       counter('oom_evictions', m.oom.evictions,
         'Emergency L1 eviction rounds triggered by heap pressure');
     }
+    if (m.remoteSnapshot?.enabled) {
+      counter('remote_snapshot_uploads',   m.remoteSnapshot.uploads,   'Total remote snapshot uploads');
+      counter('remote_snapshot_downloads', m.remoteSnapshot.downloads, 'Total remote snapshot downloads');
+      counter('remote_snapshot_errors',    m.remoteSnapshot.errors,    'Total remote snapshot errors');
+    }
 
     return lines.join('\n');
   }
@@ -3296,10 +3440,14 @@ export class CacheService {
   /** Close Redis connections and stop all background timers. */
   async destroy(): Promise<void> {
     this._destroyed = true;
-    if (this.cleanupInterval)     clearInterval(this.cleanupInterval);
-    if (this.diskJanitorInterval)  clearInterval(this.diskJanitorInterval);
-    if (this.oomInterval)          clearInterval(this.oomInterval);
-    if (this.metricsInterval)      clearInterval(this.metricsInterval);
+    if (this.cleanupInterval)        clearInterval(this.cleanupInterval);
+    if (this.diskJanitorInterval)     clearInterval(this.diskJanitorInterval);
+    if (this.oomInterval)             clearInterval(this.oomInterval);
+    if (this.metricsInterval)         clearInterval(this.metricsInterval);
+    if (this.remoteSnapshotInterval) {
+      clearInterval(this.remoteSnapshotInterval);
+      this.remoteSnapshotInterval = null;
+    }
     if (this._shutdownHandler) {
       process.off('SIGTERM', this._shutdownHandler);
       process.off('SIGINT',  this._shutdownHandler);

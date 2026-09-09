@@ -1,3 +1,5 @@
+import type { RemoteSnapshotOptions } from './remote-snapshot';
+
 /**
  * tricache — shared types and interfaces
  */
@@ -250,6 +252,16 @@ export interface CacheMetrics {
     lastTriggeredAt: number | null;
   };
 
+  /** Remote snapshot statistics — present when remoteSnapshot is configured */
+  remoteSnapshot?: {
+    enabled: boolean;
+    uploads: number;
+    downloads: number;
+    errors: number;
+    lastUploadedAt: number | null;
+    lastDownloadedAt: number | null;
+  };
+
   l1:   { entries: number; sizeBytes: number; maxBytes: number };
   disk: { files: number; sizeKB: number; maxKB: number; disabled: boolean };
 
@@ -415,6 +427,11 @@ export interface CacheOptions {
    * Max age (ms) of a snapshot file before it is rejected. Default: 2 hours
    */
   snapshotMaxAgeMs?: number;
+  /**
+   * Optional remote blob storage snapshot configuration for stateless containers (S3, GCS, R2, HTTP).
+   * Enables persisting and hydrating L1 RAM cache snapshots across Kubernetes / container deployments.
+   */
+  remoteSnapshot?: RemoteSnapshotOptions;
 
   /**
    * Optional namespace prefix for all cache keys.
