@@ -135,3 +135,11 @@ export function createMemorySnapshotAdapter(): IRemoteSnapshotAdapter & {
     },
   };
 }
+
+export {
+  SigV4SnapshotAdapter,
+  createSigV4SnapshotAdapter,
+  createS3SnapshotAdapter,
+  createR2SnapshotAdapter,
+  type SigV4SnapshotAdapterOptions,
+} from './sigv4-snapshot-adapter.js';

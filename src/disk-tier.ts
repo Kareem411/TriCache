@@ -499,10 +499,11 @@ export class DiskTier {
     const filePath = this.hashToWritePath(hash, entry.expiresAt);
     const tmpPath  = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`;
 
-    await this.diskQueue.schedule(async () => {
-      this.diskUsageBytes += final.length; // optimistic — rolled back on error
-      this.fileCount++;
+    // Optimistically reserve quota before queuing so concurrent spills respect the cap
+    this.diskUsageBytes += final.length;
+    this.fileCount++;
 
+    const result = await this.diskQueue.schedule(async () => {
       try {
         await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
         await fs.promises.writeFile(tmpPath, final, { mode: 0o600 });
@@ -524,6 +525,7 @@ export class DiskTier {
           this._stmtInsert!.run(hash, filePath, entry.expiresAt, final.length);
         }
         this.opts.logger.debug('DiskTier: entry saved', { key: key.slice(0, 50), bytes: final.length });
+        return true;
       } catch (err) {
         try { await fs.promises.unlink(tmpPath); } catch { /* ignore if already gone/failed */ }
         this.diskUsageBytes -= Math.min(this.diskUsageBytes, final.length); // rollback
@@ -533,6 +535,12 @@ export class DiskTier {
         throw err;
       }
     });
+
+    if (result === null) {
+      // Fast-dropped by BoundedDiskQueue backpressure / circuit breaker: rollback reservation
+      this.diskUsageBytes -= Math.min(this.diskUsageBytes, final.length);
+      this.fileCount = Math.max(0, this.fileCount - 1);
+    }
   }
 
   /** Load a key from disk, or return null on miss/expiry/corruption. */

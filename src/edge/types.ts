@@ -151,3 +151,80 @@ export interface CloudflareDOStorage {
   delete(keys: string[]): Promise<number>;
   list?<T = unknown>(options?: { prefix?: string; limit?: number }): Promise<Map<string, T>>;
 }
+
+/**
+ * Minimal interface representing a Cloudflare R2 object returned by R2Bucket.get().
+ */
+export interface CloudflareR2Object {
+  text(): Promise<string>;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  json?<T = unknown>(): Promise<T>;
+}
+
+/**
+ * Minimal interface representing Cloudflare R2 Bucket binding (env.MY_BUCKET).
+ */
+export interface CloudflareR2Bucket {
+  get(key: string): Promise<CloudflareR2Object | null>;
+  put(key: string, value: string | ArrayBuffer | ArrayBufferView | Blob | ReadableStream, options?: unknown): Promise<unknown>;
+  delete?(key: string | string[]): Promise<void>;
+}
+
+/**
+ * Generic source for edge snapshot hydration (R2 bucket binding, custom loader object, raw string, or ArrayBuffer).
+ */
+export type EdgeSnapshotSource =
+  | CloudflareR2Bucket
+  | { get(key: string): Promise<CloudflareR2Object | string | ArrayBuffer | Uint8Array | null> }
+  | string
+  | ArrayBuffer
+  | Uint8Array;
+
+/**
+ * Configuration options for EdgeCacheService.hydrate().
+ */
+export interface EdgeHydrateOptions {
+  /**
+   * Object key or filename in the R2 bucket. Default: 'tricache-edge.snap'
+   */
+  key?: string;
+
+  /**
+   * Maximum acceptable age of snapshot in milliseconds before rejecting as stale.
+   * Default: 7,200,000 ms (2 hours).
+   */
+  maxAgeMs?: number;
+
+  /**
+   * Acceptable clock skew tolerance in milliseconds for future timestamps.
+   * Default: 250 ms.
+   */
+  clockSkewToleranceMs?: number;
+}
+
+/**
+ * Configuration options for EdgeCacheService.exportSnapshot().
+ */
+export interface EdgeExportSnapshotOptions {
+  /**
+   * Whether to encrypt the exported snapshot using the configured Web Crypto AEAD key.
+   * Default: true (when encryption is configured).
+   */
+  encrypt?: boolean;
+}
+
+/**
+ * Serialized representation of edge cache snapshot payload.
+ */
+export interface EdgeSnapshotPayload {
+  version: number;
+  writtenAt: number;
+  entries: Array<{
+    key: string;
+    value: unknown;
+    expiresAt: number;
+    staleUntil: number;
+    tags?: string[];
+    tagVersions?: Record<string, number>;
+  }>;
+}

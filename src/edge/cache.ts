@@ -1,5 +1,15 @@
 import type { ICacheSpan, ICacheTracer } from '../types';
-import type { EdgeCacheOptions, EdgeGetOptions, IEdgeRemoteStorage, IEdgeBloomFilter } from './types';
+import type {
+  EdgeCacheOptions,
+  EdgeGetOptions,
+  IEdgeRemoteStorage,
+  IEdgeBloomFilter,
+  CloudflareR2Object,
+  EdgeSnapshotSource,
+  EdgeHydrateOptions,
+  EdgeExportSnapshotOptions,
+  EdgeSnapshotPayload,
+} from './types';
 import { WebCryptoEncryption } from './crypto';
 import { WasmBloomFilter } from '../wasm/bloom-filter-wasm';
 import { Murmur3BloomFilter } from './utils/murmur3';
@@ -602,6 +612,174 @@ export class EdgeCacheService {
     } finally {
       span.end();
     }
+  }
+
+  /**
+   * Serializes active, unexpired L1 entries into a snapshot string (encrypted if WebCrypto encryption is enabled).
+   * Ideal for persisting Edge state to Cloudflare R2 before worker restart.
+   */
+  async exportSnapshot(options?: EdgeExportSnapshotOptions): Promise<string> {
+    const now = Date.now();
+    const entries: EdgeSnapshotPayload['entries'] = [];
+
+    for (const [nsKey, entry] of this.l1.entries()) {
+      if (entry.expiresAt > now || entry.staleUntil > now) {
+        const cleanKey = this.namespace && nsKey.startsWith(this.namespace + ':')
+          ? nsKey.slice(this.namespace.length + 1)
+          : nsKey;
+
+        entries.push({
+          key: cleanKey,
+          value: entry.value,
+          expiresAt: entry.expiresAt,
+          staleUntil: entry.staleUntil,
+          tags: entry.tags,
+          tagVersions: entry.tagVersions,
+        });
+      }
+    }
+
+    const payload: EdgeSnapshotPayload = {
+      version: 1,
+      writtenAt: now,
+      entries,
+    };
+
+    const jsonStr = JSON.stringify(payload);
+    const shouldEncrypt = options?.encrypt ?? this.enc.isEnabled;
+    if (shouldEncrypt && this.enc.isEnabled) {
+      return await this.enc.encrypt(jsonStr);
+    }
+    return jsonStr;
+  }
+
+  /**
+   * Hydrates L1 memory and primes the Bloom filter directly from Cloudflare R2 or snapshot sources on edge isolate initialization.
+   *
+   * @param source Cloudflare R2 bucket binding (env.MY_BUCKET), reader object, snapshot string, or ArrayBuffer.
+   * @param options Configuration options (key, maxAgeMs, clockSkewToleranceMs).
+   * @returns Number of cache entries successfully restored into L1.
+   *
+   * @example
+   * // In Cloudflare Worker:
+   * export default {
+   *   async fetch(request, env, ctx) {
+   *     await edgeCache.hydrate(env.CACHE_R2_BUCKET);
+   *     return handleRequest(request);
+   *   }
+   * }
+   */
+  async hydrate(source: EdgeSnapshotSource, options?: EdgeHydrateOptions): Promise<number> {
+    let rawStr: string | null = null;
+
+    if (source && typeof source === 'object') {
+      if ('get' in source && typeof source.get === 'function') {
+        const key = options?.key ?? 'tricache-edge.snap';
+        const obj = await source.get(key);
+        if (!obj) return 0;
+
+        if (typeof obj === 'string') {
+          rawStr = obj;
+        } else if (obj instanceof ArrayBuffer || (typeof Uint8Array !== 'undefined' && obj instanceof Uint8Array)) {
+          rawStr = new TextDecoder().decode(obj);
+        } else if (typeof (obj as CloudflareR2Object).text === 'function') {
+          rawStr = await (obj as CloudflareR2Object).text();
+        } else if (typeof (obj as CloudflareR2Object).arrayBuffer === 'function') {
+          const ab = await (obj as CloudflareR2Object).arrayBuffer();
+          rawStr = new TextDecoder().decode(ab);
+        }
+      } else if (source instanceof ArrayBuffer) {
+        rawStr = new TextDecoder().decode(source);
+      } else if (typeof Uint8Array !== 'undefined' && source instanceof Uint8Array) {
+        rawStr = new TextDecoder().decode(source);
+      }
+    } else if (typeof source === 'string') {
+      rawStr = source;
+    }
+
+    if (!rawStr) return 0;
+
+    // Decrypt if encrypted envelope
+    if (rawStr.startsWith('enc:v1:') || rawStr.startsWith('a128:v1:')) {
+      try {
+        rawStr = await this.enc.decrypt(rawStr);
+      } catch {
+        return 0; // Decryption failure -> fallback to cold start
+      }
+    }
+
+    let payload: EdgeSnapshotPayload;
+    try {
+      payload = JSON.parse(rawStr) as EdgeSnapshotPayload;
+    } catch {
+      return 0; // Malformed JSON -> fallback cold
+    }
+
+    if (!payload || !Array.isArray(payload.entries)) {
+      return 0;
+    }
+
+    const now = Date.now();
+    const maxAgeMs = options?.maxAgeMs ?? 7_200_000;
+    const tolerance = options?.clockSkewToleranceMs ?? 250;
+    const writtenAt = payload.writtenAt ?? 0;
+
+    // Reject future timestamp exceeding clock skew tolerance
+    if (writtenAt - now > tolerance) {
+      return 0;
+    }
+
+    // Reject stale snapshot
+    const ageMs = Math.max(0, now - writtenAt);
+    if (ageMs > maxAgeMs) {
+      return 0;
+    }
+
+    let imported = 0;
+    for (const item of payload.entries) {
+      if (!item || typeof item.key !== 'string') continue;
+      // Skip if completely expired
+      if (item.expiresAt <= now && item.staleUntil <= now) continue;
+
+      const nsKey = this.nk(item.key);
+      const serialized = JSON.stringify(item.value);
+      const bytes = this._estimateBytes(nsKey, serialized);
+
+      this._deleteL1(nsKey);
+      this._evictIfNeeded(bytes);
+
+      const entry: EdgeL1Entry = {
+        value: item.value,
+        serialized,
+        bytes,
+        expiresAt: item.expiresAt,
+        staleUntil: item.staleUntil,
+        tags: item.tags,
+        tagVersions: item.tagVersions,
+      };
+
+      this.l1.set(nsKey, entry);
+      this.currentBytes += bytes;
+
+      if (item.tags) {
+        for (const tag of item.tags) {
+          let s = this.tagIndex.get(tag);
+          if (!s) {
+            s = new Set<string>();
+            this.tagIndex.set(tag, s);
+          }
+          s.add(nsKey);
+        }
+      }
+
+      if (this.bloomFilter) {
+        this.bloomFilter.add(item.key);
+      }
+
+      imported++;
+    }
+
+    return imported;
   }
 
   /**

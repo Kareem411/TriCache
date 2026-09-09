@@ -28,9 +28,14 @@ export {
   createHttpSnapshotAdapter,
   createCustomSnapshotAdapter,
   createMemorySnapshotAdapter,
+  createSigV4SnapshotAdapter,
+  createS3SnapshotAdapter,
+  createR2SnapshotAdapter,
+  SigV4SnapshotAdapter,
   type IRemoteSnapshotAdapter,
   type RemoteSnapshotOptions,
   type HttpSnapshotAdapterOptions,
+  type SigV4SnapshotAdapterOptions,
 } from './remote-snapshot';
 export {
   createHttpMeshRelay,

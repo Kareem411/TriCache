@@ -19,4 +19,10 @@ export type {
   UpstashRedisOptions,
   CloudflareKVNamespace,
   CloudflareDOStorage,
+  CloudflareR2Bucket,
+  CloudflareR2Object,
+  EdgeSnapshotSource,
+  EdgeHydrateOptions,
+  EdgeExportSnapshotOptions,
+  EdgeSnapshotPayload,
 } from './types';

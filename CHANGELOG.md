@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.0] — 2026-09-09
 
 ### Added
+- **Zero-Dependency AWS SigV4 Snapshot Adapter (`src/sigv4-snapshot-adapter.ts`)** — Lightweight (~150 LOC) AWS SigV4 signer built purely on standard Web Crypto (`crypto.subtle`) and `fetch`:
+  - Enables stateless container pods (Kubernetes, AWS ECS/Fargate, GCP Cloud Run) and edge isolates to persist and hydrate L1 snapshots directly to/from AWS S3, Cloudflare R2, MinIO, or custom S3-compatible object storage without pulling in the 30MB `@aws-sdk/client-s3` dependency.
+  - Implements canonical request hashing, string-to-sign generation, and chained HMAC key derivation (`kDate` → `kRegion` → `kService` → `kSigning`).
+  - Supports virtual-hosted and path-style addressing with clean 404 / NoSuchKey detection for initial cold start deployments.
+  - Added convenience factories `createSigV4SnapshotAdapter`, `createS3SnapshotAdapter`, and `createR2SnapshotAdapter`.
+- **Pre-Baked Snapshot Flushers & Graceful Shutdown (`src/cache-service.ts`)** — Automated flusher hooks for container orchestration:
+  - Added `cache.flushSnapshotOnShutdown(timeoutMs?: number)` returning a Promise that flushes both local disk and remote cloud snapshots before Kubernetes kills the container.
+  - Added `ProcessTerminationBus.flushAll(timeoutMs?: number)` to flush snapshots across all registered cache instances concurrently with timeout protection (default 8,000ms), preventing slow object storage from blocking pod eviction.
+- **Edge Hydration Hook (`src/edge/cache.ts`)** — `EdgeCacheService.hydrate()` and `exportSnapshot()`:
+  - Primes edge isolate L1 memory directly from Cloudflare R2 bucket bindings (`env.MY_BUCKET`) or snapshot sources on worker initialization.
+  - Seamlessly decrypts Web Crypto AEAD envelopes (`enc:v1:`) and automatically primes the Edge Bloom filter (`bloomFilter.add(k)`).
+  - Enforces snapshot staleness ceilings (`maxAgeMs`, default 2 hours) and container clock skew tolerances ($\le 250\text{ms}$).
 - **`BoundedDiskQueue` & Cloud NVMe Backpressure Guard (`src/disk-tier.ts`)** — Concurrency-controlled disk spill spooler protecting against libuv threadpool (`UV_THREADPOOL_SIZE=4`) saturation during cloud NVMe / AWS EBS latency spikes (0.4ms to 450ms):
   - Limits active async fs operations to `diskMaxConcurrentWrites` (default `Math.min(4, Math.max(1, Math.floor(os.availableParallelism() / 4)))`), preventing DNS lookups, zlib compression, and crypto operations from starving.
   - Fast-sheds incoming spills when pending writes hit `diskMaxPendingWrites` (default 512) before touching libuv, bounding heap memory and preserving main-thread latency.
@@ -37,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Removed Node.js `Buffer` dependency in `src/wasm/bloom-filter-wasm.ts` via chunked `base64ToUint8Array`, making the WASM Bloom filter 100% universal across Cloudflare Workers, Fastly Compute, Vercel Edge, and browsers.
   - Created `Murmur3BloomFilter` and `murmur3_32` (`src/edge/utils/murmur3.ts`) implementing standard 32-bit MurmurHash3 double-hashing with Kirsch-Mitzenmacher bitset probing over a pure `Uint8Array` bit-array.
   - Integrated Bloom filter into `EdgeCacheService` (`bloomFilter: boolean | IEdgeBloomFilter`): ~300ns in-isolate miss rejection completely prevents expensive, metered HTTP subrequests to remote storage (Upstash Redis REST, Cloudflare KV) on 404 routes and randomized bot crawler keys.
-- **Expanded Test Suite** — Expanded to **684 passing tests across 62 test files** with 100% test pass rate.
+- **Expanded Test Suite** — Expanded to **703 passing tests across 65 test files** with 100% test pass rate.
 - **`CacheCodec` abstraction (`src/codec.ts`)** — Centralized msgpackr binary serialization engine with built-in record structure deduplication (`useRecords: true`), rich type preservation (`moreTypes: true` for `Set`, `TypedArray`, `Date`, etc.), and strict plain-object map decoding (`mapsAsObjects: true`).
 - **`serializeToJSON` option in `CacheOptions`** — Configurable flag (defaults to `true`) leveraging msgpackr 2.1.0's `useToJSON` capability. Setting `serializeToJSON: false` preserves the object's actual internal properties in durable cache tiers without invoking `.toJSON()`, avoiding accidental HTTP response projections on cached domain entities.
 - **Dedicated test suites** — Added comprehensive coverage for previously untested integration layers, bringing the test suite to 554 tests passing:

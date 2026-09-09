@@ -396,6 +396,18 @@ export class ProcessTerminationBus {
     }
   }
 
+  /**
+   * Flushes snapshots across all active registered cache instances concurrently.
+   * Awaits both local disk and remote cloud snapshot uploads with timeout protection.
+   *
+   * @param timeoutMs Timeout in milliseconds per instance before aborting slow flushes. Default: 8000ms.
+   */
+  public static async flushAll(timeoutMs = 8_000): Promise<void> {
+    if (this.instances.size === 0) return;
+    const tasks = Array.from(this.instances).map(inst => inst.flushSnapshotOnShutdown(timeoutMs));
+    await Promise.allSettled(tasks);
+  }
+
   /** For testing diagnostics and assertions */
   public static get size(): number {
     return this.instances.size;
@@ -2293,12 +2305,64 @@ export class CacheService {
   }
 
   /**
+   * Graceful shutdown flusher for Kubernetes preStop hooks, NestJS onApplicationShutdown,
+   * or manual microservice teardown.
+   *
+   * Flushes both local disk and remote cloud snapshots (S3/R2/GCS), returning a Promise
+   * that resolves when the upload completes or after `timeoutMs` expires.
+   *
+   * @param timeoutMs Maximum time permitted for snapshot persistence before timing out. Default: 8000ms.
+   */
+  async flushSnapshotOnShutdown(timeoutMs = 8_000): Promise<boolean> {
+    const flusher = async (): Promise<boolean> => {
+      let localOk = true;
+      let remoteOk = true;
+
+      if (!this._diskDisabled) {
+        try {
+          this.writeSnapshot();
+        } catch (err) {
+          localOk = false;
+          this.logger.warn('flushSnapshotOnShutdown: disk snapshot write failed', { error: (err as Error).message });
+        }
+      }
+
+      if (this.opts.remoteSnapshot && this.opts.remoteSnapshot.saveOnShutdown !== false) {
+        try {
+          remoteOk = await this.writeRemoteSnapshot();
+        } catch (err) {
+          remoteOk = false;
+          this.logger.warn('flushSnapshotOnShutdown: remote snapshot upload failed', { error: (err as Error).message });
+        }
+      }
+
+      return localOk && remoteOk;
+    };
+
+    let timer: NodeJS.Timeout | null = null;
+    try {
+      return await Promise.race([
+        flusher(),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => {
+            this.logger.warn(`flushSnapshotOnShutdown timed out after ${timeoutMs}ms`);
+            resolve(false);
+          }, timeoutMs);
+          if (timer.unref) timer.unref();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
    * Internal graceful shutdown trigger invoked by ProcessTerminationBus.
    */
   _triggerShutdown(): void {
     if (!this._diskDisabled) this.writeSnapshot();
     if (this.opts.remoteSnapshot && this.opts.remoteSnapshot.saveOnShutdown !== false) {
-      void this.writeRemoteSnapshot();
+      void this.flushSnapshotOnShutdown();
     }
   }
 
