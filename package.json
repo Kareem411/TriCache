@@ -21,10 +21,11 @@
   "author": "Kareem (https://github.com/Kareem411)",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Kareem411/TriCache.git"
+    "url": "git+https://github.com/Kareem411/TriCache.git"
   },
   "homepage": "https://github.com/Kareem411/TriCache#readme",
   "packageManager": "pnpm@11.22.0",
+  "sideEffects": false,
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -69,9 +70,9 @@
       "require": "./dist/dashboard/index.cjs"
     },
     "./edge": {
+      "types": "./dist/edge/index.d.ts",
       "edge-light": "./dist/edge/index.js",
       "workerd": "./dist/edge/index.js",
-      "types": "./dist/edge/index.d.ts",
       "import": "./dist/edge/index.js",
       "require": "./dist/edge/index.cjs",
       "default": "./dist/edge/index.js"
