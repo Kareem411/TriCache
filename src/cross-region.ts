@@ -135,17 +135,17 @@ export function createCustomCrossRegionRelay(relay: ICrossRegionRelay): ICrossRe
  * In-memory cross-region mesh bus designed for unit testing and multi-region simulations.
  */
 export function createMemoryCrossRegionRelay(): ICrossRegionRelay & {
-  register(region: string, handler: (event: CrossRegionInvalidationEvent) => Promise<void> | void): () => void;
+  register(region: string, handler: (event: CrossRegionInvalidationEvent) => Promise<unknown> | unknown): () => void;
   getBroadcastCount(): number;
   clear(): void;
 } {
-  const handlers = new Map<string, Set<(event: CrossRegionInvalidationEvent) => Promise<void> | void>>();
+  const handlers = new Map<string, Set<(event: CrossRegionInvalidationEvent) => Promise<unknown> | unknown>>();
   let broadcastCount = 0;
 
   return {
     async broadcast(event: CrossRegionInvalidationEvent): Promise<void> {
       broadcastCount++;
-      const promises: Promise<void>[] = [];
+      const promises: Promise<unknown>[] = [];
       for (const [region, set] of handlers.entries()) {
         // Only deliver to handlers in DIFFERENT regions
         if (region !== event.originRegion) {
@@ -157,7 +157,7 @@ export function createMemoryCrossRegionRelay(): ICrossRegionRelay & {
       await Promise.allSettled(promises);
     },
 
-    register(region: string, handler: (event: CrossRegionInvalidationEvent) => Promise<void> | void): () => void {
+    register(region: string, handler: (event: CrossRegionInvalidationEvent) => Promise<unknown> | unknown): () => void {
       if (!handlers.has(region)) {
         handlers.set(region, new Set());
       }
