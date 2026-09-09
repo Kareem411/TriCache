@@ -59,6 +59,7 @@ export {
   type CachePingResult,
   type ICacheTracer,
   type ICacheSpan,
+  type ICacheSpanLink,
   type WrapOptions,
   type LockOptions,
   type ICacheCounter,
@@ -66,6 +67,12 @@ export {
   type ICacheBatchObservableCallback,
   type ICacheMeter,
 } from './types';
+
+export {
+  parseTraceParent,
+  formatTraceParent,
+  type ParsedTraceParent,
+} from './utils/tracing';
 
 export {
   tricacheDashboard,

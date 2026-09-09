@@ -9,6 +9,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { CacheService } from '../src/cache-service';
 import { CachePriority, type ICacheTracer, type ICacheSpan } from '../src/types';
+import { parseTraceParent, formatTraceParent } from '../src/utils/tracing';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { rmSync } from 'fs';
@@ -156,14 +157,27 @@ describe('mset() / mdel()', () => {
 
 describe('OpenTelemetry tracer (ICacheTracer)', () => {
   function makeTracer() {
-    const spans: { name: string; attrs: Record<string, unknown>; ended: boolean }[] = [];
+    const spans: {
+      name: string;
+      attrs: Record<string, unknown>;
+      ended: boolean;
+      status?: { code: 0 | 1 | 2; message?: string };
+      exceptions: unknown[];
+    }[] = [];
     const tracer: ICacheTracer = {
       startSpan(name) {
-        const span = { name, attrs: {} as Record<string, unknown>, ended: false };
+        const span: (typeof spans)[number] = {
+          name,
+          attrs: {} as Record<string, unknown>,
+          ended: false,
+          status: undefined,
+          exceptions: [] as unknown[],
+        };
         spans.push(span);
         const s: ICacheSpan = {
           setAttribute(k, v) { span.attrs[k] = v; return s; },
-          setStatus()        { return s; },
+          setStatus(st)      { span.status = st; return s; },
+          recordException(e) { span.exceptions.push(e); return s; },
           end()              { span.ended = true; },
         };
         return s;
@@ -180,7 +194,7 @@ describe('OpenTelemetry tracer (ICacheTracer)', () => {
     try { rmSync(diskDir, { recursive: true, force: true }); } catch {}
   });
 
-  it('records a span for get() with cache.hit = miss on cold cache', async () => {
+  it('records a span for get() with cache.hit = false on cold cache', async () => {
     const { tracer, spans } = makeTracer();
     ({ svc, diskDir } = makeService({ tracer }));
 
@@ -188,12 +202,13 @@ describe('OpenTelemetry tracer (ICacheTracer)', () => {
 
     const span = spans.find(s => s.name === 'tricache.get');
     expect(span).toBeDefined();
-    expect(span!.attrs['cache.hit']).toBe('miss');
+    expect(span!.attrs['cache.hit']).toBe(false);
+    expect(span!.attrs['cache.hit_tier']).toBe('miss');
     expect(span!.attrs['cache.key_prefix']).toBe('user');
     expect(span!.ended).toBe(true);
   });
 
-  it('records cache.hit = l1 on a warm hit', async () => {
+  it('records cache.hit = true and cache.item.tier = memory on a warm hit', async () => {
     const { tracer, spans } = makeTracer();
     ({ svc, diskDir } = makeService({ tracer }));
 
@@ -203,10 +218,12 @@ describe('OpenTelemetry tracer (ICacheTracer)', () => {
     await svc.get('user:2', async () => 'other', 60);
 
     const span = spans.find(s => s.name === 'tricache.get');
-    expect(span!.attrs['cache.hit']).toBe('l1');
+    expect(span!.attrs['cache.hit']).toBe(true);
+    expect(span!.attrs['cache.item.tier']).toBe('memory');
+    expect(span!.attrs['cache.hit_tier']).toBe('l1');
   });
 
-  it('records a span for set()', async () => {
+  it('records a span for set() with ttl and key_prefix', async () => {
     const { tracer, spans } = makeTracer();
     ({ svc, diskDir } = makeService({ tracer }));
 
@@ -215,6 +232,7 @@ describe('OpenTelemetry tracer (ICacheTracer)', () => {
     const span = spans.find(s => s.name === 'tricache.set');
     expect(span).toBeDefined();
     expect(span!.attrs['cache.key_prefix']).toBe('product');
+    expect(span!.attrs['cache.ttl']).toBe(60);
     expect(span!.ended).toBe(true);
   });
 
@@ -231,6 +249,90 @@ describe('OpenTelemetry tracer (ICacheTracer)', () => {
     expect(span).toBeDefined();
     expect(span!.attrs['cache.key_prefix']).toBe('order');
     expect(span!.ended).toBe(true);
+  });
+
+  it('records error status and exception on fetcher failure', async () => {
+    const { tracer, spans } = makeTracer();
+    ({ svc, diskDir } = makeService({ tracer }));
+
+    await expect(
+      svc.get('failing:1', async () => {
+        throw new Error('Database connection failed');
+      }, 60)
+    ).rejects.toThrow('Database connection failed');
+
+    const span = spans.find(s => s.name === 'tricache.get');
+    expect(span).toBeDefined();
+    expect(span!.status?.code).toBe(2);
+    expect(span!.status?.message).toBe('Database connection failed');
+    expect(span!.exceptions.length).toBe(1);
+    expect(span!.ended).toBe(true);
+  });
+
+  it('records a span for mget() with batch metrics', async () => {
+    const { tracer, spans } = makeTracer();
+    ({ svc, diskDir } = makeService({ tracer }));
+
+    await svc.set('k1', 'val1', 60);
+    spans.length = 0;
+
+    const res = await svc.mget(['k1', 'k2'], async _missKeys => ({
+      k2: 'val2',
+    }));
+
+    expect(res).toEqual(['val1', 'val2']);
+
+    const span = spans.find(s => s.name === 'tricache.mget');
+    expect(span).toBeDefined();
+    expect(span!.attrs['cache.batch.size']).toBe(2);
+    expect(span!.attrs['cache.hits']).toBe(1);
+    expect(span!.attrs['cache.misses']).toBe(1);
+    expect(span!.ended).toBe(true);
+  });
+
+  it('records a span for invalidateTag() with tag attributes', async () => {
+    const { tracer, spans } = makeTracer();
+    ({ svc, diskDir } = makeService({ tracer }));
+
+    await svc.invalidateTag('products');
+
+    const span = spans.find(s => s.name === 'tricache.invalidate_tag');
+    expect(span).toBeDefined();
+    expect(span!.attrs['cache.tag']).toBe('products');
+    expect(span!.ended).toBe(true);
+  });
+
+  it('records a span for clear() with prefix attribute', async () => {
+    const { tracer, spans } = makeTracer();
+    ({ svc, diskDir } = makeService({ tracer }));
+
+    await svc.clear('tenant-1:*');
+
+    const span = spans.find(s => s.name === 'tricache.clear');
+    expect(span).toBeDefined();
+    expect(span!.attrs['cache.prefix']).toBe('tenant-1:*');
+    expect(span!.ended).toBe(true);
+  });
+
+  it('formats and parses valid W3C traceparent headers', () => {
+    const traceId = '4bf92f3577b34da6a3ce929d0e0e4736';
+    const spanId = '00f067aa0ba902b7';
+    const formatted = formatTraceParent(traceId, spanId, 1);
+    expect(formatted).toBe(`00-${traceId}-${spanId}-01`);
+
+    const parsed = parseTraceParent(formatted);
+    expect(parsed).toEqual({
+      version: '00',
+      traceId,
+      spanId,
+      traceFlags: 1,
+    });
+
+    // Invalid headers
+    expect(parseTraceParent('invalid-header')).toBeNull();
+    expect(parseTraceParent('00-00000000000000000000000000000000-00f067aa0ba902b7-01')).toBeNull(); // all zeros traceId
+    expect(parseTraceParent('00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01')).toBeNull(); // all zeros spanId
+    expect(parseTraceParent(null)).toBeNull();
   });
 
   it('works without a tracer (no-op span — no error)', async () => {

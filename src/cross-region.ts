@@ -23,6 +23,8 @@ export interface CrossRegionInvalidationEvent {
   timestamp: number;
   /** Optional namespace of the origin cache */
   namespace?: string;
+  /** Optional W3C traceparent header for distributed context propagation */
+  traceparent?: string;
 }
 
 export interface ICrossRegionRelay {

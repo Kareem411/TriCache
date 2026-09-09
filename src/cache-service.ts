@@ -39,6 +39,7 @@ import {
   ILogger,
   ICacheTracer,
   ICacheSpan,
+  ICacheSpanLink,
   consoleLogger,
   WrapOptions,
   LockOptions,
@@ -972,12 +973,19 @@ export class CacheService {
   private static readonly _nullSpan: ICacheSpan = {
     setAttribute() { return this; },
     setStatus()    { return this; },
+    recordException() { return this; },
     end()          {},
   };
 
   /** Start an OTEL-compatible span if a tracer is configured. Returns a no-op span otherwise. */
-  private _startSpan(name: string): ICacheSpan {
-    if (this.opts.tracer) return this.opts.tracer.startSpan(name);
+  private _startSpan(name: string, links?: ICacheSpanLink[]): ICacheSpan {
+    if (this.opts.tracer) {
+      const span = this.opts.tracer.startSpan(name, links?.length ? { links } : undefined);
+      if (this.opts.namespace) {
+        span.setAttribute('cache.namespace', this.opts.namespace);
+      }
+      return span;
+    }
     return CacheService._nullSpan;
   }
 
@@ -1928,7 +1936,10 @@ export class CacheService {
         this.counters.l1Hits++;
         this.opts.onHit?.(cacheKey, 'l1');
         if (this.opts.frozen) deepFreeze(l1Hit.value);
-        span.setAttribute('cache.hit', 'l1').end();
+        span.setAttribute('cache.hit', true)
+          .setAttribute('cache.item.tier', 'memory')
+          .setAttribute('cache.hit_tier', 'l1')
+          .end();
         return (this.opts.cloneStrategy === 'structuredClone' && l1Hit.value != null && typeof l1Hit.value === 'object')
           ? structuredClone(l1Hit.value) as T
           : l1Hit.value as T;
@@ -1969,7 +1980,10 @@ export class CacheService {
               this.counters.l2Hits++;
               this.opts.onHit?.(cacheKey, 'l2');
               this.logger.debug('L2 hit (Redis hash)', { cacheKey });
-              span.setAttribute('cache.hit', 'l2').end();
+              span.setAttribute('cache.hit', true)
+                .setAttribute('cache.item.tier', 'remote')
+                .setAttribute('cache.hit_tier', 'l2')
+                .end();
               if (this.opts.frozen) deepFreeze(parsed);
               return (this.opts.cloneStrategy === 'structuredClone' && parsed != null && typeof parsed === 'object')
                 ? structuredClone(parsed)
@@ -1985,7 +1999,10 @@ export class CacheService {
             this.counters.l2Hits++;
             this.opts.onHit?.(cacheKey, 'l2');
             this.logger.debug('L2 hit (Redis)', { cacheKey });
-            span.setAttribute('cache.hit', 'l2').end();
+            span.setAttribute('cache.hit', true)
+              .setAttribute('cache.item.tier', 'remote')
+              .setAttribute('cache.hit_tier', 'l2')
+              .end();
             if (this.opts.frozen) deepFreeze(parsed);
             return (this.opts.cloneStrategy === 'structuredClone' && parsed != null && typeof parsed === 'object')
               ? structuredClone(parsed)
@@ -2027,7 +2044,10 @@ export class CacheService {
               this.counters.diskHits++;
               this.opts.onHit?.(cacheKey, 'disk');
               this.logger.debug('L1.5 hit (disk → L1)', { cacheKey });
-              span.setAttribute('cache.hit', 'disk').end();
+              span.setAttribute('cache.hit', true)
+                .setAttribute('cache.item.tier', 'disk')
+                .setAttribute('cache.hit_tier', 'disk')
+                .end();
               if (this.opts.frozen) deepFreeze(l1Check.value);
               return (this.opts.cloneStrategy === 'structuredClone' && l1Check.value != null && typeof l1Check.value === 'object')
                 ? structuredClone(l1Check.value) as T
@@ -2038,7 +2058,7 @@ export class CacheService {
       }
     }
 
-    span.setAttribute('cache.hit', 'miss');
+    span.setAttribute('cache.hit', false).setAttribute('cache.hit_tier', 'miss');
     this.opts.onMiss?.(cacheKey);
 
     // Cache MISS: thundering-herd prevention
@@ -2046,7 +2066,9 @@ export class CacheService {
     if (existing) {
       this.counters.stampedes++;
       this.logger.debug('Stampede prevented — coalescing onto inflight fetch', { cacheKey });
-      span.end();
+      span.setAttribute('cache.hit', true)
+        .setAttribute('cache.stampede_coalesced', true)
+        .end();
       return existing as Promise<T>;
     }
 
@@ -2054,7 +2076,17 @@ export class CacheService {
       try {
         this.counters.fetches++;
         const fetchStart  = Date.now();
-        const data        = await fetchFn();
+        let data: T;
+        try {
+          data = await fetchFn();
+        } catch (fetchErr) {
+          span.setStatus({
+            code: 2,
+            message: fetchErr instanceof Error ? fetchErr.message : String(fetchErr),
+          });
+          span.recordException?.(fetchErr);
+          throw fetchErr;
+        }
         const delta       = Date.now() - fetchStart;
 
         // Negative caching: null/undefined results get their own (shorter) TTL
@@ -2227,70 +2259,80 @@ export class CacheService {
   /** Explicitly write a value into L1 (+ L2 in production). */
   async set<T>(cacheKey: string, data: T, ttlSeconds = 300, priority?: CachePriority, opts?: { tags?: string[]; dependsOn?: string[] }): Promise<void> {
     const span  = this._startSpan('tricache.set');
-    if (this.opts.tracer) span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
-    // ttl 0 = indefinite (documented contract, used by the NestJS store): map to
-    // a far-future expiry instead of computing expiresAt = now + 0ms, which
-    // created an instantly-expired entry that could never be read.
-    const effectiveTtlSeconds = ttlSeconds > 0 ? ttlSeconds : (ttlSeconds === 0 ? INDEFINITE_TTL_SECONDS : ttlSeconds);
-    const ttlMs = this._jitterTtl(effectiveTtlSeconds * 1_000);
-    const p     = priority ?? inferPriority(cacheKey);
-    const k     = this.nk(cacheKey);
-    this.counters.sets++;
-
-    let activeTagVersions: Record<string, number> | undefined;
-    if (opts?.tags?.length) {
-      if (this.opts.tagStrategy === 'generational') {
-        const vers = await Promise.all(opts.tags.map(tag => this._getTagVersion(tag)));
-        activeTagVersions = {};
-        for (let i = 0; i < opts.tags.length; i++) {
-          activeTagVersions[opts.tags[i]] = vers[i];
-        }
-      } else {
-        await this._registerTags(k, opts.tags, ttlSeconds);
-      }
+    if (this.opts.tracer) {
+      span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
+      span.setAttribute('cache.ttl', ttlSeconds);
     }
+    try {
+      // ttl 0 = indefinite (documented contract, used by the NestJS store): map to
+      // a far-future expiry instead of computing expiresAt = now + 0ms, which
+      // created an instantly-expired entry that could never be read.
+      const effectiveTtlSeconds = ttlSeconds > 0 ? ttlSeconds : (ttlSeconds === 0 ? INDEFINITE_TTL_SECONDS : ttlSeconds);
+      const ttlMs = this._jitterTtl(effectiveTtlSeconds * 1_000);
+      const p     = priority ?? inferPriority(cacheKey);
+      const k     = this.nk(cacheKey);
+      this.counters.sets++;
 
-    this.l1.set(k, data, ttlMs, p, undefined, undefined, activeTagVersions);
-
-    // Register dependency patterns: when any key matching a pattern is deleted,
-    // this key (k) is automatically cascaded.
-    if (opts?.dependsOn?.length) {
-      for (const pattern of opts.dependsOn) {
-        const nsPattern = this.nk(pattern);
-        let deps = this.dependencyIndex.get(nsPattern);
-        if (!deps) { deps = new Set(); this.dependencyIndex.set(nsPattern, deps); }
-        deps.add(k);
-      }
-    }
-
-    if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
-      try {
-        const client = await this.getRedis();
-        const s      = JSON.stringify(data);
-        const stored = await this._serializeAndEncrypt(s);
-        const ttlSec = Math.ceil(ttlMs / 1_000);
-        if (this.opts.tagStrategy === 'generational' && activeTagVersions) {
-          const now = Date.now();
-          const tx = client.multi();
-          tx.hset(k, {
-            d: stored,
-            t: String(now),
-            tv: JSON.stringify(activeTagVersions),
-          });
-          tx.expire(k, ttlSec);
-          await tx.exec();
+      let activeTagVersions: Record<string, number> | undefined;
+      if (opts?.tags?.length) {
+        if (this.opts.tagStrategy === 'generational') {
+          const vers = await Promise.all(opts.tags.map(tag => this._getTagVersion(tag)));
+          activeTagVersions = {};
+          for (let i = 0; i < opts.tags.length; i++) {
+            activeTagVersions[opts.tags[i]] = vers[i];
+          }
         } else {
-          await client.setex(k, ttlSec, stored);
+          await this._registerTags(k, opts.tags, ttlSeconds);
         }
-        this.cb.onSuccess();
-      } catch (err) {
-        this.cb.onFailure();
-        this.logger.debug('set: Redis unavailable', { cacheKey, error: (err as Error).message });
       }
-    }
 
-    void this.publishInvalidation('del', k);
-    span.end();
+      this.l1.set(k, data, ttlMs, p, undefined, undefined, activeTagVersions);
+
+      // Register dependency patterns: when any key matching a pattern is deleted,
+      // this key (k) is automatically cascaded.
+      if (opts?.dependsOn?.length) {
+        for (const pattern of opts.dependsOn) {
+          const nsPattern = this.nk(pattern);
+          let deps = this.dependencyIndex.get(nsPattern);
+          if (!deps) { deps = new Set(); this.dependencyIndex.set(nsPattern, deps); }
+          deps.add(k);
+        }
+      }
+
+      if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
+        try {
+          const client = await this.getRedis();
+          const s      = JSON.stringify(data);
+          const stored = await this._serializeAndEncrypt(s);
+          const ttlSec = Math.ceil(ttlMs / 1_000);
+          if (this.opts.tagStrategy === 'generational' && activeTagVersions) {
+            const now = Date.now();
+            const tx = client.multi();
+            tx.hset(k, {
+              d: stored,
+              t: String(now),
+              tv: JSON.stringify(activeTagVersions),
+            });
+            tx.expire(k, ttlSec);
+            await tx.exec();
+          } else {
+            await client.setex(k, ttlSec, stored);
+          }
+          this.cb.onSuccess();
+        } catch (err) {
+          this.cb.onFailure();
+          this.logger.debug('set: Redis unavailable', { cacheKey, error: (err as Error).message });
+        }
+      }
+
+      void this.publishInvalidation('del', k);
+    } catch (err) {
+      span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
+      span.recordException?.(err);
+      throw err;
+    } finally {
+      span.end();
+    }
   }
 
   /**
@@ -2329,45 +2371,52 @@ export class CacheService {
   async delete(cacheKey: string): Promise<void> {
     const span      = this._startSpan('tricache.delete');
     if (this.opts.tracer) span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
-    const isPattern = cacheKey.includes('*');
-    const k         = this.nk(cacheKey);
-    this.counters.deletes++;
+    try {
+      const isPattern = cacheKey.includes('*');
+      const k         = this.nk(cacheKey);
+      this.counters.deletes++;
 
-    if (isPattern) {
-      this.l1.deletePattern(k);
-    } else {
-      this.l1.delete(k);
-      // Defer the synchronous SHA-256 hash + fs syscalls to the next event-loop tick so
-      // the caller's await resolves without blocking.  Matches what the backplane handler
-      // already does for remote invalidations: setImmediate(() => this.disk.delete(msg.key)).
-      // A re-get in the narrow window before the deferred call fires would get an L1 miss
-      // and promote the disk entry back — acceptable for a cache (same trade-off the backplane
-      // path already accepts).
-      setImmediate(() => { if (!this._diskDisabled) this.disk.delete(k); });
-      // Cascade: invalidate any key that declared it depends on this exact key's pattern
-      this._cascadeDependencies(k);
-      // Clean up: remove k from all dependency registrations (it is gone)
-      for (const [, dependents] of this.dependencyIndex) dependents.delete(k);
-    }
-
-    if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
-      try {
-        const client = await this.getRedis();
-        if (isPattern) {
-          const keys = await this._scanKeys(client, k);
-          if (keys.length > 0) await client.del(...keys);
-        } else {
-          await client.del(k);
-        }
-        this.cb.onSuccess();
-      } catch (err) {
-        this.cb.onFailure();
-        this.logger.debug('delete: Redis unavailable', { cacheKey, error: (err as Error).message });
+      if (isPattern) {
+        this.l1.deletePattern(k);
+      } else {
+        this.l1.delete(k);
+        // Defer the synchronous SHA-256 hash + fs syscalls to the next event-loop tick so
+        // the caller's await resolves without blocking.  Matches what the backplane handler
+        // already does for remote invalidations: setImmediate(() => this.disk.delete(msg.key)).
+        // A re-get in the narrow window before the deferred call fires would get an L1 miss
+        // and promote the disk entry back — acceptable for a cache (same trade-off the backplane
+        // path already accepts).
+        setImmediate(() => { if (!this._diskDisabled) this.disk.delete(k); });
+        // Cascade: invalidate any key that declared it depends on this exact key's pattern
+        this._cascadeDependencies(k);
+        // Clean up: remove k from all dependency registrations (it is gone)
+        for (const [, dependents] of this.dependencyIndex) dependents.delete(k);
       }
-    }
 
-    void this.publishInvalidation(isPattern ? 'del-glob' : 'del', k, undefined, false, true);
-    span.end();
+      if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
+        try {
+          const client = await this.getRedis();
+          if (isPattern) {
+            const keys = await this._scanKeys(client, k);
+            if (keys.length > 0) await client.del(...keys);
+          } else {
+            await client.del(k);
+          }
+          this.cb.onSuccess();
+        } catch (err) {
+          this.cb.onFailure();
+          this.logger.debug('delete: Redis unavailable', { cacheKey, error: (err as Error).message });
+        }
+      }
+
+      void this.publishInvalidation(isPattern ? 'del-glob' : 'del', k, undefined, false, true);
+    } catch (err) {
+      span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
+      span.recordException?.(err);
+      throw err;
+    } finally {
+      span.end();
+    }
   }
 
   // ── Counter (distributed rate limiting) ──────────────────────────────────
@@ -2434,37 +2483,47 @@ export class CacheService {
    * await cache.clear('user:abc'); // flush all keys for one user
    */
   async clear(prefix?: string): Promise<void> {
-    this.counters.deletes++;
-    const k = prefix
-      ? this.nk(prefix.includes('*') ? prefix : `${prefix}*`)
-      : undefined;
+    const span = this._startSpan('tricache.clear');
+    if (this.opts.tracer) span.setAttribute('cache.prefix', prefix || '*');
+    try {
+      this.counters.deletes++;
+      const k = prefix
+        ? this.nk(prefix.includes('*') ? prefix : `${prefix}*`)
+        : undefined;
 
-    if (k) {
-      this.l1.deletePattern(k);
-      // Disk-tier pattern delete is not supported (files are keyed by SHA-256 hash);
-      // prefix-scoped clears only evict from L1, matching existing delete('glob*') semantics.
-    } else {
-      this.l1.clear();
-      if (!this._diskDisabled) this.disk.clear();
-      this._l1Counters.clear();
-      this.tagIndex.clear();
-      this.tagVersions.clear();
-    }
-
-    if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
-      try {
-        const client  = await this.getRedis();
-        const pattern = k ?? (this._namespace ? `${this._namespace}:*` : '*');
-        const keys    = await this._scanKeys(client, pattern);
-        if (keys.length > 0) await client.del(...keys);
-      } catch (err) {
-        this.logger.debug('clear: Redis unavailable', { error: (err as Error).message });
+      if (k) {
+        this.l1.deletePattern(k);
+        // Disk-tier pattern delete is not supported (files are keyed by SHA-256 hash);
+        // prefix-scoped clears only evict from L1, matching existing delete('glob*') semantics.
+      } else {
+        this.l1.clear();
+        if (!this._diskDisabled) this.disk.clear();
+        this._l1Counters.clear();
+        this.tagIndex.clear();
+        this.tagVersions.clear();
       }
-    }
 
-    void this.publishInvalidation('del-glob',
-      k ?? (this._namespace ? `${this._namespace}:*` : '*'),
-      undefined, false, true);
+      if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
+        try {
+          const client  = await this.getRedis();
+          const pattern = k ?? (this._namespace ? `${this._namespace}:*` : '*');
+          const keys    = await this._scanKeys(client, pattern);
+          if (keys.length > 0) await client.del(...keys);
+        } catch (err) {
+          this.logger.debug('clear: Redis unavailable', { error: (err as Error).message });
+        }
+      }
+
+      void this.publishInvalidation('del-glob',
+        k ?? (this._namespace ? `${this._namespace}:*` : '*'),
+        undefined, false, true);
+    } catch (err) {
+      span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
+      span.recordException?.(err);
+      throw err;
+    } finally {
+      span.end();
+    }
   }
 
   /**
@@ -2693,110 +2752,132 @@ export class CacheService {
     ttl: number | ((key: string) => number) = 300,
     priority?: CachePriority,
   ): Promise<(T | undefined)[]> {
-    const result: (T | undefined)[] = Array.from({ length: keys.length });
-    const missIndexes: number[] = [];
-    const missKeys:   string[]  = [];
-
-    // ── Tier 1: L1 (in-memory) ──
-    for (let i = 0; i < keys.length; i++) {
-      const k = this.nk(keys[i]);
-      const entry = this.l1.getEntry(k);
-      if (entry && entry.expiresAt > Date.now()) {
-        result[i] = (entry.value !== undefined ? entry.value : this.codec.decode(entry.data)) as T;
-        this.counters.l1Hits++;
-      } else {
-        missIndexes.push(i);
-        missKeys.push(keys[i]);
-      }
+    const span = this._startSpan('tricache.mget');
+    if (this.opts.tracer) {
+      span.setAttribute('cache.batch.size', keys.length);
     }
+    try {
+      const result: (T | undefined)[] = Array.from({ length: keys.length });
+      const missIndexes: number[] = [];
+      const missKeys:   string[]  = [];
 
-    if (missKeys.length === 0) return result;
-
-    // ── Tier 2: L2 (Redis) — fetch all remaining misses in one pipeline ──
-    if (!this._redisDisabled) {
-      try {
-        const client = await this.getRedis();
-        const nsKeys = missKeys.map(k => this.nk(k));
-        const pipeline = client.multi();
-        for (const nk of nsKeys) pipeline.get(nk);
-        const raws = await pipeline.exec() as Array<[Error | null, string | null] | null>;
-        this.cb.onSuccess();
-        for (let j = 0; j < missKeys.length; j++) {
-          const raw = raws[j] ? (raws[j] as [Error | null, string | null])[1] : null;
-          const idx = missIndexes[j];
-          if (raw) {
-            const parsed = await this._decryptAndDeserialize<T>(raw);
-            const k = nsKeys[j];
-            const p = priority ?? inferPriority(missKeys[j]);
-            this.l1.set(k, parsed, this._jitterTtl((typeof ttl === 'function' ? ttl(missKeys[j]) : ttl) * 1_000), p);
-            this.counters.l2Hits++;
-            result[idx] = parsed;
-            // Mark this miss slot as resolved (position j in the parallel arrays).
-            // NOTE: must use j here, NOT idx — idx is the value (an index into the
-            // original keys[]), which only equals j when missIndexes is contiguous
-            // (every key missed). With interleaved L1 hits, missIndexes is sparse
-            // and missIndexes[idx] would clobber an unrelated slot.
-            missIndexes[j] = -1;
-            missKeys[j] = '';
-          }
+      // ── Tier 1: L1 (in-memory) ──
+      for (let i = 0; i < keys.length; i++) {
+        const k = this.nk(keys[i]);
+        const entry = this.l1.getEntry(k);
+        if (entry && entry.expiresAt > Date.now()) {
+          result[i] = (entry.value !== undefined ? entry.value : this.codec.decode(entry.data)) as T;
+          this.counters.l1Hits++;
+        } else {
+          missIndexes.push(i);
+          missKeys.push(keys[i]);
         }
-        // Compact the still-missing arrays.
-        const remainingIdx = missIndexes.filter(i => i >= 0);
-        const remainingKeys = missKeys.filter(k => k !== '');
-        missIndexes.length = 0; missKeys.length = 0;
-        missIndexes.push(...remainingIdx);
-        missKeys.push(...remainingKeys);
-        if (missKeys.length === 0) return result;
-      } catch (err) {
-        this.cb.onFailure();
-        this.logger.debug('mget: Redis unavailable, continuing to disk/fetch', { error: (err as Error).message });
       }
-    }
 
-    // ── Tier 1.5: disk spill (evicted L1 entries) ──
-    if (!this._diskDisabled) {
-      for (let j = missKeys.length - 1; j >= 0; j--) {
-        const k = this.nk(missKeys[j]);
-        const diskHit = this.disk.load(k);
-        if (diskHit !== null) {
-          const promoted = this.l1.importEntries(
-            [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
-            this.opts.forbiddenSnapshotPrefixes,
-          );
-          if (promoted > 0) {
-            const l1Check = this.l1.get(k);
-            if (l1Check !== null) {
-              this.counters.diskHits++;
-              result[missIndexes[j]] = l1Check.value as T;
-              // Remove from miss set.
-              missIndexes.splice(j, 1);
-              missKeys.splice(j, 1);
+      if (missKeys.length === 0) {
+        if (this.opts.tracer) {
+          span.setAttribute('cache.hits', keys.length);
+          span.setAttribute('cache.misses', 0);
+          span.setAttribute('cache.l1_hits', keys.length);
+          span.setAttribute('cache.l2_hits', 0);
+        }
+        return result;
+      }
+
+      let l2HitCount = 0;
+      // ── Tier 2: L2 (Redis) — fetch all remaining misses in one pipeline ──
+      if (!this._redisDisabled) {
+        try {
+          const client = await this.getRedis();
+          const nsKeys = missKeys.map(k => this.nk(k));
+          const pipeline = client.multi();
+          for (const nk of nsKeys) pipeline.get(nk);
+          const raws = await pipeline.exec() as Array<[Error | null, string | null] | null>;
+          this.cb.onSuccess();
+          for (let j = 0; j < missKeys.length; j++) {
+            const raw = raws[j] ? (raws[j] as [Error | null, string | null])[1] : null;
+            const idx = missIndexes[j];
+            if (raw) {
+              const parsed = await this._decryptAndDeserialize<T>(raw);
+              const k = nsKeys[j];
+              const p = priority ?? inferPriority(missKeys[j]);
+              this.l1.set(k, parsed, this._jitterTtl((typeof ttl === 'function' ? ttl(missKeys[j]) : ttl) * 1_000), p);
+              this.counters.l2Hits++;
+              l2HitCount++;
+              result[idx] = parsed;
+              missIndexes[j] = -1;
+              missKeys[j] = '';
+            }
+          }
+          // Compact the still-missing arrays.
+          const remainingIdx = missIndexes.filter(i => i >= 0);
+          const remainingKeys = missKeys.filter(k => k !== '');
+          missIndexes.length = 0; missKeys.length = 0;
+          missIndexes.push(...remainingIdx);
+          missKeys.push(...remainingKeys);
+        } catch (err) {
+          this.cb.onFailure();
+          this.logger.debug('mget: Redis unavailable, continuing to disk/fetch', { error: (err as Error).message });
+        }
+      }
+
+      // ── Tier 1.5: disk spill (evicted L1 entries) ──
+      if (!this._diskDisabled && missKeys.length > 0) {
+        for (let j = missKeys.length - 1; j >= 0; j--) {
+          const k = this.nk(missKeys[j]);
+          const diskHit = this.disk.load(k);
+          if (diskHit !== null) {
+            const promoted = this.l1.importEntries(
+              [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
+              this.opts.forbiddenSnapshotPrefixes,
+            );
+            if (promoted > 0) {
+              const l1Check = this.l1.get(k);
+              if (l1Check !== null) {
+                this.counters.diskHits++;
+                result[missIndexes[j]] = l1Check.value as T;
+                missIndexes.splice(j, 1);
+                missKeys.splice(j, 1);
+              }
             }
           }
         }
       }
-      if (missKeys.length === 0) return result;
-    }
 
-    // ── Tier 3: fetchFn for whatever still missed ──
-    if (missKeys.length > 0) {
-      this.counters.fetches++;
-      const fetched = await fetchFn(missKeys);
-      const setPromises: Promise<void>[] = [];
-      for (let j = 0; j < missKeys.length; j++) {
-        const v = fetched[missKeys[j]];
-        result[missIndexes[j]] = v;
-        if (v !== undefined) {
-          const resolvedTtl = typeof ttl === 'function' ? ttl(missKeys[j]) : ttl;
-          setPromises.push(this.set(missKeys[j], v, resolvedTtl, priority));
+      // ── Tier 3: fetchFn for whatever still missed ──
+      if (missKeys.length > 0) {
+        this.counters.fetches++;
+        const fetched = await fetchFn(missKeys);
+        const setPromises: Promise<void>[] = [];
+        for (let j = 0; j < missKeys.length; j++) {
+          const v = fetched[missKeys[j]];
+          result[missIndexes[j]] = v;
+          if (v !== undefined) {
+            const resolvedTtl = typeof ttl === 'function' ? ttl(missKeys[j]) : ttl;
+            setPromises.push(this.set(missKeys[j], v, resolvedTtl, priority));
+          }
+        }
+        if (setPromises.length > 0) {
+          await Promise.all(setPromises);
         }
       }
-      if (setPromises.length > 0) {
-        await Promise.all(setPromises);
-      }
-    }
 
-    return result;
+      if (this.opts.tracer) {
+        const finalMisses = missKeys.length;
+        const totalHits = keys.length - finalMisses;
+        span.setAttribute('cache.hits', totalHits);
+        span.setAttribute('cache.misses', finalMisses);
+        span.setAttribute('cache.l2_hits', l2HitCount);
+      }
+
+      return result;
+    } catch (err) {
+      span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
+      span.recordException?.(err);
+      throw err;
+    } finally {
+      span.end();
+    }
   }
 
   /**
@@ -2912,49 +2993,62 @@ export class CacheService {
    * await cache.invalidateTag('catalog'); // clears product:1 and any other tagged entries
    */
   async invalidateTag(tag: string): Promise<void> {
-    if (this.opts.tagStrategy === 'generational') {
-      let newVer = 1;
-      if (!this._redisDisabled) {
-        try {
-          const client = await this.getRedis();
-          newVer = await client.incr(this.nk(`tag_ver:${tag}`));
-        } catch (err) {
-          this.logger.debug('invalidateTag: Redis unavailable', { tag, error: (err as Error).message });
+    const span = this._startSpan('tricache.invalidate_tag');
+    if (this.opts.tracer) {
+      span.setAttribute('cache.tag', tag);
+      span.setAttribute('cache.tag_strategy', this.opts.tagStrategy);
+    }
+    try {
+      if (this.opts.tagStrategy === 'generational') {
+        let newVer = 1;
+        if (!this._redisDisabled) {
+          try {
+            const client = await this.getRedis();
+            newVer = await client.incr(this.nk(`tag_ver:${tag}`));
+          } catch (err) {
+            this.logger.debug('invalidateTag: Redis unavailable', { tag, error: (err as Error).message });
+            const current = this.tagVersions.get(tag)?.version ?? 0;
+            newVer = current + 1;
+          }
+        } else {
           const current = this.tagVersions.get(tag)?.version ?? 0;
           newVer = current + 1;
         }
-      } else {
-        const current = this.tagVersions.get(tag)?.version ?? 0;
-        newVer = current + 1;
+        this._setLocalTagVersion(tag, newVer, Date.now());
+        void this.publishInvalidation('tag_incr', tag, newVer, false, true);
+        return;
       }
-      this._setLocalTagVersion(tag, newVer, Date.now());
-      void this.publishInvalidation('tag_incr', tag, newVer, false, true);
-      return;
-    }
 
-    const tagKey  = this.nk(`_tag_:${tag}`);
-    const members = this.tagIndex.get(tagKey) ?? new Set<string>();
+      const tagKey  = this.nk(`_tag_:${tag}`);
+      const members = this.tagIndex.get(tagKey) ?? new Set<string>();
 
-    // Remove from L1 + disk
-    for (const k of members) {
-      this.l1.delete(k);
-      if (!this._diskDisabled) this.disk.delete(k);
-    }
-    this.tagIndex.delete(tagKey);
+      // Remove from L1 + disk
+      for (const k of members) {
+        this.l1.delete(k);
+        if (!this._diskDisabled) this.disk.delete(k);
+      }
+      this.tagIndex.delete(tagKey);
 
-    if (!this._redisDisabled) {
-      try {
-        const client = await this.getRedis();
-        const redisMembers: string[] = await client.smembers(tagKey);
-        const toDelete = [...new Set([...members, ...redisMembers])];
-        if (toDelete.length > 0) {
-          await client.del(...toDelete, tagKey);
-        } else {
-          await client.del(tagKey);
+      if (!this._redisDisabled) {
+        try {
+          const client = await this.getRedis();
+          const redisMembers: string[] = await client.smembers(tagKey);
+          const toDelete = [...new Set([...members, ...redisMembers])];
+          if (toDelete.length > 0) {
+            await client.del(...toDelete, tagKey);
+          } else {
+            await client.del(tagKey);
+          }
+        } catch (err) {
+          this.logger.debug('invalidateTag: Redis unavailable', { tag, error: (err as Error).message });
         }
-      } catch (err) {
-        this.logger.debug('invalidateTag: Redis unavailable', { tag, error: (err as Error).message });
       }
+    } catch (err) {
+      span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
+      span.recordException?.(err);
+      throw err;
+    } finally {
+      span.end();
     }
   }
 

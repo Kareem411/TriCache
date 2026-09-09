@@ -13,9 +13,18 @@ import type { CrossRegionRelayOptions } from './cross-region';
  * Minimal span interface — structurally compatible with `@opentelemetry/api` Span.
  * Pass your existing OTEL tracer; no extra package required.
  */
+export interface ICacheSpanLink {
+  context: {
+    traceId: string;
+    spanId: string;
+    traceFlags?: number;
+  };
+}
+
 export interface ICacheSpan {
   setAttribute(key: string, value: string | number | boolean): this;
   setStatus(status: { code: 0 | 1 | 2; message?: string }): this;
+  recordException?(err: Error | unknown): this;
   end(): void;
 }
 
@@ -23,7 +32,7 @@ export interface ICacheSpan {
  * Minimal tracer interface — structurally compatible with `@opentelemetry/api` Tracer.
  */
 export interface ICacheTracer {
-  startSpan(name: string): ICacheSpan;
+  startSpan(name: string, options?: { links?: ICacheSpanLink[] }): ICacheSpan;
 }
 
 /** Minimal logger interface — plug in any logger (pino, winston, console, etc.) */
