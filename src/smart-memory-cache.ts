@@ -13,7 +13,8 @@
  */
 
 import { CacheCodec, defaultCodec } from './codec.js';
-import type { CacheHit, CachePriority, CategoryLimit, SmartCacheEntry, ILogger, EvictionReason } from './types';
+import type { CacheHit, CachePriority, CategoryLimit, SmartCacheEntry, ILogger, EvictionReason, WTinyLfuStats } from './types';
+import { WTinyLfuPolicy } from './wtiny-lfu.js';
 
 /**
  * Packed-byte threshold above which the live JS object is NOT stored alongside the
@@ -259,6 +260,13 @@ export interface SmartMemoryCacheOptions {
   evictionWatermark?: number;
   /** Custom binary codec (defaults to defaultCodec with record structures and rich types enabled). */
   codec?:            CacheCodec;
+  /**
+   * Admission policy:
+   *  - 'wtinylfu': Window TinyLFU segmented admission with mathematical scan resistance.
+   *  - 'adaptive': Adaptive LFU x LRU x priority reservoir sampling.
+   * Default: 'adaptive' (unless explicitly set to 'wtinylfu')
+   */
+  admissionPolicy?:  'wtinylfu' | 'adaptive';
 }
 
 export class SmartMemoryCache {
@@ -270,6 +278,7 @@ export class SmartMemoryCache {
   private readonly categoryPrefixes: string[];
   /** Historical frequency sketch — survives eviction, closes same-priority burst-flood gap. */
   private readonly sketch = new CountMinSketch();
+  private readonly wtinyPolicy?:     WTinyLfuPolicy;
   private totalSize                  = 0;
   private categoryCount              = new Map<string, number>();
   private categorySize               = new Map<string, number>();
@@ -300,6 +309,9 @@ export class SmartMemoryCache {
     this.codec            = opts.codec ?? defaultCodec;
     this.bloom            = createBloomFilter(opts.logger, opts.maxEntries);
     this.categoryPrefixes = Object.keys(opts.categories).filter(k => k !== 'default');
+    if (opts.admissionPolicy === 'wtinylfu') {
+      this.wtinyPolicy = new WTinyLfuPolicy(opts.maxEntries, this.sketch);
+    }
 
     if (existing) {
       for (const [k, v] of existing) this.cache.set(k, v);
@@ -315,6 +327,12 @@ export class SmartMemoryCache {
     this.categoryCount.clear();
     this.categorySize.clear();
     this.categoryKeys.clear();
+    if (this.wtinyPolicy) {
+      this.wtinyPolicy.clear();
+      for (const key of this.cache.keys()) {
+        this.wtinyPolicy.onSet(key, false);
+      }
+    }
     for (const [key, entry] of this.cache) {
       this.totalSize += entry.size;
       const cat = this.getCategory(key);
@@ -340,6 +358,7 @@ export class SmartMemoryCache {
   private _delete(key: string, reason: EvictionReason = 'manual'): boolean {
     const entry = this.cache.get(key);
     if (!entry) return false;
+    this.wtinyPolicy?.onDelete(key);
     const cat = this.getCategory(key);
     this.totalSize -= entry.size;
     this.categoryCount.set(cat, (this.categoryCount.get(cat) ?? 1) - 1);
@@ -528,6 +547,7 @@ export class SmartMemoryCache {
     entry.lastAccess = now;
     // Sample sketch at 25 % — eviction scoring only needs relative frequency, not exact counts.
     if ((entry.hits & 3) === 0) this.sketch.increment(key);
+    this.wtinyPolicy?.onAccess(key);
     // value is cached at write time — hot reads return the live object directly,
     // skipping unpack. Falls back to decode for entries restored from disk/snapshot.
     const value = entry.value !== undefined ? entry.value : this.codec.decode(entry.data as Buffer);
@@ -580,7 +600,57 @@ export class SmartMemoryCache {
       this.categorySize.set(cat, (this.categorySize.get(cat) ?? existingEntry.size) - existingEntry.size);
       this.cache.delete(key);
     }
-    this.ensureCapacity(cat, size);
+
+    if (this.wtinyPolicy) {
+      const decision = this.wtinyPolicy.onSet(key, Boolean(existingEntry));
+      if (!decision.admit) {
+        if (decision.candidateKey === key) {
+          // Candidate itself was rejected by TinyLFU admission gate
+          if (this.opts.diskSpill) {
+            const now = Date.now();
+            const liveValue = size <= LARGE_VALUE_BYTES ? data : undefined;
+            this.opts.diskSpill(key, {
+              data: packed,
+              value: liveValue,
+              isCompressed: true,
+              expiresAt: now + ttlMs,
+              staleAt,
+              size,
+              hits: 1,
+              lastAccess: now,
+              priority,
+              ttlMs,
+              delta,
+              setAt: now,
+              tagVersions,
+            });
+          }
+          return;
+        } else if (decision.candidateKey) {
+          // An older window candidate was rejected to make room for key
+          const candEntry = this.cache.get(decision.candidateKey);
+          if (candEntry && this.opts.diskSpill) {
+            this.opts.diskSpill(decision.candidateKey, candEntry);
+          }
+          this._delete(decision.candidateKey, 'capacity');
+        }
+      } else if (decision.evictKey) {
+        // Main cache victim evicted to admit candidate
+        const victimEntry = this.cache.get(decision.evictKey);
+        if (victimEntry && this.opts.diskSpill) {
+          this.opts.diskSpill(decision.evictKey, victimEntry);
+        }
+        this._delete(decision.evictKey, 'capacity');
+      }
+
+      // Check category byte limit or total byte limit
+      const catSz = this.categorySize.get(cat) ?? 0;
+      if (catSz + size > lim.maxSizeBytes || this.totalSize + size > this.opts.maxBytes) {
+        this.ensureCapacity(cat, size);
+      }
+    } else {
+      this.ensureCapacity(cat, size);
+    }
 
     const now = Date.now();
     // Only cache the live object for small entries — large entries would store the packed
@@ -660,6 +730,7 @@ export class SmartMemoryCache {
     }
     const count = this.cache.size;
     this.cache.clear();
+    this.wtinyPolicy?.clear();
     this.totalSize = 0;
     this.categoryCount.clear();
     this.categorySize.clear();
@@ -1026,5 +1097,13 @@ export class SmartMemoryCache {
     }
     out.sort((a, b) => b.hits - a.hits);
     return out.slice(0, n);
+  }
+
+  /**
+   * Return real-time metrics and telemetry for the Window TinyLFU admission policy.
+   * Returns `undefined` when running under default adaptive eviction.
+   */
+  getWTinyLfuStats(): WTinyLfuStats | undefined {
+    return this.wtinyPolicy?.getStats();
   }
 }

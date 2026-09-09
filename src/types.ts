@@ -340,6 +340,14 @@ export interface CacheOptions {
    * Default: ['auth:', 'session:', 'mfa:', 'rate_limit:']
    */
   forbiddenSnapshotPrefixes?: string[];
+  /**
+   * L1 cache admission and eviction policy:
+   *  - `'wtinylfu'`: Window TinyLFU admission policy (popularized by Caffeine) providing
+   *                 mathematical scan resistance and burst recency absorption.
+   *  - `'adaptive'`: Adaptive LFU x LRU x priority reservoir sampling.
+   * Default: `'wtinylfu'`
+   */
+  l1AdmissionPolicy?: 'wtinylfu' | 'adaptive';
 
   // ── L1.5 (disk tier) ────────────────────────────────────────────────────
   /** Directory used for L1.5 disk-spill files. Default: os.tmpdir()/tricache-disk */
@@ -1073,4 +1081,22 @@ export interface DiskBackpressureStats {
   spillsDropped: number;
   circuitState: 'closed' | 'open' | 'half-open';
   lastTripTimestamp: number;
+}
+
+/**
+ * Telemetry metrics and counters for Window TinyLFU cache admission.
+ */
+export interface WTinyLfuStats {
+  capacity: number;
+  size: number;
+  windowSize: number;
+  probationSize: number;
+  protectedSize: number;
+  hits: number;
+  misses: number;
+  hitRate: number;
+  admissions: number;
+  rejections: number;
+  demotions: number;
+  promotions: number;
 }

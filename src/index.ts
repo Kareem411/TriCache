@@ -20,6 +20,14 @@
 export { CacheService, ProcessTerminationBus } from './cache-service';
 export { CacheEncryption, type EncryptionMode } from './encryption';
 export { SmartMemoryCache }    from './smart-memory-cache';
+export {
+  WTinyLfuCache,
+  WTinyLfuPolicy,
+  TinyLfuSketch,
+  type WTinyLfuOptions,
+  type WTinyLfuStats,
+  type EvictionResult,
+} from './wtiny-lfu';
 export { DiskTier }            from './disk-tier';
 export { WasmBloomFilter }     from './wasm/bloom-filter-wasm';
 export { type CompressionAlgorithm } from './compression';

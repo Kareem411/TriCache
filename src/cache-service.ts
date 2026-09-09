@@ -46,6 +46,7 @@ import {
   ICacheMeter,
   ICacheCounter,
   IRedisDriver,
+  WTinyLfuStats,
 } from './types';
 import { CacheEncryption, type EncryptionMode } from './encryption';
 import { SmartMemoryCache }  from './smart-memory-cache';
@@ -489,6 +490,7 @@ export class CacheService {
     diskCircuitBreakerCooldownMs?: number;
     redisCommandTimeoutMs?: number;
     clockSkewToleranceMs: number;
+    l1AdmissionPolicy?: 'wtinylfu' | 'adaptive';
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -688,6 +690,7 @@ export class CacheService {
       diskCircuitBreakerCooldownMs: options.diskCircuitBreakerCooldownMs,
       redisCommandTimeoutMs:    options.redisCommandTimeoutMs,
       clockSkewToleranceMs:     options.clockSkewToleranceMs ?? 250,
+      l1AdmissionPolicy:        options.l1AdmissionPolicy,
     };
 
     this.codec = new CacheCodec({
@@ -755,6 +758,7 @@ export class CacheService {
       maxEntries: this.opts.l1MaxEntries,
       categories: this.opts.categoryLimits,
       evictionWatermark: this.opts.l1EvictionWatermark,
+      admissionPolicy: this.opts.l1AdmissionPolicy,
       codec:      this.codec,
       diskSpill: (key: string, entry: SmartCacheEntry) => {
         if (this._diskDisabled) return; // Fix 3: skip spill in serverless environments
@@ -3924,6 +3928,14 @@ export class CacheService {
       this.redis = null;
     }
     if (!this._diskDisabled) this.disk.close();
+  }
+
+  /**
+   * Return real-time telemetry and metrics for the Window TinyLFU admission policy.
+   * Returns `undefined` if W-TinyLFU admission is not active.
+   */
+  getWTinyLfuStats(): WTinyLfuStats | undefined {
+    return this.l1.getWTinyLfuStats();
   }
 
 }

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-703%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-725%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 20](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
@@ -50,6 +50,7 @@ tricache is a three-tier Node.js cache library — in-memory (L1), local disk sp
 | **Read Safety (`cloneStrategy`)** | `cloneStrategy: 'structuredClone'` isolates returned objects from caller mutation; sub-microsecond raw reference fallback (`'none'`) |
 | **Redis Streams Backplane** | `backplaneMode: 'stream'` replaces at-most-once Pub/Sub with durable `XADD`/`XREAD` append-only log; cluster hash tag slot safety and zero-drop reconnect replay |
 | **Atomic Disk Writes** | Atomic staging via unique `.tmp` sibling files with Windows NTFS file-lock micro-retries and background `.tmp` janitor sweep |
+| **Window TinyLFU (W-TinyLFU)** | Native W-TinyLFU admission policy (`l1AdmissionPolicy: 'wtinylfu'`) with Window LRU (~1%), Protected SLRU (~80%), Probationary SLRU (~20%), Count-Min Sketch frequency gate, and near-100% scan resistance against sequential flood attacks |
 | **Adaptive eviction** | LFU × LRU × priority score + Count-Min Sketch cross-eviction frequency; reservoir-sampled O(1) hot path; category limits prevent any prefix monopolising RAM |
 | **Count-Min Sketch** | 4 × 512 `Uint16Array` (4 KB) tracks historical access frequency across eviction boundaries — same-priority burst keys cannot displace long-resident entries; **84 % survival rate** in benchmark flood tests |
 | **WASM Bloom filter** | 562-byte binary inlined as Base64 — O(k=7) guaranteed-miss detection, no filesystem access, pure-JS fallback |
@@ -572,6 +573,19 @@ const hot = cache.hotKeys(5);
 //   { key: 'product:7', hits:  893, sizeBytes: 256 },
 //   ...
 // ]
+```
+
+### `cache.getWTinyLfuStats()` → `WTinyLfuStats | undefined`
+
+Returns real-time telemetry metrics for the Window TinyLFU admission policy (hits, misses, hitRate, admissions, rejections, promotions, demotions, and segment sizes). Returns `undefined` when running under default adaptive eviction.
+
+```typescript
+const stats = cache.getWTinyLfuStats();
+if (stats) {
+  console.log(`W-TinyLFU hit rate: ${(stats.hitRate * 100).toFixed(1)}%`);
+  console.log(`Window: ${stats.windowSize}, Probation: ${stats.probationSize}, Protected: ${stats.protectedSize}`);
+  console.log(`Scan rejections: ${stats.rejections}, Promotions: ${stats.promotions}`);
+}
 ```
 
 ### `cache.invalidateTag(tag)` / `cache.invalidateTags(tags)` → `Promise<void>`

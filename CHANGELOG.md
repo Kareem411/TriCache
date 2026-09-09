@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.8.0] — 2026-09-09
 
 ### Added
+- **Native Window TinyLFU (W-TinyLFU) Admission Engine (`src/wtiny-lfu.ts`)** — Full native implementation of the W-TinyLFU segmented cache admission policy popularized by Caffeine:
+  - Three-tier segmented architecture: Window Cache (LRU, ~1% capacity) absorbs burst-recency spikes without polluting resident entries; Segmented LRU divides the main cache into Probationary SLRU (~20%) and Protected SLRU (~80%).
+  - TinyLFU Admission Gate: When the Window overflows, its LRU victim competes against the Probationary victim in a 4-row Count-Min Sketch. Candidates with higher historical frequency are admitted, while low-frequency candidates are rejected.
+  - Mathematical Scan Resistance: Sequential scans (e.g. 1,000 one-off keys) are dropped by the TinyLFU gate with >90% rejection rates, preserving 100% hit retention for resident hot items.
+  - Dual Mode Support: Available as a high-performance standalone cache (`WTinyLfuCache<K, V>`), an admission policy controller (`WTinyLfuPolicy`), or integrated into `SmartMemoryCache` and `CacheService` via `l1AdmissionPolicy: 'wtinylfu'`.
+  - Rejection Spill Integration: Rejected candidates seamlessly spill to the L1.5 disk tier when `diskSpill` is configured.
+  - Real-Time Telemetry: Exposed via `cache.getWTinyLfuStats()` and `wtinyCache.stats()` tracking hit rates, admissions, rejections, promotions, demotions, and segment sizes.
 - **Zero-Dependency AWS SigV4 Snapshot Adapter (`src/sigv4-snapshot-adapter.ts`)** — Lightweight (~150 LOC) AWS SigV4 signer built purely on standard Web Crypto (`crypto.subtle`) and `fetch`:
   - Enables stateless container pods (Kubernetes, AWS ECS/Fargate, GCP Cloud Run) and edge isolates to persist and hydrate L1 snapshots directly to/from AWS S3, Cloudflare R2, MinIO, or custom S3-compatible object storage without pulling in the 30MB `@aws-sdk/client-s3` dependency.
   - Implements canonical request hashing, string-to-sign generation, and chained HMAC key derivation (`kDate` → `kRegion` → `kService` → `kSigning`).
