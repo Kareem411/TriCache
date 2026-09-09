@@ -21,6 +21,15 @@ export interface IEdgeRemoteStorage {
 
   /** Optional clear by prefix or all keys. */
   clear?(prefix?: string): Promise<void>;
+
+  /** Optional atomic or monotonic tag version increment for generational tag invalidation. */
+  incrementTagVersion?(tag: string): Promise<number>;
+
+  /** Optional tag version retrieval. */
+  getTagVersion?(tag: string): Promise<number>;
+
+  /** Optional batch tag version retrieval. */
+  batchGetTagVersions?(tags: string[]): Promise<Record<string, number>>;
 }
 
 /**

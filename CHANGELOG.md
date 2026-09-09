@@ -5,9 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] — 2026-09-09
 
 ### Added
+- **Node 20 LTS Engine Compatibility (`engines: ">=20.10.0"`)** — Lowered the supported runtime floor from Node $\ge 22.13.0$ to Node $\ge 20.10.0$ by adding safe dynamic module probing in `disk-tier.ts` and `availableParallelism` fallback in `worker-pool.ts`.
+- **`ProcessTerminationBus` with Idle Listener Teardown (`src/cache-service.ts`)** — Centralized OS `SIGTERM`/`SIGINT` handling through a single static bus. Eliminates `MaxListenersExceededWarning` across multi-tenant microservices and ephemeral test runners, and automatically detaches process listeners when the active instance registry drops to zero to prevent test runner event loop hangs.
+- **OpenTelemetry Semantic Conventions & Batch Spans** — Full alignment with OTEL Cache Semantic Conventions:
+  - `cache.hit` standardized to strict `boolean` (`true` or `false`).
+  - Added `cache.item.tier` (`'memory'`, `'disk'`, `'remote'`).
+  - Retained legacy `cache.hit_tier` (`'l1'`, `'disk'`, `'l2'`, `'miss'`) for complete backward compatibility with existing APM / Grafana dashboards.
+  - Added batch spans `tricache.mset` and `tricache.mdel` tracking `cache.batch.size` and capturing failure status codes and exceptions.
+- **Cross-Isolate Edge Generational Tag Synchronization (`tricache/edge`)** — Extended `IEdgeRemoteStorage` with remote tag versioning:
+  - Upstash REST Redis atomic `INCR tag_ver:<tag>`.
+  - Cloudflare KV monotonic timestamp versioning: $\text{version} = \max(\text{prev} + 1, \text{Date.now}())$ eliminating read-modify-write race conditions.
+  - Cloudflare DO transactional version increment.
+  - In-isolate micro-TTL caching (800ms) to maintain sub-millisecond in-memory L1 reads without HTTP fetch amplification.
+- **Expanded Test Suite** — Added 3 new test suites (`tests/process-termination-bus.test.ts`, `tests/opentelemetry-conformance.test.ts`, `tests/edge-generational-tags.test.ts`), bringing the full test suite to **640 passing tests across 59 test files**.
 - **`CacheCodec` abstraction (`src/codec.ts`)** — Centralized msgpackr binary serialization engine with built-in record structure deduplication (`useRecords: true`), rich type preservation (`moreTypes: true` for `Set`, `TypedArray`, `Date`, etc.), and strict plain-object map decoding (`mapsAsObjects: true`).
 - **`serializeToJSON` option in `CacheOptions`** — Configurable flag (defaults to `true`) leveraging msgpackr 2.1.0's `useToJSON` capability. Setting `serializeToJSON: false` preserves the object's actual internal properties in durable cache tiers without invoking `.toJSON()`, avoiding accidental HTTP response projections on cached domain entities.
 - **Dedicated test suites** — Added comprehensive coverage for previously untested integration layers, bringing the test suite to 554 tests passing:

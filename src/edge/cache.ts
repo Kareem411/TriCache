@@ -9,6 +9,7 @@ interface EdgeL1Entry<T = unknown> {
   expiresAt: number;
   staleUntil: number;
   tags?: string[];
+  tagVersions?: Record<string, number>;
 }
 
 /**
@@ -41,6 +42,10 @@ export class EdgeCacheService {
 
   // Tag indexing for edge
   private readonly tagIndex = new Map<string, Set<string>>();
+
+  // Tag version in-isolate cache with 800ms micro-TTL (prevents HTTP fetch amplification on L1 hits)
+  private readonly tagVersionCache = new Map<string, { version: number; expiresAt: number }>();
+  private readonly tagVersionTtlMs = 800;
 
   constructor(options?: EdgeCacheOptions) {
     this.maxKeys = options?.maxKeys ?? 10_000;
@@ -109,6 +114,76 @@ export class EdgeCacheService {
     };
   }
 
+  private async _getTagVersion(tag: string): Promise<number> {
+    const cached = this.tagVersionCache.get(tag);
+    const now = Date.now();
+    if (cached && cached.expiresAt > now) {
+      return cached.version;
+    }
+    let version = 1;
+    if (this.remoteStorage) {
+      try {
+        if (typeof this.remoteStorage.getTagVersion === 'function') {
+          version = await this.remoteStorage.getTagVersion(this.nk(tag));
+        } else {
+          const raw = await this.remoteStorage.get(this.nk(`tag_ver:${tag}`));
+          version = raw ? parseInt(raw, 10) || 1 : 1;
+        }
+      } catch {
+        version = cached?.version ?? 1;
+      }
+    } else {
+      version = cached?.version ?? 1;
+    }
+    this.tagVersionCache.set(tag, { version, expiresAt: now + this.tagVersionTtlMs });
+    return version;
+  }
+
+  private async _batchGetTagVersions(tags: string[]): Promise<Record<string, number>> {
+    const now = Date.now();
+    const result: Record<string, number> = {};
+    const missingTags: string[] = [];
+
+    for (const t of tags) {
+      const c = this.tagVersionCache.get(t);
+      if (c && c.expiresAt > now) {
+        result[t] = c.version;
+      } else {
+        missingTags.push(t);
+      }
+    }
+
+    if (missingTags.length > 0 && this.remoteStorage) {
+      try {
+        if (typeof this.remoteStorage.batchGetTagVersions === 'function') {
+          const nsTags = missingTags.map(t => this.nk(t));
+          const remoteVersions = await this.remoteStorage.batchGetTagVersions(nsTags);
+          for (let i = 0; i < missingTags.length; i++) {
+            const t = missingTags[i];
+            const v = remoteVersions[this.nk(t)] ?? remoteVersions[t] ?? 1;
+            result[t] = v;
+            this.tagVersionCache.set(t, { version: v, expiresAt: now + this.tagVersionTtlMs });
+          }
+        } else {
+          await Promise.all(missingTags.map(async t => {
+            const v = await this._getTagVersion(t);
+            result[t] = v;
+          }));
+        }
+      } catch {
+        for (const t of missingTags) {
+          result[t] = this.tagVersionCache.get(t)?.version ?? 1;
+        }
+      }
+    } else {
+      for (const t of missingTags) {
+        result[t] = this.tagVersionCache.get(t)?.version ?? 1;
+      }
+    }
+
+    return result;
+  }
+
   /**
    * Reads or fetches a value by key.
    */
@@ -128,34 +203,51 @@ export class EdgeCacheService {
       // 1. Check L1 Memory
       const l1Entry = this.l1.get(nsKey);
       if (l1Entry) {
-        // Move to end of Map for LRU freshness
-        this.l1.delete(nsKey);
-        this.l1.set(nsKey, l1Entry);
-
-        if (l1Entry.expiresAt > now) {
-          // Fresh hit
-          span.setAttribute('cache.hit', true);
-          span.setAttribute('cache.item.tier', 'memory');
-          span.setAttribute('cache.hit_tier', 'l1');
-          return l1Entry.value as T;
-        }
-
-        if (l1Entry.staleUntil > now && fetchFn) {
-          // Stale hit — trigger background revalidation
-          span.setAttribute('cache.hit', true);
-          span.setAttribute('cache.item.tier', 'memory');
-          span.setAttribute('cache.hit_tier', 'l1');
-          span.setAttribute('cache.stale', true);
-
-          const revalPromise = this._revalidate(key, fetchFn, resolvedTtl, options);
-          if (options?.ctx?.waitUntil) {
-            options.ctx.waitUntil(revalPromise);
+        // Check generational tag staleness
+        let isTagStale = false;
+        if (l1Entry.tagVersions) {
+          const tagNames = Object.keys(l1Entry.tagVersions);
+          const currentVers = await this._batchGetTagVersions(tagNames);
+          for (const tag of tagNames) {
+            if (currentVers[tag] > l1Entry.tagVersions[tag]) {
+              isTagStale = true;
+              break;
+            }
           }
-          return l1Entry.value as T;
         }
 
-        // Hard expired in L1
-        this._deleteL1(nsKey);
+        if (isTagStale) {
+          this._deleteL1(nsKey);
+        } else {
+          // Move to end of Map for LRU freshness
+          this.l1.delete(nsKey);
+          this.l1.set(nsKey, l1Entry);
+
+          if (l1Entry.expiresAt > now) {
+            // Fresh hit
+            span.setAttribute('cache.hit', true);
+            span.setAttribute('cache.item.tier', 'memory');
+            span.setAttribute('cache.hit_tier', 'l1');
+            return l1Entry.value as T;
+          }
+
+          if (l1Entry.staleUntil > now && fetchFn) {
+            // Stale hit — trigger background revalidation
+            span.setAttribute('cache.hit', true);
+            span.setAttribute('cache.item.tier', 'memory');
+            span.setAttribute('cache.hit_tier', 'l1');
+            span.setAttribute('cache.stale', true);
+
+            const revalPromise = this._revalidate(key, fetchFn, resolvedTtl, options);
+            if (options?.ctx?.waitUntil) {
+              options.ctx.waitUntil(revalPromise);
+            }
+            return l1Entry.value as T;
+          }
+
+          // Hard expired in L1
+          this._deleteL1(nsKey);
+        }
       }
 
       // 2. Check L2 Remote Storage
@@ -164,15 +256,35 @@ export class EdgeCacheService {
           const rawRemote = await this.remoteStorage.get(nsKey);
           if (rawRemote !== null) {
             const plain = this.enc.isEnabled ? await this.enc.decrypt(rawRemote) : rawRemote;
-            const parsed = JSON.parse(plain) as T;
+            const parsedJson = JSON.parse(plain);
+            let parsed: T;
+            let activeTagVersions: Record<string, number> | undefined;
+            let isStaleRemote = false;
 
-            // Warm L1
-            await this.set(key, parsed, resolvedTtl, options);
+            if (parsedJson && typeof parsedJson === 'object' && '__t_val' in parsedJson && '__t_tv' in parsedJson) {
+              parsed = parsedJson.__t_val as T;
+              activeTagVersions = parsedJson.__t_tv as Record<string, number>;
+              const tagNames = Object.keys(activeTagVersions);
+              const currentVers = await this._batchGetTagVersions(tagNames);
+              for (const tag of tagNames) {
+                if (currentVers[tag] > activeTagVersions[tag]) {
+                  isStaleRemote = true;
+                  break;
+                }
+              }
+            } else {
+              parsed = parsedJson as T;
+            }
 
-            span.setAttribute('cache.hit', true);
-            span.setAttribute('cache.item.tier', 'remote');
-            span.setAttribute('cache.hit_tier', 'l2');
-            return parsed;
+            if (!isStaleRemote) {
+              // Warm L1
+              await this.set(key, parsed, resolvedTtl, options);
+
+              span.setAttribute('cache.hit', true);
+              span.setAttribute('cache.item.tier', 'remote');
+              span.setAttribute('cache.hit_tier', 'l2');
+              return parsed;
+            }
           }
         } catch (remoteErr) {
           span.recordException?.(remoteErr);
@@ -260,6 +372,11 @@ export class EdgeCacheService {
     const swrSeconds = options?.swr ?? 0;
 
     try {
+      let activeTagVersions: Record<string, number> | undefined;
+      if (options?.tags?.length) {
+        activeTagVersions = await this._batchGetTagVersions(options.tags);
+      }
+
       const serialized = JSON.stringify(value);
       const bytes = this._estimateBytes(nsKey, serialized);
 
@@ -274,6 +391,7 @@ export class EdgeCacheService {
         expiresAt: now + resolvedTtl * 1000,
         staleUntil: now + (resolvedTtl + swrSeconds) * 1000,
         tags: options?.tags,
+        tagVersions: activeTagVersions,
       };
 
       this.l1.set(nsKey, entry);
@@ -293,7 +411,10 @@ export class EdgeCacheService {
 
       // Write to L2 Remote Storage if configured
       if (this.remoteStorage) {
-        const payloadToStore = this.enc.isEnabled ? await this.enc.encrypt(serialized) : serialized;
+        const toStoreRaw = activeTagVersions
+          ? JSON.stringify({ __t_val: value, __t_tv: activeTagVersions })
+          : serialized;
+        const payloadToStore = this.enc.isEnabled ? await this.enc.encrypt(toStoreRaw) : toStoreRaw;
         await this.remoteStorage.set(nsKey, payloadToStore, resolvedTtl + swrSeconds);
       }
     } catch (err) {
@@ -335,14 +456,35 @@ export class EdgeCacheService {
     span.setAttribute('cache.tag', tag);
 
     try {
+      let newVer = 1;
+      if (this.remoteStorage) {
+        try {
+          if (typeof this.remoteStorage.incrementTagVersion === 'function') {
+            newVer = await this.remoteStorage.incrementTagVersion(this.nk(tag));
+          } else {
+            const key = this.nk(`tag_ver:${tag}`);
+            const current = await this._getTagVersion(tag);
+            newVer = Math.max(current + 1, Date.now());
+            await this.remoteStorage.set(key, String(newVer));
+          }
+        } catch {
+          const current = this.tagVersionCache.get(tag)?.version ?? 1;
+          newVer = current + 1;
+        }
+      } else {
+        const current = this.tagVersionCache.get(tag)?.version ?? 1;
+        newVer = current + 1;
+      }
+
+      // Update in-isolate version cache immediately (with 60s pin)
+      this.tagVersionCache.set(tag, { version: newVer, expiresAt: Date.now() + 60_000 });
+
+      // Invalidate local L1 entries
       const keys = this.tagIndex.get(tag);
       if (keys) {
         const keysArr = Array.from(keys);
         for (const k of keysArr) {
           this._deleteL1(k);
-          if (this.remoteStorage) {
-            await this.remoteStorage.delete(k);
-          }
         }
         this.tagIndex.delete(tag);
       }
@@ -364,6 +506,7 @@ export class EdgeCacheService {
       this.l1.clear();
       this.currentBytes = 0;
       this.tagIndex.clear();
+      this.tagVersionCache.clear();
       if (this.remoteStorage) {
         await this.remoteStorage.clear?.(this.namespace || undefined);
       }

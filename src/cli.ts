@@ -47,7 +47,7 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
   // (bin/tricache.js). Output must go directly to process stdout without logger prefixes
   // to support UNIX pipes, terminal formatting, and automated tooling.
   if (values.version || command === 'version') {
-    console.log('tricache v0.7.1');
+    console.log('tricache v0.8.0');
     return;
   }
 

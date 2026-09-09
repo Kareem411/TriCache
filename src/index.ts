@@ -17,7 +17,7 @@
  *   await cache.delete(`user:${userId}`);
  */
 
-export { CacheService }        from './cache-service';
+export { CacheService, ProcessTerminationBus } from './cache-service';
 export { CacheEncryption, type EncryptionMode } from './encryption';
 export { SmartMemoryCache }    from './smart-memory-cache';
 export { DiskTier }            from './disk-tier';

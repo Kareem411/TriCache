@@ -93,4 +93,38 @@ export class CloudflareDOStorageAdapter implements IEdgeRemoteStorage {
       await this.storage.delete(keysToDelete);
     }
   }
+
+  async incrementTagVersion(tag: string): Promise<number> {
+    const key = `tag_ver:${tag}`;
+    const raw = await this.storage.get<DOEntry>(key);
+    const prev = (raw && typeof raw === 'object' && 'val' in raw)
+      ? parseInt(raw.val, 10) || 0
+      : (typeof raw === 'string' ? parseInt(raw, 10) || 0 : 0);
+    const nextVer = prev + 1;
+    await this.storage.put(key, { val: String(nextVer), exp: 0 });
+    return nextVer;
+  }
+
+  async getTagVersion(tag: string): Promise<number> {
+    const raw = await this.storage.get<DOEntry>(`tag_ver:${tag}`);
+    if (raw && typeof raw === 'object' && 'val' in raw) {
+      return parseInt(raw.val, 10) || 1;
+    }
+    return typeof raw === 'string' ? parseInt(raw, 10) || 1 : 1;
+  }
+
+  async batchGetTagVersions(tags: string[]): Promise<Record<string, number>> {
+    const keys = tags.map(t => `tag_ver:${t}`);
+    const map = await this.storage.get<DOEntry>(keys);
+    const result: Record<string, number> = {};
+    for (const tag of tags) {
+      const entry = map.get(`tag_ver:${tag}`);
+      if (entry && typeof entry === 'object' && 'val' in entry) {
+        result[tag] = parseInt(entry.val, 10) || 1;
+      } else {
+        result[tag] = typeof entry === 'string' ? parseInt(entry, 10) || 1 : 1;
+      }
+    }
+    return result;
+  }
 }

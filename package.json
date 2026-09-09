@@ -1,6 +1,6 @@
 {
   "name": "tricache",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Three-tier Node.js cache: L1 smart RAM (adaptive LFU/LRU + Count-Min Sketch) → L1.5 NVMe disk spill → L2 Redis/Valkey. Includes AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, and thundering-herd prevention.",
   "keywords": [
     "cache",
@@ -127,6 +127,6 @@
     "vitest": "^4.1.11"
   },
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=20.10.0"
   }
 }

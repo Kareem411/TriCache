@@ -89,4 +89,27 @@ export class CloudflareKVAdapter implements IEdgeRemoteStorage {
       cursor = res.list_complete ? undefined : res.cursor;
     } while (cursor);
   }
+
+  async incrementTagVersion(tag: string): Promise<number> {
+    const key = `tag_ver:${tag}`;
+    const raw = await this.kv.get(key);
+    const prev = raw ? parseInt(raw, 10) || 0 : 0;
+    const nextVer = Math.max(prev + 1, Date.now());
+    await this.kv.put(key, String(nextVer));
+    return nextVer;
+  }
+
+  async getTagVersion(tag: string): Promise<number> {
+    const raw = await this.kv.get(`tag_ver:${tag}`);
+    return raw ? parseInt(raw, 10) || 1 : 1;
+  }
+
+  async batchGetTagVersions(tags: string[]): Promise<Record<string, number>> {
+    const vers = await Promise.all(tags.map(t => this.getTagVersion(t)));
+    const res: Record<string, number> = {};
+    for (let i = 0; i < tags.length; i++) {
+      res[tags[i]] = vers[i];
+    }
+    return res;
+  }
 }

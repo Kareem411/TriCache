@@ -42,11 +42,13 @@ type _SqliteDB = {
 };
 let _SqliteDB: (new (p: string) => _SqliteDB) | null = null;
 try {
-  // process.getBuiltinModule is available in Node >= 22.3.0 (within our >=22.13.0 engine
-  // requirement). It's synchronous and does not require the esbuild __require shim.
-  const sqlite = (process as unknown as { getBuiltinModule(m: string): unknown })
-    .getBuiltinModule('node:sqlite') as { DatabaseSync: new (p: string) => _SqliteDB } | undefined;
-  _SqliteDB = sqlite?.DatabaseSync ?? null;
+  // process.getBuiltinModule is available in Node >= 22.3.0.
+  // In Node 20 LTS or environments without node:sqlite, this safely falls back to file-only mode.
+  const proc = process as unknown as { getBuiltinModule?: (m: string) => unknown };
+  if (typeof proc.getBuiltinModule === 'function') {
+    const sqlite = proc.getBuiltinModule('node:sqlite') as { DatabaseSync: new (p: string) => _SqliteDB } | undefined;
+    _SqliteDB = sqlite?.DatabaseSync ?? null;
+  }
 } catch { /* node:sqlite unavailable — file-only mode */ }
 // ── Encryption (delegates to CacheEncryption — mode-aware, no reimplementation) ──
 // DiskTier keeps its own V2 envelope (magic | plaintext expiresAt | payload) but

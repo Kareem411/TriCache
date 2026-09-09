@@ -118,4 +118,26 @@ export class UpstashRedisAdapter implements IEdgeRemoteStorage {
       await this._executeCommand(['FLUSHDB']);
     }
   }
+
+  async incrementTagVersion(tag: string): Promise<number> {
+    const res = await this._executeCommand<number>(['INCR', `tag_ver:${tag}`]);
+    return typeof res === 'number' ? res : 1;
+  }
+
+  async getTagVersion(tag: string): Promise<number> {
+    const res = await this._executeCommand<string | null>(['GET', `tag_ver:${tag}`]);
+    return res ? parseInt(res, 10) || 1 : 1;
+  }
+
+  async batchGetTagVersions(tags: string[]): Promise<Record<string, number>> {
+    if (tags.length === 0) return {};
+    const keys = tags.map(t => `tag_ver:${t}`);
+    const res = await this.mget(keys);
+    const result: Record<string, number> = {};
+    for (let i = 0; i < tags.length; i++) {
+      const raw = res[i];
+      result[tags[i]] = raw ? parseInt(raw, 10) || 1 : 1;
+    }
+    return result;
+  }
 }

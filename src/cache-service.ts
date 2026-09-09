@@ -350,6 +350,59 @@ function detectServerlessRuntime(): string | null {
   return null;
 }
 
+/**
+ * Centralized static process termination bus.
+ * Prevents MaxListenersExceededWarning by attaching at most ONE SIGTERM and ONE SIGINT
+ * listener to process, broadcasting to all active CacheService instances.
+ * Automatically detaches listeners when the instance count reaches 0, preventing
+ * event loop / test runner hangs.
+ */
+export class ProcessTerminationBus {
+  private static readonly instances = new Set<CacheService>();
+  private static registered = false;
+  private static sigtermHandler: (() => void) | null = null;
+  private static sigintHandler: (() => void) | null = null;
+
+  public static register(instance: CacheService): void {
+    this.instances.add(instance);
+    if (!this.registered) {
+      this.registered = true;
+      this.sigtermHandler = () => {
+        for (const inst of this.instances) {
+          try { inst._triggerShutdown(); } catch { /* ok */ }
+        }
+      };
+      this.sigintHandler = () => {
+        for (const inst of this.instances) {
+          try { inst._triggerShutdown(); } catch { /* ok */ }
+        }
+      };
+      process.on('SIGTERM', this.sigtermHandler);
+      process.on('SIGINT',  this.sigintHandler);
+    }
+  }
+
+  public static unregister(instance: CacheService): void {
+    this.instances.delete(instance);
+    if (this.instances.size === 0 && this.registered) {
+      if (this.sigtermHandler) process.removeListener('SIGTERM', this.sigtermHandler);
+      if (this.sigintHandler)  process.removeListener('SIGINT',  this.sigintHandler);
+      this.sigtermHandler = null;
+      this.sigintHandler = null;
+      this.registered = false;
+    }
+  }
+
+  /** For testing diagnostics and assertions */
+  public static get size(): number {
+    return this.instances.size;
+  }
+
+  public static get isRegistered(): boolean {
+    return this.registered;
+  }
+}
+
 export class CacheService {
   private readonly logger:     ILogger;
   private readonly enc:        CacheEncryption;
@@ -683,17 +736,12 @@ export class CacheService {
       if (!this._diskDisabled) this.loadSnapshot(); // Fix 3: skip in ephemeral environments
     }
 
-    // Graceful shutdown: persist L1 to disk. The library must NEVER call
-    // process.exit() — that decision belongs to the host application (kills
-    // Kubernetes graceful drain, NestJS onApplicationShutdown, pool drains).
+    // Graceful shutdown: persist L1 to disk via centralized ProcessTerminationBus.
+    // The library must NEVER call process.exit() — that decision belongs to the host application.
     this._shutdownHandler = () => {
-      if (!this._diskDisabled) this.writeSnapshot();
-      if (this.opts.remoteSnapshot && this.opts.remoteSnapshot.saveOnShutdown !== false) {
-        void this.writeRemoteSnapshot();
-      }
+      this._triggerShutdown();
     };
-    process.once('SIGTERM', this._shutdownHandler);
-    process.once('SIGINT',  this._shutdownHandler);
+    ProcessTerminationBus.register(this);
 
     // ── Fix 1: Worker thread pool for off-main-thread AES-GCM & Compression ──
     if (this.opts.workerThreads) {
@@ -2167,6 +2215,16 @@ export class CacheService {
   }
 
   /**
+   * Internal graceful shutdown trigger invoked by ProcessTerminationBus.
+   */
+  _triggerShutdown(): void {
+    if (!this._diskDisabled) this.writeSnapshot();
+    if (this.opts.remoteSnapshot && this.opts.remoteSnapshot.saveOnShutdown !== false) {
+      void this.writeRemoteSnapshot();
+    }
+  }
+
+  /**
    * Universal fetch-and-cache wrapper with an ergonomic options object.
    *
    * Drop-in ergonomic alternative to `get()` matching developer expectations
@@ -2908,12 +2966,24 @@ export class CacheService {
   async mset<T = unknown>(
     entries: Record<string, { value: T; ttl?: number; priority?: CachePriority; tags?: string[]; dependsOn?: string[] }>,
   ): Promise<void> {
+    const span = this._startSpan('tricache.mset');
     const keys = Object.keys(entries);
-    await Promise.all(keys.map(key => {
-      const { value, ttl = 300, priority, tags, dependsOn } = entries[key];
-      const hasOpts = tags?.length || dependsOn?.length;
-      return this.set(key, value, ttl, priority, hasOpts ? { tags, dependsOn } : undefined);
-    }));
+    if (this.opts.tracer) {
+      span.setAttribute('cache.batch.size', keys.length);
+    }
+    try {
+      await Promise.all(keys.map(key => {
+        const { value, ttl = 300, priority, tags, dependsOn } = entries[key];
+        const hasOpts = tags?.length || dependsOn?.length;
+        return this.set(key, value, ttl, priority, hasOpts ? { tags, dependsOn } : undefined);
+      }));
+    } catch (err) {
+      span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
+      span.recordException?.(err);
+      throw err;
+    } finally {
+      span.end();
+    }
   }
 
   /**
@@ -2924,7 +2994,19 @@ export class CacheService {
    * await cache.mdel(['user:1', 'user:2', 'user:3']);
    */
   async mdel(keys: string[]): Promise<void> {
-    await Promise.all(keys.map(k => this.delete(k)));
+    const span = this._startSpan('tricache.mdel');
+    if (this.opts.tracer) {
+      span.setAttribute('cache.batch.size', keys.length);
+    }
+    try {
+      await Promise.all(keys.map(k => this.delete(k)));
+    } catch (err) {
+      span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
+      span.recordException?.(err);
+      throw err;
+    } finally {
+      span.end();
+    }
   }
 
   /**
@@ -3677,11 +3759,8 @@ export class CacheService {
       clearInterval(this.remoteSnapshotInterval);
       this.remoteSnapshotInterval = null;
     }
-    if (this._shutdownHandler) {
-      process.off('SIGTERM', this._shutdownHandler);
-      process.off('SIGINT',  this._shutdownHandler);
-      this._shutdownHandler = null;
-    }
+    ProcessTerminationBus.unregister(this);
+    this._shutdownHandler = null;
     if (this._workerPool) {
       await this._workerPool.destroy();
       this._workerPool = null;
