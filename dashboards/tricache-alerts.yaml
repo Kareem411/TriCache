@@ -1,0 +1,54 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: tricache-alerts
+  labels:
+    role: alert-rules
+spec:
+  groups:
+    - name: tricache.rules
+      rules:
+        # Alert 1: OOM Guard Watermark Breached
+        - alert: TriCacheOOMWatermarkBreached
+          expr: rate(tricache_oom_evictions_total[1m]) > 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "TriCache emergency OOM evictions detected on instance {{ $labels.instance }}"
+            description: "Node.js heap memory has breached the safe watermark, triggering emergency L1 cache evictions. Consider increasing container memory or lowering l1MaxBytes."
+
+        # Alert 2: L2 Redis Circuit Breaker Tripped / Invalidation Errors
+        - alert: TriCacheCircuitBreakerOpen
+          expr: rate(tricache_cross_region_errors_total[2m]) > 5 or rate(tricache_backplane_sent_total[1m]) == 0 and rate(tricache_sets_total[1m]) > 10
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "TriCache L2/Backplane degradation or circuit breaker open on {{ $labels.instance }}"
+            description: "Cache operations are falling back to L1/disk due to persistent L2 network errors or cross-region relay failures."
+
+        # Alert 3: Cache Hit Ratio Degraded
+        - alert: TriCacheHitRatioDegraded
+          expr: |
+            100 * (1 - (
+              sum by (namespace, instance) (rate(tricache_fetches_total[5m]))
+              /
+              clamp_min(sum by (namespace, instance) (rate(tricache_gets_total[5m])), 1)
+            )) < 60
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "TriCache hit ratio fell below 60% on {{ $labels.instance }} (namespace: {{ $labels.namespace }})"
+            description: "Cache hit ratio is critically low over a 5-minute window. Downstream database or service may experience excessive load."
+
+        # Alert 4: Stampede / Singleflight Queue Saturated
+        - alert: TriCacheSingleflightSaturated
+          expr: rate(tricache_stampedes_prevented_total[1m]) > 100
+          for: 2m
+          labels:
+            severity: info
+          annotations:
+            summary: "High volume of coalesced cache stampedes on {{ $labels.instance }}"
+            description: "Singleflight guard is coalescing over 100 in-flight requests/second. Indicates a thundering herd on popular expiring keys."

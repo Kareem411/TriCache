@@ -66,3 +66,14 @@ export {
   type ICacheBatchObservableCallback,
   type ICacheMeter,
 } from './types';
+
+export {
+  tricacheDashboard,
+  createNextDashboardHandlers,
+  startDashboardServer,
+  handleDashboardRequest,
+  type DashboardOptions,
+  type StandaloneDashboardOptions,
+  type DashboardPeerInstance,
+  type DashboardActionEvent,
+} from './dashboard/index';

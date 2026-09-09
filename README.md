@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-573%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-592%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 22](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org)
@@ -646,6 +646,103 @@ app.get('/metrics', (_req, res) => {
   );
 });
 ```
+
+---
+
+## 📊 Turnkey Visual Observability & Dashboard
+
+TriCache includes an enterprise-ready visual observability suite with **zero external CDN dependencies** (100% self-contained and air-gappable):
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Δ TriCache Observability       [Pod: worker-pod-42] [Uptime: 4.2h] [SSE]  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  🎯 HIT RATIO (98.4%)           🛡️ STAMPEDES PREVENTED                      │
+│  [====================  ]       14,290 concurrent requests coalesced        │
+│  L1: 82% | Disk: 11% | L2: 5%                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  🧠 L1 HEAP MEMORY              ⚡ INVALIDATION BACKPLANE                  │
+│  42.5 MB / 128 MB threshold     2,450 Sent / 9,812 Received                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1. Embedded Single-Page Web UI (`tricache/dashboard`)
+
+Mount the dashboard inside your existing app in a single line, protected with timing-safe authentication and strict CSRF guardrails:
+
+```typescript
+import { tricacheDashboard } from 'tricache/dashboard';
+
+// Express / Fastify / Connect / Node.js
+app.use(
+  '/admin/cache',
+  tricacheDashboard({
+    cache,
+    basePath: '/admin/cache',
+    title: 'Production Cache Fleet',
+    // 🔒 Timing-Safe Authentication (safeCompare with SHA-256)
+    auth: {
+      username: 'admin',
+      password: process.env.CACHE_DASHBOARD_PASSWORD,
+    },
+    // 🛡️ Read-Only Mode (disables Clear and Invalidate buttons in production)
+    readOnly: process.env.NODE_ENV === 'production',
+    // 🏷️ Audit logging hook for compliance
+    onAction: (event) => {
+      console.log(`[AUDIT] Action: ${event.action}, Target: ${event.target}, User: ${event.user}`);
+    },
+  })
+);
+```
+
+#### Next.js App Router
+```typescript
+// app/admin/cache/[...slug]/route.ts
+import { createNextDashboardHandlers } from 'tricache/dashboard';
+import { cache } from '@/lib/cache';
+
+export const { GET, POST } = createNextDashboardHandlers({
+  cache,
+  basePath: '/admin/cache',
+  authSecret: process.env.MANAGEMENT_SECRET,
+  readOnly: true,
+});
+```
+
+#### Standalone Management Server (Kubectl Port-Forwarding / SSH)
+For background workers or isolated microservices:
+```typescript
+import { startDashboardServer } from 'tricache/dashboard';
+
+const mgmt = await startDashboardServer({
+  cache,
+  port: 9090,
+  host: '127.0.0.1', // Isolated to localhost
+  authSecret: process.env.MANAGEMENT_SECRET,
+});
+console.log(`Cache management server listening on port ${mgmt.port}`);
+```
+Access securely via Kubernetes:
+```bash
+kubectl port-forward pod/my-app-pod 9090:9090
+# Open browser: http://localhost:9090?token=...
+```
+
+### 2. Pre-Built Grafana Dashboard & Prometheus Alerts
+
+For fleet-wide monitoring without direct container access, import the included assets:
+
+* **Grafana Dashboard JSON** ([`dashboards/tricache-grafana.json`](dashboards/tricache-grafana.json)):
+  * Templated multi-tenant variables: `$datasource`, `$namespace`, `$service`, and `$pod`.
+  * Visual panels for: Real-Time Hit Ratio Breakdown (L1 vs. Disk vs. L2 vs. DB Misses), Stampedes Prevented & Singleflight Coalescing, SWR Async Refresh Rates, L1 Heap Usage & OOM Emergency Purges, and Cross-Region Invalidation Mesh.
+* **Prometheus Alert Rules** ([`dashboards/tricache-alerts.yaml`](dashboards/tricache-alerts.yaml)):
+  * Turnkey `PrometheusRule` manifests covering:
+    * `TriCacheOOMWatermarkBreached`: Emergency L1 evictions triggered by heap pressure.
+    * `TriCacheCircuitBreakerOpen`: L2 Redis connection failures falling back to L1/disk.
+    * `TriCacheHitRatioDegraded`: Hit ratio falling below 60% over a 5m window.
+    * `TriCacheSingleflightSaturated`: Coalesced queue depth spiking on hot keys.
+
+---
 
 ### `cache.stats()` → `{ l1, disk }`
 

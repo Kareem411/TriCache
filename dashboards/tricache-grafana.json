@@ -1,0 +1,548 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "title": "🎯 Fleet Overview & Hit Ratios",
+      "type": "row"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 75 },
+              { "color": "green", "value": 90 }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": "${datasource}",
+          "editorMode": "code",
+          "expr": "100 * (1 - (sum(rate(tricache_fetches_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval])) / clamp_min(sum(rate(tricache_gets_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval])), 0.0001)))",
+          "legendFormat": "Global Hit Rate",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Overall Cache Hit Ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": "${datasource}",
+          "expr": "100 * (sum(rate(tricache_l1_hits_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval])) / clamp_min(sum(rate(tricache_gets_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval])), 0.0001))",
+          "legendFormat": "L1 RAM Hit Rate",
+          "refId": "A"
+        }
+      ],
+      "title": "L1 RAM Hit Ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "purple", "value": null }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": "${datasource}",
+          "expr": "100 * (sum(rate(tricache_disk_hits_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval])) / clamp_min(sum(rate(tricache_gets_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval])), 0.0001))",
+          "legendFormat": "Disk Hit Rate",
+          "refId": "A"
+        }
+      ],
+      "title": "L1.5 Disk Hit Ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "orange", "value": null }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": "${datasource}",
+          "expr": "100 * (sum(rate(tricache_l2_hits_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval])) / clamp_min(sum(rate(tricache_gets_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval])), 0.0001))",
+          "legendFormat": "L2 Redis Hit Rate",
+          "refId": "A"
+        }
+      ],
+      "title": "L2 Redis Hit Ratio",
+      "type": "stat"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "id": 5,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(increase(tricache_stampedes_prevented_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "Prevented Stampedes",
+          "refId": "A"
+        }
+      ],
+      "title": "Stampedes Prevented",
+      "type": "stat"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue", "value": null }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "id": 6,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(tricache_compression_bytes_saved{namespace=~\"$namespace\", instance=~\"$pod\"})",
+          "legendFormat": "Compression Saved",
+          "refId": "A"
+        }
+      ],
+      "title": "Msgpack Compression Saved",
+      "type": "stat"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 15,
+            "gradientMode": "opacity",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "stacking": { "group": "A", "mode": "normal" }
+          },
+          "unit": "reqps"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "L1 RAM Hits" }, "properties": [{ "id": "color", "value": { "fixedColor": "super-light-blue", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "L1.5 Disk Hits" }, "properties": [{ "id": "color", "value": { "fixedColor": "purple", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "L2 Redis Hits" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "DB Misses" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 14, "x": 0, "y": 5 },
+      "id": 7,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(rate(tricache_l1_hits_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "L1 RAM Hits",
+          "refId": "A"
+        },
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(rate(tricache_disk_hits_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "L1.5 Disk Hits",
+          "refId": "B"
+        },
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(rate(tricache_l2_hits_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "L2 Redis Hits",
+          "refId": "C"
+        },
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(rate(tricache_fetches_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "DB Misses",
+          "refId": "D"
+        }
+      ],
+      "title": "Throughput by Tier (Stacked ops/sec)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "smooth",
+            "lineWidth": 2
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 5 },
+      "id": 8,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(rate(tricache_stampedes_prevented_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "Coalesced Inflight Requests/s",
+          "refId": "A"
+        },
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(rate(tricache_swr_revalidations_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "SWR Async Refreshes/s",
+          "refId": "B"
+        }
+      ],
+      "title": "Singleflight Coalescing & SWR Background Rate",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "id": 101,
+      "title": "🧠 Memory Footprint, OOM Guard & Invalidation Backplane",
+      "type": "row"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 14 },
+      "id": 9,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(tricache_l1_size_bytes{namespace=~\"$namespace\", instance=~\"$pod\"}) by (instance)",
+          "legendFormat": "L1 RAM Heap ({{instance}})",
+          "refId": "A"
+        }
+      ],
+      "title": "L1 Memory Used Bytes by Pod",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": { "drawStyle": "bars", "fillOpacity": 80, "lineWidth": 1 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 14 },
+      "id": 10,
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(rate(tricache_oom_evictions_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "OOM Emergency Evictions/s",
+          "refId": "A"
+        }
+      ],
+      "title": "OOM Emergency Purge Rounds",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "${datasource}",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 },
+          "unit": "msgps"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 14 },
+      "id": 11,
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      },
+      "targets": [
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(rate(tricache_backplane_sent_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "Backplane Invalidation Sent",
+          "refId": "A"
+        },
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(rate(tricache_backplane_received_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "Backplane Invalidation Received",
+          "refId": "B"
+        },
+        {
+          "datasource": "${datasource}",
+          "expr": "sum(rate(tricache_cross_region_received_total{namespace=~\"$namespace\", instance=~\"$pod\"}[$__rate_interval]))",
+          "legendFormat": "Cross-Region Mesh Received",
+          "refId": "C"
+        }
+      ],
+      "title": "Invalidation Backplane & Cross-Region Mesh",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["tricache", "cache", "redis", "l1", "performance", "observability"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data Source",
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource"
+      },
+      {
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "datasource": "${datasource}",
+        "definition": "label_values(tricache_gets_total, namespace)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Namespace",
+        "multi": true,
+        "name": "namespace",
+        "options": [],
+        "query": { "query": "label_values(tricache_gets_total, namespace)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
+        "datasource": "${datasource}",
+        "definition": "label_values(tricache_gets_total, instance)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Pod / Instance",
+        "multi": true,
+        "name": "pod",
+        "options": [],
+        "query": { "query": "label_values(tricache_gets_total, instance)", "refId": "StandardVariableQuery" },
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {
+    "refresh_intervals": ["1s", "5s", "10s", "30s", "1m"]
+  },
+  "timezone": "browser",
+  "title": "TriCache Observability & Performance Dashboard",
+  "uid": "tricache-overview",
+  "version": 1
+}
