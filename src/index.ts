@@ -32,6 +32,18 @@ export {
   type RemoteSnapshotOptions,
   type HttpSnapshotAdapterOptions,
 } from './remote-snapshot';
+export {
+  createHttpMeshRelay,
+  createCustomCrossRegionRelay,
+  createMemoryCrossRegionRelay,
+  createCrossRegionWebhookHandler,
+  type CrossRegionInvalidationEvent,
+  type ICrossRegionRelay,
+  type CrossRegionRelayOptions,
+  type HttpMeshRelayOptions,
+  type WebhookRequestLike,
+  type WebhookResponseLike,
+} from './cross-region';
 
 export {
   CachePriority,

@@ -1,4 +1,5 @@
 import type { RemoteSnapshotOptions } from './remote-snapshot';
+import type { CrossRegionRelayOptions } from './cross-region';
 
 /**
  * tricache — shared types and interfaces
@@ -262,6 +263,16 @@ export interface CacheMetrics {
     lastDownloadedAt: number | null;
   };
 
+  /** Cross-region invalidation relay statistics — present when crossRegion is configured */
+  crossRegion?: {
+    enabled: boolean;
+    currentRegion: string;
+    sent: number;
+    received: number;
+    deduplicated: number;
+    errors: number;
+  };
+
   l1:   { entries: number; sizeBytes: number; maxBytes: number };
   disk: { files: number; sizeKB: number; maxKB: number; disabled: boolean };
 
@@ -509,6 +520,15 @@ export interface CacheOptions {
    * Default: `false` (standard cluster PUBLISH / SUBSCRIBE).
    */
   useShardedPubSub?: boolean;
+
+  // ── Multi-Region / Cross-Cluster Invalidation Relay ─────────────────────
+  /**
+   * Optional cross-region invalidation relay configuration for geo-distributed deployments.
+   * Synchronizes `delete()` and `invalidateTag()` events across separate regional Redis clusters
+   * (e.g. `us-east-1` and `eu-central-1`) via HTTP mesh or custom message brokers (SNS, SQS, EventBridge)
+   * with automatic origin deduplication to prevent invalidation loops.
+   */
+  crossRegion?: CrossRegionRelayOptions;
 
   // ── OOM protection ──────────────────────────────────────────────────────
   /**

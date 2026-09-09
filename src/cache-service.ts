@@ -19,6 +19,7 @@
 import { Redis as RedisClient, Cluster as RedisCluster } from 'ioredis';
 import { CacheCodec } from './codec.js';
 import type { RemoteSnapshotOptions } from './remote-snapshot.js';
+import type { CrossRegionRelayOptions, CrossRegionInvalidationEvent } from './cross-region.js';
 import crypto from 'crypto';
 import os    from 'os';
 import { WorkerPool } from './worker-pool.js';
@@ -409,6 +410,7 @@ export class CacheService {
     backplaneStreamKey?: string;
     serializeToJSON: boolean;
     remoteSnapshot: RemoteSnapshotOptions | undefined;
+    crossRegion: CrossRegionRelayOptions | undefined;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -451,6 +453,8 @@ export class CacheService {
   private _destroyed = false;
   /** Timestamp (Date.now()) when the backplane subscriber last lost its connection. */
   private _subDisconnectedAt:  number | null = null;
+  /** Deduplication ring buffer for incoming and outgoing cross-region invalidations (loop prevention) */
+  private readonly _seenCrossRegionEvents = new Map<string, number>();
   private counters = {
     gets:             0,
     l1Hits:           0,
@@ -481,6 +485,10 @@ export class CacheService {
     remoteSnapshotErrors:     0,
     remoteSnapshotLastUploadedAt:   null as number | null,
     remoteSnapshotLastDownloadedAt: null as number | null,
+    crossRegionSent:          0,
+    crossRegionReceived:      0,
+    crossRegionDeduplicated:  0,
+    crossRegionErrors:        0,
   };
 
   /** One-time guard so the in-process increment() fallback warning fires only once. */
@@ -592,6 +600,7 @@ export class CacheService {
       backplaneStreamKey:       options.backplaneStreamKey,
       serializeToJSON:          options.serializeToJSON ?? true,
       remoteSnapshot:           options.remoteSnapshot,
+      crossRegion:              options.crossRegion,
     };
 
     this.codec = new CacheCodec({
@@ -900,6 +909,7 @@ export class CacheService {
       invalidationBackplane: o.invalidationBackplane,
       strictSingleton:     o.strictSingleton,
       remoteSnapshot:      o.remoteSnapshot,
+      crossRegion:         o.crossRegion,
     } as CacheOptions;
   }
 
@@ -1242,7 +1252,19 @@ export class CacheService {
     }
   }
 
-  private async publishInvalidation(op: 'del' | 'del-glob' | 'tag_incr', key: string, tagVersion?: number): Promise<void> {
+  private async publishInvalidation(
+    op: 'del' | 'del-glob' | 'tag_incr',
+    key: string,
+    tagVersion?: number,
+    isCrossRegionRelay = false,
+    isExplicitInvalidation = false,
+  ): Promise<void> {
+    if (!isCrossRegionRelay && this.opts.crossRegion) {
+      const shouldBroadcast = isExplicitInvalidation || Boolean(this.opts.crossRegion.broadcastOnSet);
+      if (shouldBroadcast) {
+        void this._broadcastCrossRegion(op, key, tagVersion);
+      }
+    }
     if (!this.opts.invalidationBackplane || this._redisDisabled) return;
     try {
       const client = await this.getRedis();
@@ -1279,6 +1301,102 @@ export class CacheService {
       }
       this.counters.invSent++;
     } catch { /* non-critical — never block the caller */ }
+  }
+
+  private _markCrossRegionEventSeen(id: string): void {
+    const maxDedup = this.opts.crossRegion?.dedupCacheSize ?? 10_000;
+    if (this._seenCrossRegionEvents.size >= maxDedup) {
+      const oldestKey = this._seenCrossRegionEvents.keys().next().value;
+      if (oldestKey !== undefined) this._seenCrossRegionEvents.delete(oldestKey);
+    }
+    this._seenCrossRegionEvents.set(id, Date.now());
+  }
+
+  private _isCrossRegionEventSeen(id: string): boolean {
+    return this._seenCrossRegionEvents.has(id);
+  }
+
+  private async _broadcastCrossRegion(
+    op: 'del' | 'del-glob' | 'tag_incr',
+    key: string,
+    tagVersion?: number,
+  ): Promise<void> {
+    const cr = this.opts.crossRegion;
+    if (!cr) return;
+    try {
+      const eventId = crypto.randomUUID();
+      this._markCrossRegionEventSeen(eventId);
+      const event: CrossRegionInvalidationEvent = {
+        id: eventId,
+        originRegion: cr.currentRegion,
+        originInstanceId: this.instanceId,
+        op,
+        key,
+        tagVersion,
+        timestamp: Date.now(),
+        namespace: this._namespace || undefined,
+      };
+      this.counters.crossRegionSent++;
+      await cr.relay.broadcast(event);
+      this.logger.debug('Cross-region invalidation broadcast', { op, key, region: cr.currentRegion });
+    } catch (err) {
+      this.counters.crossRegionSent = Math.max(0, this.counters.crossRegionSent - 1);
+      this.counters.crossRegionErrors++;
+      this.logger.warn('Cross-region invalidation broadcast failed', { error: (err as Error).message });
+    }
+  }
+
+  /**
+   * Receives an invalidation event from another region (e.g. via HTTP webhook or broker subscriber).
+   * Validates origin, deduplicates to prevent loops, applies locally to L1/disk,
+   * and fans out to the local Redis backplane so all regional peers invalidate as well.
+   *
+   * Returns true if the event was accepted and applied, or false if ignored/deduplicated.
+   */
+  async receiveCrossRegionInvalidation(event: CrossRegionInvalidationEvent): Promise<boolean> {
+    const cr = this.opts.crossRegion;
+    if (!cr) return false;
+
+    // Reject malformed event
+    if (!event || typeof event !== 'object' || !event.id || !event.originRegion || !event.op || !event.key) {
+      this.counters.crossRegionErrors++;
+      this.logger.warn('Cross-region: rejected invalid event payload', { event });
+      return false;
+    }
+
+    // Ignore events originating from our own region (prevents echo loops)
+    if (event.originRegion === cr.currentRegion) {
+      this.counters.crossRegionDeduplicated++;
+      return false;
+    }
+
+    // Ignore duplicate event IDs (already processed)
+    if (this._isCrossRegionEventSeen(event.id)) {
+      this.counters.crossRegionDeduplicated++;
+      return false;
+    }
+    this._markCrossRegionEventSeen(event.id);
+
+    // If namespaces don't match, ignore
+    if (event.namespace !== undefined && event.namespace !== (this._namespace || undefined)) {
+      return false;
+    }
+
+    this.counters.crossRegionReceived++;
+
+    // 1. Apply to local L1 and disk
+    this._applyInvalidationEvent(event.op, event.key, event.tagVersion);
+
+    // 2. Propagate to local Redis backplane so other instances in THIS region also invalidate,
+    // passing isCrossRegionRelay = true to prevent re-broadcasting cross-region
+    void this.publishInvalidation(event.op, event.key, event.tagVersion, true);
+
+    this.logger.info('Cross-region invalidation applied', {
+      op: event.op,
+      key: event.key,
+      originRegion: event.originRegion,
+    });
+    return true;
   }
 
   private _setLocalTagVersion(tag: string, version: number, now = Date.now()): void {
@@ -2248,7 +2366,7 @@ export class CacheService {
       }
     }
 
-    void this.publishInvalidation(isPattern ? 'del-glob' : 'del', k);
+    void this.publishInvalidation(isPattern ? 'del-glob' : 'del', k, undefined, false, true);
     span.end();
   }
 
@@ -2345,7 +2463,8 @@ export class CacheService {
     }
 
     void this.publishInvalidation('del-glob',
-      k ?? (this._namespace ? `${this._namespace}:*` : '*'));
+      k ?? (this._namespace ? `${this._namespace}:*` : '*'),
+      undefined, false, true);
   }
 
   /**
@@ -2809,7 +2928,7 @@ export class CacheService {
         newVer = current + 1;
       }
       this._setLocalTagVersion(tag, newVer, Date.now());
-      void this.publishInvalidation('tag_incr', tag, newVer);
+      void this.publishInvalidation('tag_incr', tag, newVer, false, true);
       return;
     }
 
@@ -2867,7 +2986,7 @@ export class CacheService {
             const [err, newVer] = results[i] ?? [null, null];
             const ver = (!err && typeof newVer === 'number') ? newVer : (this.tagVersions.get(tags[i])?.version ?? 0) + 1;
             this._setLocalTagVersion(tags[i], ver, now);
-            void this.publishInvalidation('tag_incr', tags[i], ver);
+            void this.publishInvalidation('tag_incr', tags[i], ver, false, true);
           }
           return;
         } catch (err) {
@@ -2877,7 +2996,7 @@ export class CacheService {
       for (const tag of tags) {
         const ver = (this.tagVersions.get(tag)?.version ?? 0) + 1;
         this._setLocalTagVersion(tag, ver, now);
-        void this.publishInvalidation('tag_incr', tag, ver);
+        void this.publishInvalidation('tag_incr', tag, ver, false, true);
       }
       return;
     }
@@ -3249,7 +3368,7 @@ export class CacheService {
         if (visited.has(dep)) continue;
         this.l1.delete(dep);
         if (!this._diskDisabled) this.disk.delete(dep);
-        void this.publishInvalidation('del', dep);
+        void this.publishInvalidation('del', dep, undefined, false, true);
         this.logger.debug('Dependency cascade: invalidated dependent key', {
           trigger: deletedKey.slice(0, 60), dependent: dep.slice(0, 60),
         });
@@ -3332,6 +3451,16 @@ export class CacheService {
           errors: c.remoteSnapshotErrors,
           lastUploadedAt: c.remoteSnapshotLastUploadedAt,
           lastDownloadedAt: c.remoteSnapshotLastDownloadedAt,
+        },
+      }),
+      ...(this.opts.crossRegion && {
+        crossRegion: {
+          enabled: true,
+          currentRegion: this.opts.crossRegion.currentRegion,
+          sent: c.crossRegionSent,
+          received: c.crossRegionReceived,
+          deduplicated: c.crossRegionDeduplicated,
+          errors: c.crossRegionErrors,
         },
       }),
 
@@ -3417,6 +3546,12 @@ export class CacheService {
       counter('remote_snapshot_uploads',   m.remoteSnapshot.uploads,   'Total remote snapshot uploads');
       counter('remote_snapshot_downloads', m.remoteSnapshot.downloads, 'Total remote snapshot downloads');
       counter('remote_snapshot_errors',    m.remoteSnapshot.errors,    'Total remote snapshot errors');
+    }
+    if (m.crossRegion?.enabled) {
+      counter('cross_region_sent',         m.crossRegion.sent,         'Total cross-region invalidations broadcast');
+      counter('cross_region_received',     m.crossRegion.received,     'Total cross-region invalidations received');
+      counter('cross_region_deduplicated', m.crossRegion.deduplicated, 'Total cross-region invalidations deduplicated or self-filtered');
+      counter('cross_region_errors',       m.crossRegion.errors,       'Total cross-region relay errors');
     }
 
     return lines.join('\n');

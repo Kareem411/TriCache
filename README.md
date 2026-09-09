@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-563%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-573%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 22](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org)
@@ -250,6 +250,15 @@ CacheService.create({
   backplaneStreamMaxLen:  10_000, // max entries retained in invalidation stream
   backplaneStreamBlockMs: 2_000,  // blocking poll interval for XREAD BLOCK
   // backplaneStreamKey:  'tricache:stream:{my-app}', // custom stream key override
+
+  // ── Multi-Region / Cross-Cluster Invalidation Relay ─────────────────
+  // Synchronizes invalidations across independent regional Redis clusters (us-east-1 + eu-central-1)
+  // crossRegion: {
+  //   currentRegion: 'us-east-1',
+  //   relay: createHttpMeshRelay({ peerUrls: ['https://eu.internal.api/cache/invalidation'], authSecret: 'my-secret' }),
+  //   authSecret: 'my-secret',
+  //   dedupCacheSize: 10_000, // loop prevention cache size
+  // },
 
   // ── Generational tagging & clone strategy ─────────────────────────────
   // 'set' (default)    — traditional Redis Set member tracking
@@ -1353,6 +1362,82 @@ const cache = CacheService.create({
 
 - **Encryption at rest**: When `encryptionKey` is configured, remote snapshots are automatically encrypted with AES-256-GCM before upload, keeping your remote storage compliant with SOC2/HIPAA.
 - **Fail-safe**: If the remote blob is missing (first deploy) or corrupted, TriCache logs a warning, starts cold, and continues serving requests without interruption.
+
+---
+
+## 🌍 Multi-Cluster / Geo-Distributed Cross-Region Invalidation Relay
+
+In global, multi-region deployments (e.g. `us-east-1` + `eu-central-1`), maintaining independent Redis clusters per region is standard practice to keep read and write latencies under 1 ms. However, without expensive active-active Redis Enterprise replication licenses, when an admin or background worker in Europe invalidates a tag or deletes a key, US instances remain stale.
+
+TriCache includes a lightweight, pluggable **Multi-Region Invalidation Relay** that synchronizes `del`, `del-glob`, and `tag_incr` invalidations between independent regional clusters:
+
+### How It Works
+1. **Local Eviction & Dispatch**: A delete or tag invalidation in `us-east-1` immediately evicts local L1/disk, broadcasts to `us-east-1`'s local Redis backplane, and dispatches an invalidation event to the cross-region relay.
+2. **Loop Prevention & Deduplication**: When `eu-central-1` receives the event, it verifies `originRegion !== currentRegion` and checks its deduplication ring buffer (default: 10,000 IDs). If the event originated in Europe or was already processed, it is immediately discarded.
+3. **Regional Fan-Out**: The receiving node applies the invalidation locally and relays it to `eu-central-1`'s local Redis backplane so all other pods in the region invalidate without re-broadcasting back to the cross-region mesh.
+
+### 1. Zero-Dependency HTTP Mesh Relay (Webhooks)
+
+Using Node 22 native `fetch()`, connect regional peer endpoints over internal service meshes or VPC peering:
+
+```typescript
+import { CacheService, createHttpMeshRelay, createCrossRegionWebhookHandler } from 'tricache';
+
+const cache = CacheService.create({
+  crossRegion: {
+    currentRegion: process.env.AWS_REGION || 'us-east-1',
+    relay: createHttpMeshRelay({
+      peerUrls: ['https://eu.internal.api/cache/invalidation'],
+      authSecret: process.env.CROSS_REGION_SECRET,
+      timeoutMs: 3000,
+    }),
+    authSecret: process.env.CROSS_REGION_SECRET,
+  },
+});
+
+// Framework-agnostic webhook receiver (Express / Fastify / Next.js / Node http)
+const webhookHandler = createCrossRegionWebhookHandler(cache, {
+  authSecret: process.env.CROSS_REGION_SECRET,
+});
+
+app.post('/cache/invalidation', async (req, res) => {
+  const result = await webhookHandler({ headers: req.headers, body: req.body });
+  res.status(result.status).json(result.body);
+});
+```
+
+### 2. Custom Message Broker Relay (AWS SNS/SQS, EventBridge, Kafka, NATS)
+
+For event-driven cloud architectures:
+
+```typescript
+import { CacheService, createCustomCrossRegionRelay } from 'tricache';
+import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
+
+const sns = new SNSClient({ region: 'us-east-1' });
+
+const snsRelay = createCustomCrossRegionRelay({
+  async broadcast(event) {
+    await sns.send(new PublishCommand({
+      TopicArn: 'arn:aws:sns:us-east-1:123456789012:global-cache-invalidation',
+      Message: JSON.stringify(event),
+    }));
+  },
+});
+
+const cache = CacheService.create({
+  crossRegion: {
+    currentRegion: 'us-east-1',
+    relay: snsRelay,
+  },
+});
+
+// When your SQS / Kafka consumer in another region receives the message:
+sqsConsumer.on('message', async (msg) => {
+  const event = JSON.parse(msg.Body);
+  await cache.receiveCrossRegionInvalidation(event);
+});
+```
 
 ---
 
