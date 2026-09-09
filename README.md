@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-640%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-671%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 20](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
@@ -1557,7 +1557,31 @@ const cache = new EdgeCacheService({
 });
 ```
 
-### 4. Edge Architecture Highlights
+### 4. Edge WebAssembly & Murmur3 Bloom Filter (Cold-Miss Penetration Defense)
+In Edge Isolates, querying remote storage (e.g. Upstash Redis REST or Cloudflare KV) takes 15–50ms over HTTP and incurs metered read costs. A local Bloom filter in isolate memory executes in **~300ns**, intercepting negative queries (random crawler probes, 404s, missing tenant keys) before they ever reach the network:
+
+```typescript
+import {
+  EdgeCacheService,
+  UpstashRedisAdapter,
+  WasmBloomFilter,
+  Murmur3BloomFilter,
+} from 'tricache/edge';
+
+const cache = new EdgeCacheService({
+  remoteStorage: new UpstashRedisAdapter({
+    url: process.env.UPSTASH_REDIS_REST_URL!,
+    token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+  }),
+  // 'bloomFilter: true' automatically compiles the inlined universal WebAssembly filter.
+  // Pass an explicit 'Murmur3BloomFilter' instance for custom capacity or pure JS environments:
+  bloomFilter: true, // or new Murmur3BloomFilter(100_000, 7)
+});
+```
+* **Universal Edge WASM:** Decoded via chunked `base64ToUint8Array`, eliminating Node.js `Buffer` traps across Cloudflare Workers, Fastly Compute, and Vercel Edge.
+* **MurmurHash3 Double-Hashing:** `Murmur3BloomFilter` uses 32-bit MurmurHash3 with Kirsch-Mitzenmacher optimization over a `Uint8Array` bitset, eliminating bit clustering and achieving <1% false positive rate at rated capacity.
+
+### 5. Edge Architecture Highlights
 * **Zero Interval Timers:** Does not use `setInterval`, allowing edge worker instances to freeze and suspend cleanly without CPU billing leaks.
 * **Dual-Bounded LRU:** Memory footprint is strictly bounded by both `maxKeys` and approximate byte weight.
 * **Isolate Lifecycle SWR Fence:** Background revalidations are registered via `ctx.waitUntil()` to prevent premature isolate termination.
@@ -1697,6 +1721,34 @@ CacheService.create({
 ```
 
 > `redisHost` / `redisPort` are ignored when `redisClusterNodes` or `redisSentinel` is set. All three topology modes support `redisTls` and `redisProtocol` (RESP2/RESP3).
+
+### Pluggable Redis Drivers (`@redis/client` / `node-redis` Adapter)
+
+Organizations standardizing on `@redis/client` (`npm:redis`), AWS ElastiCache IAM authentication, or Azure Managed Identities can plug their existing connection pools directly into TriCache without maintaining duplicate `ioredis` socket pools:
+
+```typescript
+import { createClient } from 'redis';
+import { CacheService, createNodeRedisAdapter } from 'tricache';
+
+// Initialize your company-standard node-redis client (e.g. with IAM or connection pooling)
+const nodeRedisClient = createClient({
+  url: 'redis://prod-cluster.internal:6379',
+});
+await nodeRedisClient.connect();
+
+// Plug directly into TriCache with zero runtime overhead
+const cache = CacheService.create({
+  redisClient: createNodeRedisAdapter(nodeRedisClient),
+  // Optional: pass a dedicated subscriber client or let TriCache duplicate automatically
+  // redisSubClient: createNodeRedisAdapter(nodeRedisClient.duplicate()),
+});
+```
+
+#### Adapter Architecture & Features
+* **Zero Runtime Overhead:** Implemented via duck-typing; zero external runtime dependencies added to TriCache.
+* **Transparent Command Mapping:** Automatically maps single/multi-key deletes (`del`), atomic sets with TTL (`setEx` / `{ EX, NX }`), set operations (`sAdd`, `sMembers`), and Lua lock release (`sendCommand`).
+* **Tuple-Normalized Pipelines:** Adapts `node-redis` `.multi()` to return error-first tuple arrays (`Array<[Error | null, T]>`), guaranteeing 100% interoperability with TriCache's pipelined `mget` and `warmFromL2` routines.
+* **Safe Teardown:** `cache.destroy()` gracefully disconnects internal workers and leaves your shared external connection pool open.
 
 ---
 

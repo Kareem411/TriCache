@@ -15,12 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `cache.item.tier` (`'memory'`, `'disk'`, `'remote'`).
   - Retained legacy `cache.hit_tier` (`'l1'`, `'disk'`, `'l2'`, `'miss'`) for complete backward compatibility with existing APM / Grafana dashboards.
   - Added batch spans `tricache.mset` and `tricache.mdel` tracking `cache.batch.size` and capturing failure status codes and exceptions.
-- **Cross-Isolate Edge Generational Tag Synchronization (`tricache/edge`)** — Extended `IEdgeRemoteStorage` with remote tag versioning:
-  - Upstash REST Redis atomic `INCR tag_ver:<tag>`.
-  - Cloudflare KV monotonic timestamp versioning: $\text{version} = \max(\text{prev} + 1, \text{Date.now}())$ eliminating read-modify-write race conditions.
-  - Cloudflare DO transactional version increment.
-  - In-isolate micro-TTL caching (800ms) to maintain sub-millisecond in-memory L1 reads without HTTP fetch amplification.
-- **Expanded Test Suite** — Added 3 new test suites (`tests/process-termination-bus.test.ts`, `tests/opentelemetry-conformance.test.ts`, `tests/edge-generational-tags.test.ts`), bringing the full test suite to **640 passing tests across 59 test files**.
+- **Pluggable `node-redis` Driver Adapter (`@redis/client` Bridge)** — Added `NodeRedisAdapter` and `createNodeRedisAdapter` (`src/adapters/node-redis.ts`) enabling enterprise organizations standardizing on `@redis/client` (node-redis v4/v5/v6), AWS ElastiCache IAM authentication, or Azure Managed Identities to plug their existing connection pools directly into `CacheService`:
+  - Zero additional runtime dependencies added to TriCache.
+  - Transparently translates single and multi-key deletions, camelCase methods (`sAdd`, `sMembers`, `setEx`, `mGet`), distributed locks (`EVAL` Lua scripts), and transactions.
+  - Normalizes pipeline/multi execution into error-first tuple arrays (`Array<[Error | null, T]>`) for 100% compatibility with all batch and warming flows.
+  - Added `redisClient?: IRedisDriver | any` and `redisSubClient?: IRedisDriver | any` options to `CacheOptions`.
+- **Edge WebAssembly & Murmur3 Bloom Filter (`tricache/edge`)** — High-performance cold-miss penetration defense for V8 edge isolates:
+  - Removed Node.js `Buffer` dependency in `src/wasm/bloom-filter-wasm.ts` via chunked `base64ToUint8Array`, making the WASM Bloom filter 100% universal across Cloudflare Workers, Fastly Compute, Vercel Edge, and browsers.
+  - Created `Murmur3BloomFilter` and `murmur3_32` (`src/edge/utils/murmur3.ts`) implementing standard 32-bit MurmurHash3 double-hashing with Kirsch-Mitzenmacher bitset probing over a pure `Uint8Array` bit-array.
+  - Integrated Bloom filter into `EdgeCacheService` (`bloomFilter: boolean | IEdgeBloomFilter`): ~300ns in-isolate miss rejection completely prevents expensive, metered HTTP subrequests to remote storage (Upstash Redis REST, Cloudflare KV) on 404 routes and randomized bot crawler keys.
+- **Expanded Test Suite** — Added 2 new test suites (`tests/node-redis-adapter.test.ts`, `tests/edge-bloom-filter.test.ts`), bringing the full test suite to **671 passing tests across 61 test files**.
 - **`CacheCodec` abstraction (`src/codec.ts`)** — Centralized msgpackr binary serialization engine with built-in record structure deduplication (`useRecords: true`), rich type preservation (`moreTypes: true` for `Set`, `TypedArray`, `Date`, etc.), and strict plain-object map decoding (`mapsAsObjects: true`).
 - **`serializeToJSON` option in `CacheOptions`** — Configurable flag (defaults to `true`) leveraging msgpackr 2.1.0's `useToJSON` capability. Setting `serializeToJSON: false` preserves the object's actual internal properties in durable cache tiers without invoking `.toJSON()`, avoiding accidental HTTP response projections on cached domain entities.
 - **Dedicated test suites** — Added comprehensive coverage for previously untested integration layers, bringing the test suite to 554 tests passing:

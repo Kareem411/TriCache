@@ -89,6 +89,26 @@ export interface EdgeCacheOptions {
 
   /** OpenTelemetry-compatible tracer for distributed tracing. */
   tracer?: ICacheTracer;
+
+  /**
+   * Optional Bloom filter to defend against remote storage penetration on guaranteed misses.
+   * - `true`: automatically instantiates a default `WasmBloomFilter` (or `Murmur3BloomFilter` fallback).
+   * - `IEdgeBloomFilter`: a custom or configured `WasmBloomFilter` or `Murmur3BloomFilter` instance.
+   */
+  bloomFilter?: boolean | IEdgeBloomFilter;
+}
+
+/**
+ * Common contract for Edge-compatible Bloom filters (WASM or pure TypeScript Murmur3).
+ */
+export interface IEdgeBloomFilter {
+  add(key: string): void;
+  mightContain(key: string): boolean;
+  reset(): void;
+  rebuild?(keys: Iterable<string>): void;
+  readonly insertions?: number;
+  readonly maxCapacity?: number;
+  readonly stats?: { bitsSet: number; fillFactor: number };
 }
 
 /**

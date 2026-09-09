@@ -46,6 +46,19 @@ export {
 } from './cross-region';
 
 export {
+  NodeRedisAdapter,
+  createNodeRedisAdapter,
+  type IRedisDriver,
+  type IRedisPipeline,
+} from './adapters/node-redis';
+
+export {
+  Murmur3BloomFilter,
+  murmur3_32,
+  type BloomFilterStats,
+} from './edge/utils/murmur3';
+
+export {
   CachePriority,
   consoleLogger,
   type ILogger,

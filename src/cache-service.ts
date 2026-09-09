@@ -45,6 +45,7 @@ import {
   LockOptions,
   ICacheMeter,
   ICacheCounter,
+  IRedisDriver,
 } from './types';
 import { CacheEncryption, type EncryptionMode } from './encryption';
 import { SmartMemoryCache }  from './smart-memory-cache';
@@ -329,8 +330,8 @@ function inferPriority(cacheKey: string): CachePriority {
 // globalThis key — allows reuse across hot reloads (Next.js, ts-node watch, etc.)
 const GLOBAL_KEY = '__tricache_instance__';
 
-// ── Union type for single-node, Cluster, and Sentinel Redis clients ───────────
-type AnyRedisClient = RedisClient | RedisCluster;
+// ── Union type for single-node, Cluster, Sentinel, and pluggable Redis drivers ──
+type AnyRedisClient = RedisClient | RedisCluster | IRedisDriver | any;
 
 // ── Serverless environment detection ─────────────────────────────────────────
 /**
@@ -465,6 +466,8 @@ export class CacheService {
     serializeToJSON: boolean;
     remoteSnapshot: RemoteSnapshotOptions | undefined;
     crossRegion: CrossRegionRelayOptions | undefined;
+    redisClient?: IRedisDriver | any;
+    redisSubClient?: IRedisDriver | any;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -600,7 +603,7 @@ export class CacheService {
         // The REDIS_HOST env fallback does NOT count as explicit: CI exports it
         // globally and unit tests rely on L2 staying off unless asked for.
         const explicitConfig = Boolean(
-          options.redisHost || options.redisClusterNodes?.length || options.redisSentinel,
+          options.redisClient || options.redisHost || options.redisClusterNodes?.length || options.redisSentinel,
         );
         return !explicitConfig && process.env.NODE_ENV !== 'production';
       })(),
@@ -655,6 +658,8 @@ export class CacheService {
       serializeToJSON:          options.serializeToJSON ?? true,
       remoteSnapshot:           options.remoteSnapshot,
       crossRegion:              options.crossRegion,
+      redisClient:              options.redisClient,
+      redisSubClient:           options.redisSubClient,
     };
 
     this.codec = new CacheCodec({
@@ -709,7 +714,7 @@ export class CacheService {
     // disableRedis takes unconditional precedence; otherwise, L2 is active when
     // at least one of host / cluster nodes / sentinel is configured.
     this._redisDisabled = this.opts.disableRedis
-      || (!this.opts.redisHost && !this.opts.redisClusterNodes?.length && !this.opts.redisSentinel);
+      || (!this.opts.redisClient && !this.opts.redisHost && !this.opts.redisClusterNodes?.length && !this.opts.redisSentinel);
 
     // L1 in-memory cache
     this.l1 = new SmartMemoryCache({
@@ -1038,6 +1043,12 @@ export class CacheService {
   }
 
   private createDedicatedRedisClient(): AnyRedisClient {
+    if (this.opts.redisSubClient) {
+      return this.opts.redisSubClient;
+    }
+    if (this.opts.redisClient && typeof this.opts.redisClient.duplicate === 'function') {
+      return this.opts.redisClient.duplicate();
+    }
     if (this.opts.redisClusterNodes?.length) {
       return new RedisCluster(this.opts.redisClusterNodes, {
         redisOptions: {
@@ -1556,13 +1567,25 @@ export class CacheService {
           stream.on('error', reject);
         }),
       ));
-    } else {
+    } else if (typeof (client as any).scanStream === 'function') {
       await new Promise<void>((resolve, reject) => {
-        const stream = client.scanStream({ match: pattern, count: 100 });
+        const stream = (client as any).scanStream({ match: pattern, count: 100 });
         stream.on('data',  (chunk: string[]) => keys.push(...chunk));
         stream.on('end',   resolve);
         stream.on('error', reject);
       });
+    } else if (typeof (client as any).scanIterator === 'function') {
+      for await (const key of (client as any).scanIterator({ MATCH: pattern, COUNT: 100 })) {
+        keys.push(key);
+      }
+    } else if (typeof (client as any).scan === 'function') {
+      let cursor = '0';
+      do {
+        const res = await (client as any).scan(cursor, 'MATCH', pattern, 'COUNT', 100);
+        cursor = String(res[0]);
+        const chunk = res[1] as string[];
+        if (chunk?.length) keys.push(...chunk);
+      } while (cursor !== '0');
     }
     return keys;
   }
@@ -1588,6 +1611,16 @@ export class CacheService {
     if (!this.cb.isAllowed()) throw new Error('tricache: L2 circuit breaker is open');
     if (this.redis) return this.redis;
     if (this.redisConnecting) return this.redisConnecting;
+
+    if (this.opts.redisClient) {
+      const client = this.opts.redisClient;
+      if (typeof client.connect === 'function' && client.isOpen === false) {
+        await client.connect();
+      }
+      this.cb.onSuccess();
+      this.redis = client;
+      return client;
+    }
 
     this.redisConnecting = (async () => {
       try {
@@ -3766,7 +3799,9 @@ export class CacheService {
       this._workerPool = null;
     }
     if (this.subClient) {
-      try { this.subClient.disconnect(); } catch { /* ok */ }
+      if (!this.opts.redisSubClient) {
+        try { this.subClient.disconnect(); } catch { /* ok */ }
+      }
       this.subClient = null;
     }
     if (this.streamClient) {
@@ -3774,7 +3809,9 @@ export class CacheService {
       this.streamClient = null;
     }
     if (this.redis) {
-      try { await this.redis.disconnect(); } catch { /* ok */ }
+      if (!this.opts.redisClient) {
+        try { await this.redis.disconnect(); } catch { /* ok */ }
+      }
       this.redis = null;
     }
     if (!this._diskDisabled) this.disk.close();

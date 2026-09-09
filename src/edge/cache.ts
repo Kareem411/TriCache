@@ -1,6 +1,8 @@
 import type { ICacheSpan, ICacheTracer } from '../types';
-import type { EdgeCacheOptions, EdgeGetOptions, IEdgeRemoteStorage } from './types';
+import type { EdgeCacheOptions, EdgeGetOptions, IEdgeRemoteStorage, IEdgeBloomFilter } from './types';
 import { WebCryptoEncryption } from './crypto';
+import { WasmBloomFilter } from '../wasm/bloom-filter-wasm';
+import { Murmur3BloomFilter } from './utils/murmur3';
 
 interface EdgeL1Entry<T = unknown> {
   value: T;
@@ -32,6 +34,7 @@ export class EdgeCacheService {
   private readonly remoteStorage: IEdgeRemoteStorage | null;
   private readonly enc: WebCryptoEncryption;
   private readonly tracer: ICacheTracer | null;
+  private readonly bloomFilter: IEdgeBloomFilter | null;
 
   // L1 Dual-bounded LRU
   private readonly l1 = new Map<string, EdgeL1Entry>();
@@ -55,6 +58,25 @@ export class EdgeCacheService {
     this.remoteStorage = options?.remoteStorage ?? null;
     this.tracer = options?.tracer ?? null;
     this.enc = new WebCryptoEncryption(options?.encryption);
+
+    if (options?.bloomFilter === true) {
+      try {
+        this.bloomFilter = new WasmBloomFilter();
+      } catch {
+        this.bloomFilter = new Murmur3BloomFilter();
+      }
+    } else if (options?.bloomFilter) {
+      this.bloomFilter = options.bloomFilter;
+    } else {
+      this.bloomFilter = null;
+    }
+  }
+
+  /**
+   * Active Bloom filter instance defending against cold miss penetration, or null.
+   */
+  get bloom(): IEdgeBloomFilter | null {
+    return this.bloomFilter;
   }
 
   private nk(key: string): string {
@@ -250,44 +272,48 @@ export class EdgeCacheService {
         }
       }
 
-      // 2. Check L2 Remote Storage
+      // 2. Check L2 Remote Storage (defended by Bloom filter against cold-miss penetration)
       if (this.remoteStorage) {
-        try {
-          const rawRemote = await this.remoteStorage.get(nsKey);
-          if (rawRemote !== null) {
-            const plain = this.enc.isEnabled ? await this.enc.decrypt(rawRemote) : rawRemote;
-            const parsedJson = JSON.parse(plain);
-            let parsed: T;
-            let activeTagVersions: Record<string, number> | undefined;
-            let isStaleRemote = false;
+        if (this.bloomFilter && !this.bloomFilter.mightContain(nsKey)) {
+          span.setAttribute('cache.bloom.filtered', true);
+        } else {
+          try {
+            const rawRemote = await this.remoteStorage.get(nsKey);
+            if (rawRemote !== null) {
+              const plain = this.enc.isEnabled ? await this.enc.decrypt(rawRemote) : rawRemote;
+              const parsedJson = JSON.parse(plain);
+              let parsed: T;
+              let activeTagVersions: Record<string, number> | undefined;
+              let isStaleRemote = false;
 
-            if (parsedJson && typeof parsedJson === 'object' && '__t_val' in parsedJson && '__t_tv' in parsedJson) {
-              parsed = parsedJson.__t_val as T;
-              activeTagVersions = parsedJson.__t_tv as Record<string, number>;
-              const tagNames = Object.keys(activeTagVersions);
-              const currentVers = await this._batchGetTagVersions(tagNames);
-              for (const tag of tagNames) {
-                if (currentVers[tag] > activeTagVersions[tag]) {
-                  isStaleRemote = true;
-                  break;
+              if (parsedJson && typeof parsedJson === 'object' && '__t_val' in parsedJson && '__t_tv' in parsedJson) {
+                parsed = parsedJson.__t_val as T;
+                activeTagVersions = parsedJson.__t_tv as Record<string, number>;
+                const tagNames = Object.keys(activeTagVersions);
+                const currentVers = await this._batchGetTagVersions(tagNames);
+                for (const tag of tagNames) {
+                  if (currentVers[tag] > activeTagVersions[tag]) {
+                    isStaleRemote = true;
+                    break;
+                  }
                 }
+              } else {
+                parsed = parsedJson as T;
               }
-            } else {
-              parsed = parsedJson as T;
-            }
 
-            if (!isStaleRemote) {
-              // Warm L1
-              await this.set(key, parsed, resolvedTtl, options);
+              if (!isStaleRemote) {
+                // Warm L1
+                await this.set(key, parsed, resolvedTtl, options);
 
-              span.setAttribute('cache.hit', true);
-              span.setAttribute('cache.item.tier', 'remote');
-              span.setAttribute('cache.hit_tier', 'l2');
-              return parsed;
+                span.setAttribute('cache.hit', true);
+                span.setAttribute('cache.item.tier', 'remote');
+                span.setAttribute('cache.hit_tier', 'l2');
+                return parsed;
+              }
             }
+          } catch (remoteErr) {
+            span.recordException?.(remoteErr);
           }
-        } catch (remoteErr) {
-          span.recordException?.(remoteErr);
         }
       }
 
@@ -417,6 +443,11 @@ export class EdgeCacheService {
         const payloadToStore = this.enc.isEnabled ? await this.enc.encrypt(toStoreRaw) : toStoreRaw;
         await this.remoteStorage.set(nsKey, payloadToStore, resolvedTtl + swrSeconds);
       }
+
+      // Register in Bloom filter
+      if (this.bloomFilter) {
+        this.bloomFilter.add(nsKey);
+      }
     } catch (err) {
       span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
       span.recordException?.(err);
@@ -507,6 +538,9 @@ export class EdgeCacheService {
       this.currentBytes = 0;
       this.tagIndex.clear();
       this.tagVersionCache.clear();
+      if (this.bloomFilter) {
+        this.bloomFilter.reset();
+      }
       if (this.remoteStorage) {
         await this.remoteStorage.clear?.(this.namespace || undefined);
       }

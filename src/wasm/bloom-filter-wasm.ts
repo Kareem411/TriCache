@@ -38,7 +38,11 @@ interface BloomWasmExports {
   countBits(): number;
 }
 
-const BLOOM_WASM_MODULE = new WebAssembly.Module(Buffer.from(BLOOM_WASM_BASE64, 'base64'));
+import { base64ToUint8Array } from '../edge/utils/base64';
+
+const BLOOM_WASM_MODULE = new WebAssembly.Module(
+  base64ToUint8Array(BLOOM_WASM_BASE64) as unknown as BufferSource,
+);
 
 // NOTE: WasmBloomFilter initializes 100% synchronously in its constructor from
 // pre-compiled WebAssembly bytecode (BLOOM_WASM_MODULE). There is no async init() promise,

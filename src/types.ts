@@ -375,6 +375,19 @@ export interface CacheOptions {
    */
   disableRedis?: boolean;
 
+  /**
+   * Pre-existing or custom Redis client or driver adapter (e.g. `NodeRedisAdapter` wrapping
+   * `@redis/client`, or a pre-configured `ioredis` instance).
+   * When supplied, TriCache bypasses internal connection construction and uses this client directly.
+   */
+  redisClient?: IRedisDriver | any;
+
+  /**
+   * Dedicated subscriber client for Redis Pub/Sub invalidation backplane.
+   * If omitted and `redisClient` supports `.duplicate()`, TriCache will duplicate `redisClient`.
+   */
+  redisSubClient?: IRedisDriver | any;
+
   // ── Encryption ────────────────────────────────────────────────────────────
   /**
    * Base64-encoded 32-byte AES-256-GCM key for encrypting L2 (Redis) values and
@@ -963,4 +976,51 @@ export interface ICacheMeter {
   createCounter(name: string, options?: { description?: string; unit?: string }): ICacheCounter;
   createObservableGauge(name: string, options?: { description?: string; unit?: string }): ICacheObservableGauge;
   addBatchObservableCallback(callback: ICacheBatchObservableCallback, observables: ICacheObservableGauge[]): void;
+}
+
+/**
+ * Common pipeline / transaction interface matching ioredis and adapted drivers.
+ */
+export interface IRedisPipeline {
+  get(key: string): this;
+  set(key: string, value: string, ...args: (string | number)[]): this;
+  setex(key: string, seconds: number, value: string): this;
+  del(...keys: string[]): this;
+  expire(key: string, seconds: number): this;
+  incr(key: string): this;
+  sadd(key: string, ...members: string[]): this;
+  smembers(key: string): this;
+  hset(key: string, value: Record<string, string>): this;
+  exec(): Promise<Array<[Error | null, any]> | null>;
+}
+
+/**
+ * Pluggable contract for external Redis drivers (e.g. `@redis/client` / `node-redis`,
+ * custom connection pools, or pre-configured `ioredis` instances).
+ */
+export interface IRedisDriver {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string, ...args: (string | number)[]): Promise<unknown>;
+  setex?(key: string, seconds: number, value: string): Promise<unknown>;
+  del(...keys: string[]): Promise<number>;
+  ping(): Promise<string>;
+  expire(key: string, seconds: number): Promise<number | boolean>;
+  incr(key: string): Promise<number>;
+  eval(script: string, numkeys: number, ...args: (string | number)[]): Promise<unknown>;
+  multi(): IRedisPipeline;
+  pipeline?(): IRedisPipeline;
+  smembers?(key: string): Promise<string[]>;
+  sadd?(key: string, ...members: string[]): Promise<number>;
+  scan?(cursor: string, ...args: (string | number)[]): Promise<[string, string[]]>;
+  scanStream?(options?: { match?: string; count?: number }): any;
+  hset?(key: string, value: Record<string, string>): Promise<unknown>;
+  publish?(channel: string, message: string): Promise<number>;
+  subscribe?(...channels: string[]): Promise<unknown>;
+  disconnect(): Promise<void> | void;
+  quit?(): Promise<void> | void;
+  duplicate?(): IRedisDriver;
+  on?(event: string, listener: (...args: any[]) => void): this | unknown;
+  once?(event: string, listener: (...args: any[]) => void): this | unknown;
+  isOpen?: boolean;
+  connect?(): Promise<unknown>;
 }
