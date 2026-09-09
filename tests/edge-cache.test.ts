@@ -206,4 +206,78 @@ describe('Universal Edge Portability: EdgeCacheService', () => {
     expect(spans[0].attrs['cache.hit']).toBe(true);
     expect(spans[0].attrs['cache.item.tier']).toBe('memory');
   });
+
+  it('isolates keys across distinct multi-tenant namespaces', async () => {
+    const remoteStore = new Map<string, string>();
+    const mockStorage: IEdgeRemoteStorage = {
+      async get(k: string) { return remoteStore.get(k) ?? null; },
+      async set(k: string, v: string) { remoteStore.set(k, v); },
+      async delete(k: string) { remoteStore.delete(k); },
+    };
+
+    const tenantA = new EdgeCacheService({ namespace: 'tenant_a', remoteStorage: mockStorage });
+    const tenantB = new EdgeCacheService({ namespace: 'tenant_b', remoteStorage: mockStorage });
+
+    await tenantA.set('shared-key', 'Data A');
+    await tenantB.set('shared-key', 'Data B');
+
+    expect(await tenantA.get('shared-key')).toBe('Data A');
+    expect(await tenantB.get('shared-key')).toBe('Data B');
+
+    expect(remoteStore.get('tenant_a:shared-key')).toBe('"Data A"');
+    expect(remoteStore.get('tenant_b:shared-key')).toBe('"Data B"');
+  });
+
+  it('performs batch mget with miss fetching for absent keys', async () => {
+    const cache = new EdgeCacheService();
+    await cache.set('k1', 'existing-1');
+
+    let fetcherCalled = false;
+    const fetchFn = async (missKeys: string[]) => {
+      fetcherCalled = true;
+      expect(missKeys).toEqual(['k2']);
+      return { k2: 'fetched-2' };
+    };
+
+    const results = await cache.mget(['k1', 'k2'], fetchFn, 60);
+    expect(results).toEqual(['existing-1', 'fetched-2']);
+    expect(fetcherCalled).toBe(true);
+
+    // Subsequent read hits cache directly
+    expect(await cache.get('k2')).toBe('fetched-2');
+  });
+
+  it('promotes accessed keys to MRU position so frequently read keys survive maxKeys eviction', async () => {
+    const cache = new EdgeCacheService({ maxKeys: 3 });
+
+    await cache.set('a', 1);
+    await cache.set('b', 2);
+    await cache.set('c', 3);
+
+    // Access 'a' — order becomes: b, c, a
+    await cache.get('a');
+
+    // Add 'd' — should evict oldest 'b'
+    await cache.set('d', 4);
+
+    expect(await cache.get('b')).toBeNull(); // evicted
+    expect(await cache.get('a')).toBe(1);    // survived
+    expect(await cache.get('c')).toBe(3);
+    expect(await cache.get('d')).toBe(4);
+  });
+
+  it('clears all entries and resets byte counters', async () => {
+    const cache = new EdgeCacheService();
+    await cache.set('item1', 'v1');
+    await cache.set('item2', 'v2');
+
+    expect(cache.stats().keys).toBe(2);
+    expect(cache.stats().bytes).toBeGreaterThan(0);
+
+    await cache.clear();
+
+    expect(cache.stats().keys).toBe(0);
+    expect(cache.stats().bytes).toBe(0);
+    expect(await cache.get('item1')).toBeNull();
+  });
 });

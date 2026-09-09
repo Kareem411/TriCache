@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-615%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-629%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 22](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org)
@@ -1459,6 +1459,109 @@ const cache = CacheService.create({
 
 - **Encryption at rest**: When `encryptionKey` is configured, remote snapshots are automatically encrypted with AES-256-GCM before upload, keeping your remote storage compliant with SOC2/HIPAA.
 - **Fail-safe**: If the remote blob is missing (first deploy) or corrupted, TriCache logs a warning, starts cold, and continues serving requests without interruption.
+- **Full Architectural Design**: See [Architecture Design: Cold-Start Cloud Hydration (Gap 3)](docs/cold-start-cloud-hydration.md) for deep dives into Kubernetes readiness gates, staleness fences, and multi-cloud snapshot formats.
+
+---
+
+## 🌐 Universal Edge & Serverless Runtime Portability (`tricache/edge`)
+
+TriCache includes first-class support for **pure V8 Edge Isolates** and modern serverless platforms where POSIX filesystems, Node worker threads, and raw TCP sockets are unavailable:
+
+* **Cloudflare Workers & Pages**
+* **Vercel Edge Middleware & Edge Functions**
+* **Fastly Compute**
+* **Next.js 16/15 Edge Runtime (`export const runtime = 'edge'`)**
+* **Deno Deploy**
+
+### 1. Quick Start in an Edge Isolate
+
+```typescript
+import { EdgeCacheService } from 'tricache/edge';
+
+const cache = new EdgeCacheService({
+  maxKeys: 5_000,
+  maxBytes: 16 * 1024 * 1024, // 16 MB memory ceiling
+  defaultTtlSeconds: 300,
+});
+
+export default {
+  async fetch(request, env, ctx) {
+    const data = await cache.get(
+      'top-stories',
+      () => fetch('https://api.example.com/stories').then(r => r.json()),
+      60,
+      { ctx, swr: 30 }, // ctx.waitUntil keeps isolate alive during background SWR
+    );
+    return Response.json(data);
+  },
+};
+```
+
+### 2. Edge Remote Storage Adapters (L2 Tier)
+
+When running in edge isolates without raw TCP sockets, connect to HTTP-based key-value backplanes:
+
+#### Upstash Redis (HTTPS REST)
+Zero external dependencies. Communicates over HTTPS REST with pipeline batching:
+```typescript
+import { EdgeCacheService, UpstashRedisAdapter } from 'tricache/edge';
+
+const remote = new UpstashRedisAdapter({
+  url: process.env.UPSTASH_REDIS_REST_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+});
+
+const cache = new EdgeCacheService({ remoteStorage: remote });
+```
+
+#### Cloudflare Workers KV
+Bridges Cloudflare `KVNamespace`. Automatically mitigates Cloudflare KV's 60-second TTL floor by wrapping sub-minute TTLs in a logical timestamp envelope:
+```typescript
+import { EdgeCacheService, CloudflareKVAdapter } from 'tricache/edge';
+
+export default {
+  async fetch(request, env, ctx) {
+    const cache = new EdgeCacheService({
+      remoteStorage: new CloudflareKVAdapter(env.MY_KV),
+    });
+    // Supports sub-minute TTLs (e.g. 5 seconds) without Cloudflare API errors
+    await cache.set('rapid-key', { status: 'ok' }, 5);
+    return Response.json(await cache.get('rapid-key'));
+  },
+};
+```
+
+#### Cloudflare Durable Objects
+Transactional storage bridge (`state.storage`) with automatic expiration:
+```typescript
+import { EdgeCacheService, CloudflareDOStorageAdapter } from 'tricache/edge';
+
+export class MyDurableObject {
+  constructor(state, env) {
+    this.cache = new EdgeCacheService({
+      remoteStorage: new CloudflareDOStorageAdapter(state.storage),
+    });
+  }
+}
+```
+
+### 3. Web Crypto AEAD at-rest Encryption
+Encrypt cached entries at rest with standard Web Crypto API (`crypto.subtle`). Wire format is 100% interoperable with Node.js `CacheEncryption`:
+```typescript
+const cache = new EdgeCacheService({
+  remoteStorage: remote,
+  encryption: {
+    keyBase64: 'your-base64-32-byte-key',
+    mode: 'aes-256-gcm', // or 'aes-128-gcm'
+  },
+});
+```
+
+### 4. Edge Architecture Highlights
+* **Zero Interval Timers:** Does not use `setInterval`, allowing edge worker instances to freeze and suspend cleanly without CPU billing leaks.
+* **Dual-Bounded LRU:** Memory footprint is strictly bounded by both `maxKeys` and approximate byte weight.
+* **Isolate Lifecycle SWR Fence:** Background revalidations are registered via `ctx.waitUntil()` to prevent premature isolate termination.
+* **Buffer-Free Chunked Base64:** Chunks binary serialization into safe 8 KB slices, eliminating `RangeError` call stack overflows on large payloads (>64 KB).
 
 ---
 

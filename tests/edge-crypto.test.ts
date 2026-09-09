@@ -93,4 +93,32 @@ describe('Universal Edge Portability: Web Crypto AEAD & Cross-Compatibility', ()
     expect(roundtrip[1000]).toBe(1000 % 256);
     expect(roundtrip[largeSize - 1]).toBe((largeSize - 1) % 256);
   });
+
+  it('validates key byte lengths during initialization', () => {
+    // 10-byte key (too short for aes-256-gcm)
+    const invalidKey = crypto.randomBytes(10).toString('base64');
+    expect(() => new WebCryptoEncryption({ keyBase64: invalidKey, mode: 'aes-256-gcm' })).toThrow(
+      /key length mismatch for aes-256-gcm. Expected 32 bytes, received 10 bytes/,
+    );
+
+    // 32-byte key for aes-128-gcm (expects 16 bytes)
+    const tooLongKey = crypto.randomBytes(32).toString('base64');
+    expect(() => new WebCryptoEncryption({ keyBase64: tooLongKey, mode: 'aes-128-gcm' })).toThrow(
+      /key length mismatch for aes-128-gcm. Expected 16 bytes, received 32 bytes/,
+    );
+  });
+
+  it('passes through plaintext when encryption is disabled', async () => {
+    const disabledEnc = new WebCryptoEncryption();
+    expect(disabledEnc.isEnabled).toBe(false);
+
+    const plain = 'unencrypted data';
+    expect(await disabledEnc.encrypt(plain)).toBe(plain);
+    expect(await disabledEnc.decrypt(plain)).toBe(plain);
+  });
+
+  it('returns unrecognized prefixes as-is on decrypt', async () => {
+    const enc = new WebCryptoEncryption({ keyBase64: key256 });
+    expect(await enc.decrypt('raw-unencrypted-string')).toBe('raw-unencrypted-string');
+  });
 });

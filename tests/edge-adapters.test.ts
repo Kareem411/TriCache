@@ -88,6 +88,68 @@ describe('Universal Edge Portability: Edge Remote Storage Adapters', () => {
       await upstash.mset({ k1: 'v1', k2: 'v2' }, 60);
       expect(pipelineCalled).toBe(true);
     });
+    it('throws actionable error when fetch returns HTTP non-200', async () => {
+      const mockFetch = vi.fn(async () => ({
+        ok: false,
+        status: 503,
+        statusText: 'Service Unavailable',
+        text: async () => 'Cluster failover in progress',
+      })) as unknown as typeof globalThis.fetch;
+
+      const upstash = new UpstashRedisAdapter({
+        url: 'https://us1-mock.upstash.io',
+        token: 'mock-token',
+        fetch: mockFetch,
+      });
+
+      await expect(upstash.get('fail-key')).rejects.toThrow(
+        /Upstash HTTP error \(503 Service Unavailable\): Cluster failover in progress/,
+      );
+    });
+
+    it('executes batch mget with mixed hits and misses', async () => {
+      const mockFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(init?.body as string);
+        if (Array.isArray(body) && body[0] === 'MGET') {
+          return {
+            ok: true,
+            json: async () => ({ result: ['hit1', null, 'hit3'] }),
+          } as Response;
+        }
+        return { ok: true, json: async () => ({ result: null }) } as Response;
+      }) as unknown as typeof globalThis.fetch;
+
+      const upstash = new UpstashRedisAdapter({
+        url: 'https://us1-mock.upstash.io',
+        token: 'mock-token',
+        fetch: mockFetch,
+      });
+
+      const res = await upstash.mget(['k1', 'k2', 'k3']);
+      expect(res).toEqual(['hit1', null, 'hit3']);
+    });
+
+    it('clears keys matching a prefix via KEYS and DEL', async () => {
+      const executed: unknown[][] = [];
+      const mockFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const body = JSON.parse(init?.body as string);
+        executed.push(body);
+        if (body[0] === 'KEYS') {
+          return { ok: true, json: async () => ({ result: ['tenant:1', 'tenant:2'] }) } as Response;
+        }
+        return { ok: true, json: async () => ({ result: 2 }) } as Response;
+      }) as unknown as typeof globalThis.fetch;
+
+      const upstash = new UpstashRedisAdapter({
+        url: 'https://us1-mock.upstash.io',
+        token: 'mock-token',
+        fetch: mockFetch,
+      });
+
+      await upstash.clear('tenant:');
+      expect(executed[0]).toEqual(['KEYS', 'tenant:*']);
+      expect(executed[1]).toEqual(['DEL', 'tenant:1', 'tenant:2']);
+    });
   });
 
   describe('CloudflareKVAdapter (Sub-minute TTL mitigation)', () => {
@@ -156,6 +218,56 @@ describe('Universal Edge Portability: Edge Remote Storage Adapters', () => {
       expect(kvStore.get('long-key')).toBe('durable-data');
       expect(await adapter.get('long-key')).toBe('durable-data');
     });
+
+    it('clears paginated keys using cursor loop', async () => {
+      const kvStore = new Map<string, string>([
+        ['cache:1', 'v1'],
+        ['cache:2', 'v2'],
+        ['cache:3', 'v3'],
+      ]);
+
+      let listCallCount = 0;
+      const mockKV: CloudflareKVNamespace = {
+        async get(k: string) { return kvStore.get(k) ?? null; },
+        async put(k: string, v: string) { kvStore.set(k, v); },
+        async delete(k: string) { kvStore.delete(k); },
+        async list(options?: { prefix?: string; cursor?: string }) {
+          listCallCount++;
+          if (!options?.cursor) {
+            return {
+              keys: [{ name: 'cache:1' }, { name: 'cache:2' }],
+              list_complete: false,
+              cursor: 'cursor-page-2',
+            };
+          }
+          return {
+            keys: [{ name: 'cache:3' }],
+            list_complete: true,
+          };
+        },
+      };
+
+      const adapter = new CloudflareKVAdapter(mockKV);
+      await adapter.clear('cache:');
+
+      expect(listCallCount).toBe(2);
+      expect(kvStore.size).toBe(0);
+    });
+
+    it('performs batch mget and mset on Cloudflare KV', async () => {
+      const kvStore = new Map<string, string>();
+      const mockKV: CloudflareKVNamespace = {
+        async get(k: string) { return kvStore.get(k) ?? null; },
+        async put(k: string, v: string) { kvStore.set(k, v); },
+        async delete(k: string) { kvStore.delete(k); },
+      };
+
+      const adapter = new CloudflareKVAdapter(mockKV);
+      await adapter.mset({ 'item:1': 'A', 'item:2': 'B' }, 120);
+
+      const res = await adapter.mget(['item:1', 'item:2', 'item:3']);
+      expect(res).toEqual(['A', 'B', null]);
+    });
   });
 
   describe('CloudflareDOStorageAdapter (Durable Objects)', () => {
@@ -182,6 +294,72 @@ describe('Universal Edge Portability: Edge Remote Storage Adapters', () => {
 
       await adapter.delete('session:1');
       expect(await adapter.get('session:1')).toBeNull();
+    });
+
+    it('performs batch mset and mget on Durable Object storage', async () => {
+      const doMap = new Map<string, unknown>();
+
+      const mockDO: CloudflareDOStorage = {
+        async get<T = unknown>(keys: string[]): Promise<Map<string, T>> {
+          const m = new Map<string, T>();
+          for (const k of keys) {
+            if (doMap.has(k)) m.set(k, doMap.get(k) as T);
+          }
+          return m;
+        },
+        async put<T = unknown>(entries: Record<string, T>): Promise<void> {
+          for (const [k, v] of Object.entries(entries)) {
+            doMap.set(k, v);
+          }
+        },
+        async delete(keys: string[]): Promise<number> {
+          let count = 0;
+          for (const k of keys) {
+            if (doMap.delete(k)) count++;
+          }
+          return count;
+        },
+      } as unknown as CloudflareDOStorage;
+
+      const adapter = new CloudflareDOStorageAdapter(mockDO);
+      await adapter.mset({ a: '1', b: '2' }, 300);
+
+      const res = await adapter.mget(['a', 'b', 'c']);
+      expect(res).toEqual(['1', '2', null]);
+    });
+
+    it('clears keys matching a prefix from Durable Object storage', async () => {
+      const doMap = new Map<string, unknown>([
+        ['tenant:1', 'val1'],
+        ['tenant:2', 'val2'],
+        ['other:3', 'val3'],
+      ]);
+
+      const mockDO: CloudflareDOStorage = {
+        async list<T = unknown>(options?: { prefix?: string }): Promise<Map<string, T>> {
+          const m = new Map<string, T>();
+          for (const [k, v] of doMap.entries()) {
+            if (!options?.prefix || k.startsWith(options.prefix)) {
+              m.set(k, v as T);
+            }
+          }
+          return m;
+        },
+        async delete(keys: string[]): Promise<number> {
+          let c = 0;
+          for (const k of keys) {
+            if (doMap.delete(k)) c++;
+          }
+          return c;
+        },
+      } as unknown as CloudflareDOStorage;
+
+      const adapter = new CloudflareDOStorageAdapter(mockDO);
+      await adapter.clear('tenant:');
+
+      expect(doMap.has('tenant:1')).toBe(false);
+      expect(doMap.has('tenant:2')).toBe(false);
+      expect(doMap.has('other:3')).toBe(true);
     });
   });
 });
