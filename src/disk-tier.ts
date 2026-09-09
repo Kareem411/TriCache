@@ -17,7 +17,7 @@
 import fs                from 'fs';
 import path              from 'path';
 import crypto            from 'crypto';
-import { pack, unpack }  from 'msgpackr';
+import { CacheCodec, defaultCodec } from './codec.js';
 import type { DiskCacheEntry, ILogger } from './types.js';
 import type { CacheEncryption }        from './encryption.js';
 import {
@@ -89,10 +89,12 @@ export interface DiskTierOptions {
   compression?:     CompressionAlgorithm;
   compressionThresholdBytes?: number;
   logger:           ILogger;
+  codec?:           CacheCodec;
 }
 
 export class DiskTier {
   private readonly opts:    DiskTierOptions;
+  private readonly codec:   CacheCodec;
   private dirReady          = false;
   private diskUsageBytes    = 0;
   private usageCounted      = false;
@@ -110,7 +112,8 @@ export class DiskTier {
   private _stmtStats:  _SqliteStmt | null = null;  // COUNT + SUM(size)
 
   constructor(opts: DiskTierOptions) {
-    this.opts = opts;
+    this.opts  = opts;
+    this.codec = opts.codec ?? defaultCodec;
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -345,7 +348,7 @@ export class DiskTier {
         },
         writtenAt: Date.now(),
       };
-      const packed = pack(payload);
+      const packed = this.codec.encode(payload);
       if (packed.length > this.opts.entryMaxBytes) return;
       let toEncrypt = packed;
       if (this.opts.compression && this.opts.compression !== 'none' && packed.length > (this.opts.compressionThresholdBytes ?? 1024)) {
@@ -366,7 +369,7 @@ export class DiskTier {
     // ── Async phase: mkdir + write to same-dir tmp + atomic rename ────
     const hash     = this.keyToHash(key);
     const filePath = this.hashToWritePath(hash, entry.expiresAt);
-    const tmpPath  = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+    const tmpPath  = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`;
     this.diskUsageBytes += final.length; // optimistic — rolled back on error
     this.fileCount++;
 
@@ -477,7 +480,7 @@ export class DiskTier {
       }
 
       const uncompressed = decompressWithHeader(decrypted, this.opts.compression ?? 'brotli');
-      const payload = unpack(uncompressed) as DiskPayload;
+      const payload = this.codec.decode(uncompressed) as DiskPayload;
       if (!payload || payload.version !== DISK_TIER_VERSION || payload.key !== key) return null;
       if (payload.entry.expiresAt <= Date.now()) return null;
 
@@ -568,6 +571,10 @@ export class DiskTier {
       }
 
       // ── V2 header fast path: read only the 16-byte plaintext header ────────
+      // NOTE: Modern TriCache disk files never read full payload data during eviction.
+      // The 16-byte plaintext header (magic + expiresAt) allows checking TTL and unlinking
+      // expired files with near-zero I/O overhead. Full readFileSync below is exclusively
+      // for backward compatibility with ancient V1 files lacking the magic header.
       let fd = -1;
       try {
         fd = fs.openSync(filePath, 'r');
@@ -588,7 +595,7 @@ export class DiskTier {
           continue;
         }
 
-        // ── Legacy path: V1 encrypted or pre-magic unencrypted ────────────
+        // ── Legacy fallback path: V1 encrypted or pre-magic unencrypted ────────
         const stat = fs.statSync(filePath);
         if (stat.size > this.opts.entryMaxBytes) {
           fs.unlinkSync(filePath);
@@ -600,7 +607,7 @@ export class DiskTier {
         const raw = fs.readFileSync(filePath);
         let dec: Buffer;
         try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size); this.fileCount = Math.max(0, this.fileCount - 1); purged++; continue; }
-        const payload = unpack(dec) as DiskPayload;
+        const payload = this.codec.decode(dec) as DiskPayload;
         if (!payload || payload.version !== DISK_TIER_VERSION || payload.entry.expiresAt <= now) {
           fs.unlinkSync(filePath);
           this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
@@ -759,7 +766,7 @@ export class DiskTier {
         const raw = fs.readFileSync(filePath);
         let dec: Buffer;
         try { dec = this.decrypt(raw); } catch { fs.unlinkSync(filePath); this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size); this.fileCount = Math.max(0, this.fileCount - 1); purged++; continue; }
-        const payload = unpack(dec) as DiskPayload;
+        const payload = this.codec.decode(dec) as DiskPayload;
         if (!payload || payload.version !== DISK_TIER_VERSION || payload.entry.expiresAt <= now) {
           fs.unlinkSync(filePath);
           this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);

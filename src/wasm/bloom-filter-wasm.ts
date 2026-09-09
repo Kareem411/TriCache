@@ -40,6 +40,9 @@ interface BloomWasmExports {
 
 const BLOOM_WASM_MODULE = new WebAssembly.Module(Buffer.from(BLOOM_WASM_BASE64, 'base64'));
 
+// NOTE: WasmBloomFilter initializes 100% synchronously in its constructor from
+// pre-compiled WebAssembly bytecode (BLOOM_WASM_MODULE). There is no async init() promise,
+// deferred worker loading, or uninitialized state; instances are fully operational immediately.
 export class WasmBloomFilter {
   private readonly exports: BloomWasmExports;
   private readonly mem: Uint8Array;

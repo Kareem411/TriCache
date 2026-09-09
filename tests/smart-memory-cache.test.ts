@@ -212,6 +212,28 @@ describe('SmartMemoryCache', () => {
     expect(tiny.get('auth:tok')).not.toBeNull();
   });
 
+  it('isolates user-provided onEviction errors and continues operating normally', () => {
+    let evictedCount = 0;
+    const tiny = new SmartMemoryCache({
+      ...opts,
+      maxEntries: 2,
+      categories: { default: { maxEntries: 2, maxSizeBytes: 1024 * 1024 } },
+      onEviction: (_key, _reason) => {
+        evictedCount++;
+        throw new Error('Explosive user callback failure!');
+      },
+    });
+
+    expect(() => {
+      tiny.set('k1', 'val1', 60_000);
+      tiny.set('k2', 'val2', 60_000);
+      tiny.set('k3', 'val3', 60_000); // triggers eviction and user callback throw
+    }).not.toThrow();
+
+    expect(evictedCount).toBeGreaterThan(0);
+    expect(tiny.get('k3')).not.toBeNull();
+  });
+
   // ── Snapshot import/export ───────────────────────────────────────────────
 
   it('exports and re-imports entries faithfully', () => {

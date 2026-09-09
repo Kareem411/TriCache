@@ -216,4 +216,70 @@ describe('DiskTier', () => {
       try { fs.unlinkSync(freshTmp); } catch {}
     });
   });
+
+  // ── Corruption & Decryption Error Handling ─────────────────────────────────
+
+  describe('corruption and decryption resilience', () => {
+    it('returns null safely when encrypted payload is corrupted or tampered', async () => {
+      const keyBase64 = Buffer.from('01'.repeat(32), 'hex').toString('base64');
+      const enc = new CacheEncryption(keyBase64, consoleLogger, 'aes-256-gcm');
+      const encDisk = new DiskTier({
+        dir: tempDir(),
+        maxBytes: 10 * 1024 * 1024,
+        entryMaxBytes: 1024 * 1024,
+        forbiddenPrefixes: [],
+        encryption: enc,
+        logger: consoleLogger,
+      });
+
+      try {
+        await encDisk.save('tamper-test', makeEntry('secret value'));
+
+        // Locate the created file on disk
+        const hash = (encDisk as any).keyToHash('tamper-test');
+        const filePath = (encDisk as any).findFilePath(hash);
+        expect(filePath).not.toBeNull();
+
+        // Tamper with the ciphertext (flip bytes in the payload)
+        const fileContent = fs.readFileSync(filePath!);
+        fileContent[fileContent.length - 2] ^= 0xff;
+        fs.writeFileSync(filePath!, fileContent);
+
+        // Loading should catch decryption/tag failure and safely return null
+        const loaded = encDisk.load('tamper-test');
+        expect(loaded).toBeNull();
+      } finally {
+        try { rmSync((encDisk as any).opts.dir, { recursive: true, force: true }); } catch {}
+      }
+    });
+
+    it('returns null safely when file contains truncated or malformed payload', async () => {
+      await disk.save('malformed-key', makeEntry('valid value'));
+      const hash = (disk as any).keyToHash('malformed-key');
+      const filePath = (disk as any).findFilePath(hash);
+      expect(filePath).not.toBeNull();
+
+      // Write truncated garbage into the file
+      fs.writeFileSync(filePath!, Buffer.from('GARBAGE'));
+
+      expect(disk.load('malformed-key')).toBeNull();
+    });
+
+    it('returns null safely if entry key in payload does not match expected key', async () => {
+      // Save under 'original-key'
+      await disk.save('original-key', makeEntry('hello'));
+      const origHash = (disk as any).keyToHash('original-key');
+      const origPath = (disk as any).findFilePath(origHash);
+      expect(origPath).not.toBeNull();
+
+      // Rename file to hash of 'different-key'
+      const diffHash = (disk as any).keyToHash('different-key');
+      const diffPath = (disk as any).hashToWritePath(diffHash, Date.now() + 60_000);
+      fs.mkdirSync(require('path').dirname(diffPath), { recursive: true });
+      fs.renameSync(origPath!, diffPath);
+
+      // Loading 'different-key' should reject because payload.key !== key
+      expect(disk.load('different-key')).toBeNull();
+    });
+  });
 });

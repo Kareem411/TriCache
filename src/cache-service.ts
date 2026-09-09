@@ -17,7 +17,7 @@
  */
 
 import { Redis as RedisClient, Cluster as RedisCluster } from 'ioredis';
-import { pack, unpack } from 'msgpackr';
+import { CacheCodec } from './codec.js';
 import crypto from 'crypto';
 import os    from 'os';
 import { WorkerPool } from './worker-pool.js';
@@ -350,6 +350,7 @@ function detectServerlessRuntime(): string | null {
 export class CacheService {
   private readonly logger:     ILogger;
   private readonly enc:        CacheEncryption;
+  private readonly codec:      CacheCodec;
   private readonly l1:         SmartMemoryCache;
   private readonly disk:       DiskTier;
   /** When true, all disk-tier and snapshot operations are skipped. */
@@ -405,6 +406,7 @@ export class CacheService {
     backplaneStreamMaxLen: number;
     backplaneStreamBlockMs: number;
     backplaneStreamKey?: string;
+    serializeToJSON: boolean;
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
@@ -580,7 +582,14 @@ export class CacheService {
       backplaneStreamMaxLen:    options.backplaneStreamMaxLen ?? 10_000,
       backplaneStreamBlockMs:   options.backplaneStreamBlockMs ?? 2_000,
       backplaneStreamKey:       options.backplaneStreamKey,
+      serializeToJSON:          options.serializeToJSON ?? true,
     };
+
+    this.codec = new CacheCodec({
+      useToJSON:  this.opts.serializeToJSON,
+      useRecords: true,
+      moreTypes:  true,
+    });
 
     // Circuit breaker for L2 Redis
     const cbThreshold  = options.l2CircuitBreakerThreshold  ?? 5;
@@ -621,6 +630,7 @@ export class CacheService {
       compression:      this.opts.compression,
       compressionThresholdBytes: this.opts.compressionThresholdBytes,
       logger,
+      codec:            this.codec,
     });
 
     this._namespace     = ns;
@@ -635,6 +645,7 @@ export class CacheService {
       maxEntries: this.opts.l1MaxEntries,
       categories: this.opts.categoryLimits,
       evictionWatermark: this.opts.l1EvictionWatermark,
+      codec:      this.codec,
       diskSpill: (key: string, entry: SmartCacheEntry) => {
         if (this._diskDisabled) return; // Fix 3: skip spill in serverless environments
         // Defer disk.save() entirely to the next event-loop tick so the synchronous
@@ -1468,13 +1479,19 @@ export class CacheService {
 
   // ── Snapshot (cold-start persistence) ────────────────────────────────────
 
+  /**
+   * Writes the cold-start snapshot to disk.
+   * NOTE: fs.writeFileSync is INTENTIONAL here: this method is invoked during SIGTERM/SIGINT
+   * process termination hooks where asynchronous I/O would risk the Node.js event loop dying or
+   * process.exit() being called before the snapshot is physically written to disk.
+   */
   writeSnapshot(altPath?: string): void {
     try {
       const entries = this.l1.exportEntries(this.opts.forbiddenSnapshotPrefixes);
       if (entries.length === 0) return;
 
       const payload = { version: SNAPSHOT_VERSION, writtenAt: Date.now(), entries };
-      const packed  = pack(payload);
+      const packed  = this.codec.encode(payload);
       const final   = this.enc.isEnabled ? this.enc.encryptBuffer(packed) : packed;
       const dest    = altPath ?? this.opts.snapshotPath;
       fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -1488,6 +1505,12 @@ export class CacheService {
     }
   }
 
+  /**
+   * Loads cold-start snapshot from disk into L1 memory.
+   * NOTE: fs.readFileSync is INTENTIONAL here: this method is invoked synchronously inside the
+   * CacheService constructor so that the cache is atomically populated before any subsequent
+   * cache.get() or cache.set() operations run, eliminating cold-start race conditions.
+   */
   loadSnapshot(): void {
     const snapshotPath = this.opts.snapshotPath;
     try {
@@ -1509,7 +1532,7 @@ export class CacheService {
         return;
       }
 
-      const snapshot = unpack(buf) as {
+      const snapshot = this.codec.decode(buf) as {
         version?: number; writtenAt?: number;
         entries?: Array<{ key: string; entry: SmartCacheEntry }>;
       };
@@ -1603,9 +1626,10 @@ export class CacheService {
     if (l1Hit !== null) {
       let isGenerationalStale = false;
       if (this.opts.tagStrategy === 'generational' && l1Hit.tagVersions) {
-        for (const [tag, entryVer] of Object.entries(l1Hit.tagVersions)) {
-          const currentVer = await this._getTagVersion(tag);
-          if (currentVer > entryVer) {
+        const tags = Object.keys(l1Hit.tagVersions);
+        const currentVers = await Promise.all(tags.map(tag => this._getTagVersion(tag)));
+        for (let i = 0; i < tags.length; i++) {
+          if (currentVers[i] > l1Hit.tagVersions[tags[i]]) {
             isGenerationalStale = true;
             break;
           }
@@ -1681,9 +1705,10 @@ export class CacheService {
             if (hashData.tv) {
               try { storedTagVersions = JSON.parse(hashData.tv); } catch { /* ignore */ }
             }
-            for (const [tag, entryVer] of Object.entries(storedTagVersions)) {
-              const currentVer = await this._getTagVersion(tag);
-              if (currentVer > entryVer) {
+            const tags = Object.keys(storedTagVersions);
+            const currentVers = await Promise.all(tags.map(tag => this._getTagVersion(tag)));
+            for (let i = 0; i < tags.length; i++) {
+              if (currentVers[i] > storedTagVersions[tags[i]]) {
                 isStale = true;
                 break;
               }
@@ -1732,9 +1757,10 @@ export class CacheService {
       if (diskHit !== null) {
         let isDiskStale = false;
         if (this.opts.tagStrategy === 'generational' && diskHit.tagVersions) {
-          for (const [tag, entryVer] of Object.entries(diskHit.tagVersions)) {
-            const currentVer = await this._getTagVersion(tag);
-            if (currentVer > entryVer) {
+          const tags = Object.keys(diskHit.tagVersions);
+          const currentVers = await Promise.all(tags.map(tag => this._getTagVersion(tag)));
+          for (let i = 0; i < tags.length; i++) {
+            if (currentVers[i] > diskHit.tagVersions[tags[i]]) {
               isDiskStale = true;
               break;
             }
@@ -1806,9 +1832,10 @@ export class CacheService {
         let activeTagVersions: Record<string, number> | undefined;
         if (optTags?.length) {
           if (this.opts.tagStrategy === 'generational') {
+            const vers = await Promise.all(optTags.map(tag => this._getTagVersion(tag)));
             activeTagVersions = {};
-            for (const tag of optTags) {
-              activeTagVersions[tag] = await this._getTagVersion(tag);
+            for (let i = 0; i < optTags.length; i++) {
+              activeTagVersions[optTags[i]] = vers[i];
             }
           } else {
             await this._registerTags(k, optTags, Math.ceil(effectiveTtl / 1_000));
@@ -1901,9 +1928,11 @@ export class CacheService {
       let activeTagVersions: Record<string, number> | undefined;
       const l1Existing = this.l1.get(cacheKey);
       if (this.opts.tagStrategy === 'generational' && l1Existing?.tagVersions) {
+        const tags = Object.keys(l1Existing.tagVersions);
+        const vers = await Promise.all(tags.map(tag => this._getTagVersion(tag)));
         activeTagVersions = {};
-        for (const tag of Object.keys(l1Existing.tagVersions)) {
-          activeTagVersions[tag] = await this._getTagVersion(tag);
+        for (let i = 0; i < tags.length; i++) {
+          activeTagVersions[tags[i]] = vers[i];
         }
       }
 
@@ -1964,9 +1993,10 @@ export class CacheService {
     let activeTagVersions: Record<string, number> | undefined;
     if (opts?.tags?.length) {
       if (this.opts.tagStrategy === 'generational') {
+        const vers = await Promise.all(opts.tags.map(tag => this._getTagVersion(tag)));
         activeTagVersions = {};
-        for (const tag of opts.tags) {
-          activeTagVersions[tag] = await this._getTagVersion(tag);
+        for (let i = 0; i < opts.tags.length; i++) {
+          activeTagVersions[opts.tags[i]] = vers[i];
         }
       } else {
         await this._registerTags(k, opts.tags, ttlSeconds);
@@ -2326,7 +2356,7 @@ export class CacheService {
     const now = Date.now();
     if (entry.expiresAt <= now) return null;               // expired
     if (entry.staleAt !== undefined && entry.staleAt < now) return null; // in SWR grace
-    return (entry.value !== undefined ? entry.value : unpack(entry.data)) as T;
+    return (entry.value !== undefined ? entry.value : this.codec.decode(entry.data)) as T;
   }
 
   /**
@@ -2424,7 +2454,7 @@ export class CacheService {
       const k = this.nk(keys[i]);
       const entry = this.l1.getEntry(k);
       if (entry && entry.expiresAt > Date.now()) {
-        result[i] = (entry.value !== undefined ? entry.value : unpack(entry.data)) as T;
+        result[i] = (entry.value !== undefined ? entry.value : this.codec.decode(entry.data)) as T;
         this.counters.l1Hits++;
       } else {
         missIndexes.push(i);
@@ -2504,13 +2534,17 @@ export class CacheService {
     if (missKeys.length > 0) {
       this.counters.fetches++;
       const fetched = await fetchFn(missKeys);
+      const setPromises: Promise<void>[] = [];
       for (let j = 0; j < missKeys.length; j++) {
         const v = fetched[missKeys[j]];
         result[missIndexes[j]] = v;
         if (v !== undefined) {
           const resolvedTtl = typeof ttl === 'function' ? ttl(missKeys[j]) : ttl;
-          await this.set(missKeys[j], v, resolvedTtl, priority);
+          setPromises.push(this.set(missKeys[j], v, resolvedTtl, priority));
         }
+      }
+      if (setPromises.length > 0) {
+        await Promise.all(setPromises);
       }
     }
 
@@ -2597,7 +2631,6 @@ export class CacheService {
       this.cb.onSuccess();
 
       let loaded = 0;
-      const now = Date.now();
       for (let i = 0; i < matchedKeys.length; i++) {
         const [err, raw] = results[i];
         if (err || raw == null) continue;
@@ -2610,7 +2643,6 @@ export class CacheService {
           loaded++;
         } catch { /* skip malformed entries */ }
       }
-      void now; // suppress unused warning
 
       this.logger.info('warmFromL2 complete', {
         pattern, matched: matchedKeys.length, loaded,

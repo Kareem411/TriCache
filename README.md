@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml/badge.svg)](https://github.com/Kareem411/TriCache/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-511%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-554%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 22](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](https://nodejs.org)
@@ -17,16 +17,20 @@ tricache is a three-tier Node.js cache library — in-memory (L1), local disk sp
 
 ## 🏆 What Makes TriCache a "No-Brainer"
 
-| Dimension | Industry Standard (`keyv`, `@neshca/cache-handler`, `cache-manager`) | **TriCache v0.7.1** |
+| Dimension | Industry Standard (`keyv`, `@neshca/cache-handler`, `cache-manager`) | **TriCache v0.8.0** |
 |:---|:---|:---|
-| **Storage Hierarchy** | Single-tier (RAM or Redis or Disk) | **Three-Tier (RAM → NVMe Disk → Redis/Valkey)** |
-| **Thundering-Herd** | Unhandled / requires external single-flight libraries | **Built-in Inflight Promise Coalescing (10k tested)** |
-| **Tag Invalidation** | $O(N)$ bulk key scans or Redis `SMEMBERS` deletions | **$O(1)$ Generational Version Counters (`MULTI/EXEC`)** |
-| **Next.js 16 Support** | Basic key-value handlers, broken RSC stream reuse | **Native 5-Method Bridge with stream re-hydration & `cacheLife`** |
-| **NestJS Support** | Generic `CacheModule` with missing batch/tag methods | **Dynamic `TriCacheModule` + `@Cacheable` & `@CacheEvict` decorators** |
-| **Cluster Invalidation** | At-most-once Pub/Sub (drops messages on network blips) | **Durable Redis Streams (`XADD`/`XREAD`) with reconnect replay** |
-| **Memory Hygiene** | Standard JSON stringification, unconstrained RAM | **WASM Bloom filter, Count-Min Sketch, Zero-Copy `transferList` workers** |
-| **Failure Tolerance** | Cascading 500s when Redis/Upstream flutters | **Circuit Breaker, `staleIfError` SWR grace, monotonic tag guarantees** |
+| **Storage Hierarchy** | Single-tier (RAM or Redis or Disk) | **Three-Tier (RAM → NVMe Disk Spill → Redis/Valkey L2)** |
+| **Throughput & Latency** | ~200k – 600k ops/sec | **2.81 Million ops/sec (356 ns/op) warm L1 on a single core** |
+| **Thundering-Herd** | Unhandled / requires external single-flight libraries | **Built-in Inflight Promise Coalescing (10,000 tested concurrent callers)** |
+| **Tag Invalidation** | $O(N)$ bulk key scans or blocking Redis `SMEMBERS` | **$O(1)$ Generational Version Counters (`MULTI/EXEC`) in < 1 ms** |
+| **ORM & Database Layer** | Manual boilerplate wrappers | **Native Prisma Extension (`withTriCache`) & Drizzle Wrapper (`withCache`)** |
+| **Serialization & Payload**| Heavy JSON stringification | **`msgpackr` 2.1.0 Record Compression (~45% smaller binary footprint)** |
+| **Next.js 16 & 15** | Basic key-value handlers, broken RSC stream reuse | **Native 5-Method Bridge with stream re-hydration & `cacheLife`** |
+| **NestJS Ecosystem** | Generic `CacheModule` missing batch & tag methods | **Dynamic `TriCacheModule` + `@Cacheable` & `@CacheEvict` decorators** |
+| **Cluster Invalidation** | At-most-once Pub/Sub (drops invalidations on blips) | **Durable Redis Streams (`XADD`/`XREAD`) with zero-drop reconnect replay** |
+| **Memory Hygiene** | Unconstrained RAM until node crashes (OOM) | **Count-Min Sketch (84% flood survival), WASM Bloom filter, OOM guard** |
+| **Failure Tolerance** | Cascading 500s when Redis or upstream flutters | **Circuit Breaker, `staleIfError` SWR grace, monotonic tag guarantees** |
+
 
 ---
 
@@ -49,7 +53,7 @@ tricache is a three-tier Node.js cache library — in-memory (L1), local disk sp
 | **Adaptive eviction** | LFU × LRU × priority score + Count-Min Sketch cross-eviction frequency; reservoir-sampled O(1) hot path; category limits prevent any prefix monopolising RAM |
 | **Count-Min Sketch** | 4 × 512 `Uint16Array` (4 KB) tracks historical access frequency across eviction boundaries — same-priority burst keys cannot displace long-resident entries; **84 % survival rate** in benchmark flood tests |
 | **WASM Bloom filter** | 562-byte binary inlined as Base64 — O(k=7) guaranteed-miss detection, no filesystem access, pure-JS fallback |
-| **msgpackr serialization** | L1 and disk-tier entries packed with msgpackr — uniform binary format, no JSON on hot paths; L2 (Redis) string values are JSON-serialised before encryption |
+| **msgpackr 2.1.0 serialization** | L1 and disk-tier entries packed with `msgpackr` 2.1.0 via `CacheCodec` — record structure compression (`useRecords: true`, ~45% smaller binary footprint), rich type preservation (`moreTypes: true`), DoS defense, and `serializeToJSON` toggle |
 | **Stale-While-Revalidate** | Serve stale instantly, revalidate in background — zero added latency on cache hit |
 | **Stale-if-error** | Extend a stale entry's TTL when SWR revalidation fails — no errors served during upstream outages |
 | **Thundering-herd prevention** | Inflight `Promise` registry — only one `fetchFn` call per key regardless of concurrency (10,000 tested) |
@@ -255,6 +259,11 @@ CacheService.create({
   // 'none' (default)   — raw in-memory references (~350 ns performance)
   // 'structuredClone'  — deep-clones returned values to prevent caller mutation
   cloneStrategy:          'none',
+
+  // ── Serialization & Record Compression ────────────────────────────────
+  // serializeToJSON: (default: true) uses msgpackr 2.1.0 useToJSON.
+  // Set to false to preserve internal object properties without invoking .toJSON()
+  serializeToJSON:        true,
 
   // ── OOM guard ────────────────────────────────────────────────────────
   oomProtection:      true,   // enabled by default

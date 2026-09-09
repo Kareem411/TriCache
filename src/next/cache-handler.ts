@@ -122,10 +122,11 @@ export class TriCacheHandler {
 
     // Check softTags at read time (e.g. Next.js 16 layout / page boundaries)
     if (ctx?.softTags && ctx.softTags.length > 0) {
-      for (const softTag of ctx.softTags) {
-        const currentVer = await this.cache.getTagVersion(softTag);
-        const storedSoftVer = stored.softTagVersions?.[softTag] ?? 0;
-        if (currentVer > storedSoftVer) {
+      const softTags = ctx.softTags;
+      const currentVers = await Promise.all(softTags.map(st => this.cache.getTagVersion(st)));
+      for (let i = 0; i < softTags.length; i++) {
+        const storedSoftVer = stored.softTagVersions?.[softTags[i]] ?? 0;
+        if (currentVers[i] > storedSoftVer) {
           return null;
         }
       }
@@ -193,9 +194,11 @@ export class TriCacheHandler {
 
     let softTagVersions: Record<string, number> | undefined;
     if (ctx?.softTags && ctx.softTags.length > 0) {
+      const softTags = ctx.softTags;
+      const vers = await Promise.all(softTags.map(st => this.cache.getTagVersion(st)));
       softTagVersions = {};
-      for (const st of ctx.softTags) {
-        softTagVersions[st] = await this.cache.getTagVersion(st);
+      for (let i = 0; i < softTags.length; i++) {
+        softTagVersions[softTags[i]] = vers[i];
       }
     }
 

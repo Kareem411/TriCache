@@ -43,6 +43,9 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
     return;
   }
 
+  // NOTE: console.log is INTENTIONAL across cli.ts — this file is the terminal CLI runner
+  // (bin/tricache.js). Output must go directly to process stdout without logger prefixes
+  // to support UNIX pipes, terminal formatting, and automated tooling.
   if (values.version || command === 'version') {
     console.log('tricache v0.7.1');
     return;

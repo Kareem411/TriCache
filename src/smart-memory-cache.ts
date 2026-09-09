@@ -12,7 +12,7 @@
  *  - Process-level singleton via globalThis (survives Next.js hot reloads)
  */
 
-import { pack, unpack } from 'msgpackr';
+import { CacheCodec, defaultCodec } from './codec.js';
 import type { CacheHit, CachePriority, CategoryLimit, SmartCacheEntry, ILogger, EvictionReason } from './types';
 
 /**
@@ -257,11 +257,14 @@ export interface SmartMemoryCacheOptions {
   logger:            ILogger;
   /** Fraction of maxEntries / maxBytes at which proactive eviction fires (default 0.9). */
   evictionWatermark?: number;
+  /** Custom binary codec (defaults to defaultCodec with record structures and rich types enabled). */
+  codec?:            CacheCodec;
 }
 
 export class SmartMemoryCache {
   private readonly cache             = new Map<string, SmartCacheEntry>();
   private readonly opts:             SmartMemoryCacheOptions;
+  private readonly codec:            CacheCodec;
   private bloom:                     AnyBloomFilter;
   /** Non-default category prefixes pre-extracted to avoid Object.keys() allocation on every call. */
   private readonly categoryPrefixes: string[];
@@ -294,6 +297,7 @@ export class SmartMemoryCache {
 
   constructor(opts: SmartMemoryCacheOptions, existing?: Map<string, SmartCacheEntry>) {
     this.opts             = opts;
+    this.codec            = opts.codec ?? defaultCodec;
     this.bloom            = createBloomFilter(opts.logger, opts.maxEntries);
     this.categoryPrefixes = Object.keys(opts.categories).filter(k => k !== 'default');
 
@@ -526,7 +530,7 @@ export class SmartMemoryCache {
     if ((entry.hits & 3) === 0) this.sketch.increment(key);
     // value is cached at write time — hot reads return the live object directly,
     // skipping unpack. Falls back to decode for entries restored from disk/snapshot.
-    const value = entry.value !== undefined ? entry.value : unpack(entry.data as Buffer);
+    const value = entry.value !== undefined ? entry.value : this.codec.decode(entry.data as Buffer);
     // Fresh object per call — never a shared/reusable one. Callers hold this result
     // across await boundaries (CacheService.get() awaits tag-version checks between
     // the L1 hit and the return); a shared object would let a concurrent get()
@@ -555,7 +559,7 @@ export class SmartMemoryCache {
   ): void {
     // Single serialization pass — always msgpackr. Eliminates the prior JSON.stringify
     // "size probe" that was discarded for large payloads (the double-pass).
-    const packed = pack(data);
+    const packed = this.codec.encode(data);
     const size   = packed.byteLength;
     this.compressions++;
     this.sketch.increment(key);
@@ -840,12 +844,12 @@ export class SmartMemoryCache {
       const rawData = entry.data;
       // Handle both legacy (isCompressed=false, data=JSON string) and current (data=Buffer) formats.
       const data: Buffer = !entry.isCompressed
-        ? pack(JSON.parse(rawData as unknown as string))  // legacy: re-encode JSON → msgpackr
+        ? this.codec.encode(JSON.parse(rawData as unknown as string))  // legacy: re-encode JSON → msgpackr
         : rawData instanceof Uint8Array
           ? Buffer.from(rawData)                          // msgpackr Uint8Array → Buffer
           : rawData as Buffer;                            // already a Buffer
       // Cache the live object for small entries only — large entries skip double-heap storage.
-      const value = entry.size <= LARGE_VALUE_BYTES ? unpack(data) : undefined;
+      const value = entry.size <= LARGE_VALUE_BYTES ? this.codec.decode(data) : undefined;
       this.cache.set(key, { ...entry, data, value, isCompressed: true });
       this.bloom.add(key);
       loaded++;
@@ -922,7 +926,7 @@ export class SmartMemoryCache {
    * if the live object was not cached (large-entry optimisation or disk-restored entry).
    */
   resolveValue(entry: SmartCacheEntry): unknown {
-    return entry.value !== undefined ? entry.value : unpack(entry.data as Buffer);
+    return entry.value !== undefined ? entry.value : this.codec.decode(entry.data as Buffer);
   }
 
   // ── Stats ─────────────────────────────────────────────────────────────────

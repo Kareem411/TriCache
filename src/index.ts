@@ -23,6 +23,7 @@ export { SmartMemoryCache }    from './smart-memory-cache';
 export { DiskTier }            from './disk-tier';
 export { WasmBloomFilter }     from './wasm/bloom-filter-wasm';
 export { type CompressionAlgorithm } from './compression';
+export { CacheCodec, defaultCodec, type CacheCodecOptions } from './codec';
 
 export {
   CachePriority,

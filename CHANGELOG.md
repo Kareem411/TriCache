@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`CacheCodec` abstraction (`src/codec.ts`)** — Centralized msgpackr binary serialization engine with built-in record structure deduplication (`useRecords: true`), rich type preservation (`moreTypes: true` for `Set`, `TypedArray`, `Date`, etc.), and strict plain-object map decoding (`mapsAsObjects: true`).
+- **`serializeToJSON` option in `CacheOptions`** — Configurable flag (defaults to `true`) leveraging msgpackr 2.1.0's `useToJSON` capability. Setting `serializeToJSON: false` preserves the object's actual internal properties in durable cache tiers without invoking `.toJSON()`, avoiding accidental HTTP response projections on cached domain entities.
+- **Dedicated test suites** — Added comprehensive coverage for previously untested integration layers, bringing the test suite to 554 tests passing:
+  - `tests/codec-improvements.test.ts`: Record structure deduplication (~45% smaller binary size), `serializeToJSON` toggle, rich type round-tripping, and DoS rejection.
+  - `tests/drizzle.test.ts`: Deterministic query hashing and `withCache` query execution wrapping.
+  - `tests/prisma.test.ts`: Deterministic query argument serialization and `withTriCache` extension hooks with mutation tag invalidation.
+  - `tests/next-cache-life.test.ts`: Next.js 16 `cacheLife` preset resolution (`seconds`, `minutes`, `hours`, `days`, `weeks`, `max`, and custom profiles).
+  - `tests/types-logger.test.ts`: Built-in `consoleLogger` wrapping and formatting.
+  - `tests/disk-tier.test.ts`: Tampered ciphertext and corrupted disk payload resilience.
+
+### Performance
+- **Parallelized Tag Version Loops (N+1 Waterfall Elimination)** — Replaced sequential `for...of` awaited `_getTagVersion` calls with concurrent `Promise.all` parallel requests across `CacheService` (L1 hit staleness check, L2 hash staleness check, disk hit staleness check, `set()` active tag versioning, and SWR background revalidation) and `NextCacheHandler` (entry staleness checks and write paths).
+- **Cryptographic Randomness for Temp Files** — Replaced `Math.random()` in temporary spill file naming (`src/disk-tier.ts`) with `crypto.randomBytes(6).toString('hex')` to eliminate potential collision risks under high multi-tenant spill concurrency.
+
+### Documentation & Architecture Notes
+- Documented intentional architectural choices across the codebase to eliminate false positive review warnings:
+  - `src/cli.ts`: Documented why `console.log` is required for CLI stdout piping.
+  - `src/wasm/bloom-filter-wasm.ts`: Documented why `WasmBloomFilter` initializes 100% synchronously from inlined precompiled bytecode with no async init phase.
+  - `src/cache-service.ts`: Documented why `fs.writeFileSync` in `writeSnapshot` (SIGTERM/SIGINT hooks) and `fs.readFileSync` in `loadSnapshot` (constructor cold start) are intentionally synchronous.
+  - `src/disk-tier.ts`: Documented the 16-byte fixed header (`DISK_MAGIC_V2`) fast path in `purgeNextBucket` demonstrating that full payload reads are skipped during janitor sweeps.
+
+### Security
+- **Memory amplification DoS defense (`msgpackr` 2.0.5 → 2.1.0)** — Upgraded `msgpackr` to 2.1.0. Malformed `array32` or `map32` headers declaring excessive lengths beyond the buffer boundary are rejected immediately without allocating memory, eliminating a ~32,000,000x memory amplification attack vector on untrusted payloads.
+
 ## [0.7.1] — 2026-08-22
 
 ### Fixed

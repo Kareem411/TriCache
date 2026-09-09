@@ -380,6 +380,15 @@ export interface CacheOptions {
    */
   strictKeyValidation?: boolean;
 
+  // ── Serialization & Codec (msgpackr) ────────────────────────────────────
+  /**
+   * Whether to call `.toJSON()` when serializing objects into binary cache buffers.
+   * - `true` (default): Honors `.toJSON()`, matching standard JSON serialization conventions.
+   * - `false`: Preserves the object's own internal properties (msgpackr 2.1.0+ durable state feature),
+   *   avoiding accidental API response projections on cached domain entities.
+   */
+  serializeToJSON?: boolean;
+
   // ── Compression ──────────────────────────────────────────────────────────
   /**
    * Optional compression algorithm for L2 (Redis) strings and disk-tier binary blobs.
