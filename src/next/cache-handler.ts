@@ -110,14 +110,14 @@ export class TriCacheHandler {
    * Get an entry from cache. Checks softTags against generational tag versions
    * and returns a fresh unlocked ReadableStream if the stored value was a stream.
    */
-  async get(cacheKey: string, ctx?: CacheHandlerContext): Promise<CacheHandlerValue | null> {
+  async get(cacheKey: string, ctx?: CacheHandlerContext): Promise<CacheHandlerValue | undefined> {
     const stored = await this.cache.get<StoredNextCacheEntry | null>(
       cacheKey,
       async () => null,
     );
 
     if (!stored || stored.data == null) {
-      return null;
+      return undefined;
     }
 
     // Check softTags at read time (e.g. Next.js 16 layout / page boundaries)
@@ -126,7 +126,7 @@ export class TriCacheHandler {
         const currentVer = await this.cache.getTagVersion(softTag);
         const storedSoftVer = stored.softTagVersions?.[softTag] ?? 0;
         if (currentVer > storedSoftVer) {
-          return null;
+          return undefined;
         }
       }
     }
