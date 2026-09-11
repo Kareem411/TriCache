@@ -1,0 +1,7 @@
+[
+    { "id": 1, "name": "TriCache Pro Headphones", "price": 299, "stock": 12, "category": "Audio" },
+    { "id": 2, "name": "Ergonomic Mechanical Keyboard", "price": 149, "stock": 5, "category": "Peripherals" },
+    { "id": 3, "name": "Ultra-Fast NVMe SSD 2TB", "price": 180, "stock": 20, "category": "Storage" },
+    { "id": 4, "name": "4K Webcam Pro", "price": 129, "stock": 8, "category": "Video" },
+    { "id": 5, "name": "USB-C Dock Station", "price": 89, "stock": 15, "category": "Accessories" }
+]
