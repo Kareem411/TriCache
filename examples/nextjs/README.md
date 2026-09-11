@@ -1,36 +1,45 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# TriCache Next.js Demo
 
-## Getting Started
+Cache Components demo comparing **TriCache `"use cache"`** vs **uncached** fetches.
 
-First, run the development server:
+## Quick Start
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
+pnpm install
 pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## What It Shows
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- **Cached panel** — `"use cache"` + `cacheTag` backed by TriCache (`cacheHandlers`)
+- **Uncached panel** — raw fetch every request (~1s simulated DB)
+- **Revalidate** — `updateTag("products")` via Server Action
 
-## Learn More
+## Setup
 
-To learn more about Next.js, take a look at the following resources:
+```typescript
+// cache-handler.ts
+import { createNextCacheHandler } from "tricache/next";
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+const Handler = createNextCacheHandler({ namespace: "nextjs-demo" });
+const handler = new Handler();
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+export default {
+  get: (key, softTags) => handler.get(key, { softTags }),
+  set: (key, entry) => handler.set(key, entry),
+  refreshTags: () => handler.refreshTags(),
+  getExpiration: (tags) => handler.getExpiration(tags),
+  updateTags: (tags) => handler.updateTags(tags),
+};
+```
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```typescript
+// next.config.ts
+const nextConfig = {
+  cacheHandlers: { default: require.resolve("./cache-handler.ts") },
+  cacheMaxMemorySize: 0,
+  cacheComponents: true,
+};
+```
