@@ -51,7 +51,7 @@ describe('Next.js 16 Modern App Router CacheHandler (TriCacheHandler)', () => {
     );
 
     const hit = await handler.get('page:home');
-    expect(hit).not.toBeNull();
+    expect(hit).not.toBeUndefined();
     expect(hit?.value).toEqual(payload);
     expect(hit?.tags).toContain('home');
     expect(hit?.tags).toContain('users');
@@ -71,14 +71,14 @@ describe('Next.js 16 Modern App Router CacheHandler (TriCacheHandler)', () => {
 
     // First read from cache
     const hit1 = await handler.get('rsc:stream-key');
-    expect(hit1).not.toBeNull();
+    expect(hit1).not.toBeUndefined();
     expect(typeof (hit1!.value as any).getReader).toBe('function');
     const readText1 = await readStream(hit1!.value as ReadableStream<Uint8Array>);
     expect(readText1).toBe(text);
 
     // Second independent read from cache — must return a brand new, unlocked stream
     const hit2 = await handler.get('rsc:stream-key');
-    expect(hit2).not.toBeNull();
+    expect(hit2).not.toBeUndefined();
     expect(typeof (hit2!.value as any).getReader).toBe('function');
     const readText2 = await readStream(hit2!.value as ReadableStream<Uint8Array>);
     expect(readText2).toBe(text);
@@ -98,16 +98,16 @@ describe('Next.js 16 Modern App Router CacheHandler (TriCacheHandler)', () => {
       Promise.resolve({ value: { id: 101 }, tags: ['posts'] }),
     );
 
-    expect(await handler.get('card:1')).not.toBeNull();
-    expect(await handler.get('card:2')).not.toBeNull();
-    expect(await handler.get('post:1')).not.toBeNull();
+    expect(await handler.get('card:1')).not.toBeUndefined();
+    expect(await handler.get('card:2')).not.toBeUndefined();
+    expect(await handler.get('post:1')).not.toBeUndefined();
 
     // Invalidate 'cards'
     await handler.updateTags(['cards']);
 
-    expect(await handler.get('card:1')).toBeNull();
-    expect(await handler.get('card:2')).toBeNull();
-    expect(await handler.get('post:1')).not.toBeNull();
+    expect(await handler.get('card:1')).toBeUndefined();
+    expect(await handler.get('card:2')).toBeUndefined();
+    expect(await handler.get('post:1')).not.toBeUndefined();
   });
 
   it('evaluates softTags at read time against generational tag versions', async () => {
@@ -126,7 +126,7 @@ describe('Next.js 16 Modern App Router CacheHandler (TriCacheHandler)', () => {
 
     // Subsequent read with invalidated softTag -> miss
     const hit2 = await handler.get('layout:blog', { softTags: ['_N_T_/blog'] });
-    expect(hit2).toBeNull();
+    expect(hit2).toBeUndefined();
   });
 
   it('skips caching when revalidate is 0 and caches long-term when revalidate is false', async () => {
@@ -136,7 +136,7 @@ describe('Next.js 16 Modern App Router CacheHandler (TriCacheHandler)', () => {
       Promise.resolve({ value: 'dynamic' }),
       { revalidate: 0 },
     );
-    expect(await handler.get('dyn:key')).toBeNull();
+    expect(await handler.get('dyn:key')).toBeUndefined();
 
     // revalidate: false -> static indefinite (1 year)
     await handler.set(
@@ -164,7 +164,7 @@ describe('Next.js 16 Modern App Router CacheHandler (TriCacheHandler)', () => {
       ),
     ).resolves.not.toThrow();
 
-    expect(await handler.get('stream:err')).toBeNull();
+    expect(await handler.get('stream:err')).toBeUndefined();
   });
 
   it('correctly handles multi-chunk asynchronous RSC streams with delayed Suspense boundaries', async () => {
@@ -200,7 +200,7 @@ describe('Next.js 16 Modern App Router CacheHandler (TriCacheHandler)', () => {
     );
 
     const hit1 = await handler.get('rsc:async-suspense');
-    expect(hit1).not.toBeNull();
+    expect(hit1).not.toBeUndefined();
     const content1 = await readStream(hit1?.value as ReadableStream<Uint8Array>);
     expect(content1).toBe(
       '<!-- $ --><div>Header</div><!-- /$ -->' +
@@ -209,7 +209,7 @@ describe('Next.js 16 Modern App Router CacheHandler (TriCacheHandler)', () => {
     );
 
     const hit2 = await handler.get('rsc:async-suspense');
-    expect(hit2).not.toBeNull();
+    expect(hit2).not.toBeUndefined();
     const content2 = await readStream(hit2?.value as ReadableStream<Uint8Array>);
     expect(content2).toBe(content1);
   });
@@ -221,7 +221,7 @@ describe('Next.js 16 Modern App Router CacheHandler (TriCacheHandler)', () => {
 
     // Instance B caches feed in L1
     await instanceB.set('feed:user1', Promise.resolve({ value: 'feed-data-v1', tags: ['feed'] }));
-    expect(await instanceB.get('feed:user1')).not.toBeNull();
+    expect(await instanceB.get('feed:user1')).not.toBeUndefined();
 
     // Instance A updates tags
     await instanceA.updateTags(['feed']);
@@ -236,7 +236,7 @@ describe('Next.js 16 Modern App Router CacheHandler (TriCacheHandler)', () => {
 
     // Instance B should now see cache miss
     const hitAfter = await instanceB.get('feed:user1');
-    expect(hitAfter).toBeNull();
+    expect(hitAfter).toBeUndefined();
   });
 
   it('refreshTags() operates fail-soft without throwing', async () => {
@@ -354,7 +354,7 @@ describe('createNextCacheHandler Factory & Build Phase Guards', () => {
     );
 
     const hitHours = await handler.get('product:view:1');
-    expect(hitHours).not.toBeNull();
+    expect(hitHours).not.toBeUndefined();
     expect(hitHours?.ttl).toBe(3600);
 
     // Test 'seconds' preset -> revalidate 1s
