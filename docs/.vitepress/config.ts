@@ -148,6 +148,7 @@ export default defineConfig({
           { text: 'Fleet Observability Overview', link: '/observability' },
           { text: 'Real-time Web Dashboard', link: '/observability#real-time-sse-web-dashboard' },
           { text: 'Prometheus & Grafana Alerting', link: '/observability#prometheus--grafana-golden-signals-dashboard' },
+          { text: 'Prometheus /metrics Recipe', link: '/metrics-recipe' },
           { text: 'OpenTelemetry Tracing & Metrics', link: '/observability#opentelemetry-distributed-tracing--metrics' },
           { text: 'Terminal Interactive CLI', link: '/observability#terminal-cli-tricache-top' },
         ],
