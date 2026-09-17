@@ -136,6 +136,7 @@ const cache = CacheService.preset('enterprise-hardened', { redisHost: 'redis.int
 * ☁️ **[Cold-Start Cloud Snapshot Hydration](docs/cold-start-cloud-hydration.md)** — S3, Cloudflare R2, readiness gates
 * 💰 **[Cloud ROI Financial Simulation](bench/cloud-roi-simulation.ts)** — Deterministic Mulberry32 Zipfian benchmark (`pnpm bench:roi`)
 * 📊 **[Full Benchmark Suite](BENCHMARKS.md)** — Throughput, serialization, concurrency analysis
+* 🚀 **[NestJS Microservice Example](examples/nestjs-microservice/)** — `TriCacheModule.register()`, `@Cacheable`, `@CacheEvict` decorators demo
 
 ---
 
