@@ -134,6 +134,7 @@ const cache = CacheService.preset('enterprise-hardened', { redisHost: 'redis.int
 * 🔬 **[Architecture & Mathematical Internals](docs/architecture-internals.md)** — W-TinyLFU, CMS, Bloom filters, SigV4 signer
 * ☸️ **[Kubernetes SRE & Production Guide](docs/kubernetes-production-guide.md)** — `/dev/shm`, cgroups, eviction defense, readiness probes
 * ☁️ **[Cold-Start Cloud Snapshot Hydration](docs/cold-start-cloud-hydration.md)** — S3, Cloudflare R2, readiness gates
+* 📈 **[Prometheus /metrics Scraping Recipe](docs/metrics-recipe.md)** — Express / Fastify / Next.js endpoints, scrape config, and one-command local Grafana stack
 * 💰 **[Cloud ROI Financial Simulation](bench/cloud-roi-simulation.ts)** — Deterministic Mulberry32 Zipfian benchmark (`pnpm bench:roi`)
 * 📊 **[Full Benchmark Suite](BENCHMARKS.md)** — Throughput, serialization, concurrency analysis
 

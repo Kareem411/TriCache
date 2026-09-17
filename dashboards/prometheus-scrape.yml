@@ -1,0 +1,18 @@
+# Example Prometheus scrape config for TriCache.
+# See docs/metrics-recipe.md §3 for the full walkthrough.
+#
+# Bind Prometheus + Grafana to 127.0.0.1 only (see docker-compose.metrics.yml).
+# DO NOT expose /metrics publicly without auth or IP allow-list.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: tricache
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:3000']   # Prometheus in docker → host app
+        labels:
+          service: tricache
+          env: dev
