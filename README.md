@@ -121,7 +121,7 @@ const cache = CacheService.preset('enterprise-hardened', { redisHost: 'redis.int
 | **NestJS Module** | `tricache/nestjs` | Official `TriCacheModule.register()`, `@nestjs/cache-manager` store adapter, and `@Cacheable`. |
 | **Prisma ORM** | `tricache/prisma` | `$extends` client extension with query hashing and auto-mutation tag eviction. |
 | **Drizzle ORM** | `tricache/drizzle` | `withCache(query, opts)` query wrapper with SQL+parameters hashing and background SWR. |
-| **Express & Fastify** | `tricache/http` | Route caching middleware with deterministic query sorting, weak ETag, and `304 Not Modified`. |
+| **Express & Fastify** | `tricache/http` | Route caching middleware with deterministic query sorting, weak ETag, and `304 Not Modified`. See [`examples/fastify-api/`](examples/fastify-api/) for a runnable Fastify demo. |
 | **Hono & Edge Isolates** | `tricache/edge` | Zero-Node-dependency implementation for Cloudflare Workers, Fastly Compute, Hono, and Vercel Edge. |
 | **SSE Dashboard** | `tricache/dashboard` | Zero-dependency Server-Sent Events real-time admin dashboard. |
 | **Live CLI Top** | `npx tricache top` | Real-time terminal ASCII monitor over Unix sockets and Windows named pipes. |
