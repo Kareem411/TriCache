@@ -113,6 +113,8 @@ Import directly into Grafana for instant fleet-wide visibility:
   - Cross-Region Invalidation Mesh Health & Deduplication Ratios
   - Disk Tier Backpressure Queue Depth & Host Low Space Pauses
 
+> 💡 **Looking to expose a `/metrics` scrape endpoint?** See the [Prometheus /metrics Scraping Recipe](./metrics-recipe.md) for Express, Fastify, and Next.js App Router endpoint recipes, scrape configs, and a one-command local Docker dev stack.
+
 ### Prometheus Alert Rules (`dashboards/tricache-alerts.yaml`)
 Turnkey `PrometheusRule` manifests ready for Prometheus Operator / VictoriaMetrics:
 

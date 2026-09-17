@@ -4,7 +4,7 @@
 [![Docs](https://img.shields.io/badge/docs-VitePress-blue.svg)](https://kareem411.github.io/TriCache/)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
 [![npm downloads](https://img.shields.io/npm/dm/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-809%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-816%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 20](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
@@ -134,6 +134,7 @@ const cache = CacheService.preset('enterprise-hardened', { redisHost: 'redis.int
 * 🔬 **[Architecture & Mathematical Internals](docs/architecture-internals.md)** — W-TinyLFU, CMS, Bloom filters, SigV4 signer
 * ☸️ **[Kubernetes SRE & Production Guide](docs/kubernetes-production-guide.md)** — `/dev/shm`, cgroups, eviction defense, readiness probes
 * ☁️ **[Cold-Start Cloud Snapshot Hydration](docs/cold-start-cloud-hydration.md)** — S3, Cloudflare R2, readiness gates
+* 📈 **[Prometheus /metrics Scraping Recipe](docs/metrics-recipe.md)** — Express / Fastify / Next.js endpoints, scrape config, and one-command local Grafana stack
 * 💰 **[Cloud ROI Financial Simulation](bench/cloud-roi-simulation.ts)** — Deterministic Mulberry32 Zipfian benchmark (`pnpm bench:roi`)
 * 📊 **[Full Benchmark Suite](BENCHMARKS.md)** — Throughput, serialization, concurrency analysis
 

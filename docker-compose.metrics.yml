@@ -1,0 +1,34 @@
+# Local-only Prometheus + Grafana for TriCache metrics.
+# See docs/metrics-recipe.md §4 for the full walkthrough.
+#
+# SAFETY:
+# - Both services bind to 127.0.0.1 only (no public exposure).
+# - Grafana default admin password is `admin` — change via GRAFANA_ADMIN_PASSWORD env var.
+# - This stack has NO outbound network dependencies besides the docker pull.
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: tricache-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    volumes:
+      - ./dashboards/prometheus-scrape.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - '127.0.0.1:9090:9090'   # loopback only
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: tricache-grafana
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    volumes:
+      - ./dashboards/tricache-grafana.json:/var/lib/grafana/dashboards/tricache.json:ro
+    ports:
+      - '127.0.0.1:3001:3000'   # loopback only
