@@ -4,6 +4,19 @@
 
 TriCache provides enterprise-grade HTTP route caching middleware with weak ETag calculation, deterministic query sorting, and RFC 7232 `304 Not Modified` short-circuiting for Express, Fastify, Connect, and Node.js HTTP servers.
 
+### Ready-to-run Express demo
+
+A self-contained microservice lives at [`examples/express-api`](https://github.com/Kareem411/TriCache/tree/main/examples/express-api). It exercises weak ETags, `If-None-Match` → `304`, deterministic query sorting, `headerWhitelist: ['accept-language']`, and `skipCache` for `Authorization`.
+
+```bash
+pnpm install && pnpm build
+cd examples/express-api
+pnpm install
+pnpm dev
+```
+
+Then follow the `curl -i` walkthrough in that README.
+
 ---
 
 ## 1. Express & Connect (`createExpressMiddleware`)
@@ -21,9 +34,10 @@ const cache = CacheService.create();
 // Route-level caching with automatic 304 Not Modified
 app.get(
   '/api/products',
-  createExpressMiddleware(cache, {
-    ttlSeconds: 300,
-    swrSeconds: 60,
+  createExpressMiddleware({
+    cache,
+    ttl: 300,
+    swr: 60,
     headerWhitelist: ['accept-language'],
     tags: ['products'],
   }),
@@ -50,8 +64,9 @@ const fastify = Fastify();
 const cache = CacheService.create();
 
 // Register globally across all GET routes
-await fastify.register(createFastifyPlugin(cache, {
-  ttlSeconds: 120,
+await fastify.register(createFastifyPlugin({
+  cache,
+  ttl: 120,
   headerWhitelist: ['x-tenant-id'],
 }));
 ```
@@ -60,7 +75,7 @@ await fastify.register(createFastifyPlugin(cache, {
 ```typescript
 import { createFastifyPlugin } from 'tricache/http';
 
-const plugin = createFastifyPlugin(cache, { ttlSeconds: 300 });
+const plugin = createFastifyPlugin({ cache, ttl: 300 });
 
 fastify.get('/api/catalog', {
   preHandler: plugin.preHandler,
@@ -99,8 +114,9 @@ TriCache respects standard HTTP client and server cache control semantics:
 ```typescript
 app.get(
   '/api/search',
-  createExpressMiddleware(cache, {
-    ttlSeconds: 60,
+  createExpressMiddleware({
+    cache,
+    ttl: 60,
     skipCache: (req) => Boolean(req.headers['authorization']),
   }),
   searchHandler
@@ -115,8 +131,10 @@ app.get(
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `ttlSeconds` | `number` | `300` | Time-to-live in seconds |
-| `swrSeconds` | `number` | `0` | Stale-While-Revalidate window in seconds |
+| `cache` | `CacheService` | singleton | TriCache instance. If omitted, lazily resolves `CacheService.create()` |
+| `ttl` | `number` | `300` | Time-to-live in seconds |
+| `swr` | `number` | `undefined` | Stale-While-Revalidate window in seconds |
+| `etag` | `boolean` | `true` | Generate and evaluate weak ETags (`W/"…"`) |
 | `keyGenerator` | `(req) => string` | `buildDeterministicKey` | Custom cache key generator function |
 | `headerWhitelist` | `string[]` | `[]` | Request headers incorporated into the cache key |
 | `skipCache` | `(req) => boolean` | `undefined` | Predicate returning true to bypass cache |
