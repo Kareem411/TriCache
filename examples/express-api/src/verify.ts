@@ -1,15 +1,19 @@
 /**
  * Smoke-checks the demo the same way the README curl -i walkthrough does:
  * weak ETag, 304, sorted query keys, accept-language, skipCache for Authorization.
+ *
+ * Uses node:http (not fetch). Undici fetch adds Cache-Control on conditional
+ * GETs, and tricache/http treats no-cache / no-store as a bypass.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import http from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const port = Number(process.env.VERIFY_PORT) || 34567;
-const base = `http://127.0.0.1:${port}`;
+const host = '127.0.0.1';
 
 interface Probe {
   status: number;
@@ -23,25 +27,44 @@ function header(res: Probe, name: string): string | undefined {
   return res.headers[name.toLowerCase()];
 }
 
-async function request(urlPath: string, headers: Record<string, string> = {}): Promise<Probe> {
-  const started = Date.now();
-  const res = await fetch(base + urlPath, { headers });
-  const body = await res.text();
-  let json: Record<string, unknown> | null = null;
-  if (body) {
-    try {
-      json = JSON.parse(body) as Record<string, unknown>;
-    } catch {
-      json = null;
-    }
-  }
-  return {
-    status: res.status,
-    headers: Object.fromEntries(res.headers.entries()),
-    body,
-    json,
-    ms: Date.now() - started,
-  };
+function request(urlPath: string, headers: Record<string, string> = {}): Promise<Probe> {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const req = http.request(
+      { host, port, path: urlPath, headers },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk) => {
+          chunks.push(chunk);
+        });
+        res.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8');
+          let json: Record<string, unknown> | null = null;
+          if (body) {
+            try {
+              json = JSON.parse(body) as Record<string, unknown>;
+            } catch {
+              json = null;
+            }
+          }
+          const normalized: Record<string, string> = {};
+          for (const [key, value] of Object.entries(res.headers)) {
+            if (typeof value === 'string') normalized[key.toLowerCase()] = value;
+            else if (Array.isArray(value)) normalized[key.toLowerCase()] = value.join(', ');
+          }
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: normalized,
+            body,
+            json,
+            ms: Date.now() - started,
+          });
+        });
+      },
+    );
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -55,8 +78,8 @@ async function waitForHealth(timeoutMs = 20_000): Promise<void> {
   let lastError: unknown;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`${base}/healthz`);
-      if (res.ok) return;
+      const res = await request('/healthz');
+      if (res.status === 200) return;
       lastError = new Error(`healthz ${res.status}`);
     } catch (err) {
       lastError = err;
@@ -75,7 +98,7 @@ async function main(): Promise<void> {
       env: {
         ...process.env,
         PORT: String(port),
-        HOST: '127.0.0.1',
+        HOST: host,
         ORIGIN_LATENCY_MS: process.env.ORIGIN_LATENCY_MS ?? '250',
       },
       stdio: ['ignore', 'pipe', 'pipe'],

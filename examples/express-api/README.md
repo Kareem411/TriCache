@@ -65,8 +65,10 @@ Expect the **same** `ETag` and `generatedAt`, no `X-TriCache-Demo` header, and a
 
 ### 3. Conditional GET — `304 Not Modified`
 
+Capture the ETag from a **GET** (`curl -sI` is HEAD, and HEAD is a different cache key):
+
 ```bash
-ETAG=$(curl -sI 'http://127.0.0.1:3000/api/products?limit=5&page=2' \
+ETAG=$(curl -sD - -o /dev/null 'http://127.0.0.1:3000/api/products?limit=5&page=2' \
   -H 'Accept-Language: en' \
   | awk -F': ' 'tolower($1)=="etag"{gsub("\r","",$2); print $2}')
 
