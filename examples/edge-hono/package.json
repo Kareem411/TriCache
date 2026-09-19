@@ -1,0 +1,29 @@
+{
+  "name": "edge-hono",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TriCache Hono + Cloudflare Workers edge demo: Web Crypto weak ETag, RFC 7232 304, MurmurHash3 Bloom filter",
+  "scripts": {
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "verify": "tsx scripts/verify.ts"
+  },
+  "dependencies": {
+    "hono": "^4.13.8",
+    "tricache": "link:../.."
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260702.1",
+    "@types/node": "^22.18.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.135.0"
+  },
+  "engines": {
+    "node": ">=20.10.0"
+  },
+  "packageManager": "pnpm@11.22.0"
+}
