@@ -10,6 +10,9 @@
  *   import { fastifyCachePlugin } from 'tricache/http';
  *   await fastify.register(fastifyCachePlugin, { cache, ttl: 300 });
  *
+ * For Koa, use the dedicated adapter:
+ *   import { koaCache } from 'tricache/koa';
+ *
  * For Edge runtimes (Cloudflare Workers, Vercel Edge, Deno) and Hono, use:
  *   import { honoEdgeCache } from 'tricache/edge';
  */

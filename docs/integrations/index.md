@@ -16,6 +16,6 @@ Explore the dedicated guides for your application stack:
 | **[NestJS Module](/integrations/nestjs)** | `tricache/nestjs` | Dynamic `TriCacheModule` (`register`/`registerAsync`), `@Cacheable` and `@CacheEvict` decorators. |
 | **[Prisma ORM Extension](/integrations/prisma)** | `tricache/prisma` | `$extends(withTriCache())`, automatic mutation invalidation, deterministic query key hashing. |
 | **[Drizzle ORM Wrapper](/integrations/drizzle)** | `tricache/drizzle` | `withCache(query)`, SQL + parameterized argument hashing, custom TTL and tag assignment. |
-| **[Express & Hono Middleware](/integrations/http)** | `tricache/http` | Route caching middleware, weak ETag calculation, RFC 7232 `304 Not Modified` short-circuiting. |
+| **[Express, Fastify & Koa Middleware](/integrations/http)** | `tricache/http`, `tricache/koa` | Route caching middleware, weak ETag calculation, RFC 7232 `304 Not Modified` short-circuiting. |
 | **[Edge Isolates (Workers)](/integrations/edge)** | `tricache/edge` | Universal zero-Node runtime for Cloudflare Workers, Fastly Compute, Web Crypto, WASM Bloom. |
 | **[Visual Dashboard & CLI](/integrations/dashboard)** | `tricache/dashboard` | Real-time SSE Web UI, Next.js route handlers, standalone management server, CLI. |
