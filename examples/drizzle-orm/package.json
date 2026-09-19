@@ -1,0 +1,30 @@
+{
+  "name": "drizzle-orm-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TriCache Drizzle ORM demo: withCache query fingerprinting, background SWR, and tag invalidation",
+  "scripts": {
+    "seed": "tsx src/seed.ts",
+    "demo": "tsx src/demo.ts",
+    "dev": "tsx src/demo.ts",
+    "start": "tsx src/demo.ts",
+    "typecheck": "tsc --noEmit",
+    "verify": "tsx src/verify.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "drizzle-orm": "^0.45.2",
+    "tricache": "link:../.."
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.18.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=20.10.0"
+  },
+  "packageManager": "pnpm@11.22.0"
+}
