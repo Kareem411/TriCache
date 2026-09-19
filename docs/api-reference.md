@@ -463,7 +463,7 @@ The TriCache engine honors the following environment variables across all enviro
 
 ---
 
-## 9. HTTP & Framework Middlewares (`tricache/http` & `tricache/edge`)
+## 9. HTTP & Framework Middlewares (`tricache/http`, `tricache/fastify` & `tricache/edge`)
 
 ### `createExpressMiddleware(cache, options?)`
 Creates an Express/Connect route middleware with deterministic query sorting, weak ETag calculation, and RFC 7232 `304 Not Modified` short-circuiting.
@@ -477,13 +477,15 @@ app.get('/api/users', createExpressMiddleware(cache, {
 }), handler);
 ```
 
-### `createFastifyPlugin(cache, options?)`
-Creates an encapsulation-safe Fastify plugin (`[Symbol.for('skip-override')] = true`) intercepting requests early in `onRequest` and caching responses in `onSend`.
+### `createFastifyPlugin(options?)` (`tricache/fastify`)
+Creates an encapsulation-safe Fastify plugin (`[Symbol.for('skip-override')] = true`) intercepting requests early in `onRequest` and caching responses in `onSend`. Prefer the dedicated entry; `tricache/http` still re-exports the same functions.
 
 ```typescript
-import { createFastifyPlugin } from 'tricache/http';
+import { createFastifyPlugin, fastifyCachePlugin, fastifyCache } from 'tricache/fastify';
 
-await fastify.register(createFastifyPlugin(cache, { ttlSeconds: 120 }));
+await fastify.register(createFastifyPlugin({ cache, ttl: 120, tags: ['api'] }));
+// or: await fastify.register(fastifyCachePlugin, { cache, ttl: 120 });
+// or route-level: { preHandler: fastifyCache({ cache, ttl: 120, tags: ['catalog'] }) }
 ```
 
 ### `createHonoEdgeMiddleware(edgeCache, options?)`

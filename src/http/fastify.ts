@@ -33,7 +33,7 @@ export interface CachedFastifyResponse {
  *
  * @example
  * import Fastify from 'fastify';
- * import { fastifyCachePlugin } from 'tricache/http';
+ * import { fastifyCachePlugin } from 'tricache/fastify';
  *
  * const app = Fastify();
  * await app.register(fastifyCachePlugin, {

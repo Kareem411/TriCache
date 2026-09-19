@@ -4,6 +4,8 @@
 
 TriCache provides enterprise-grade HTTP route caching middleware with weak ETag calculation, deterministic query sorting, and RFC 7232 `304 Not Modified` short-circuiting for Express, Fastify, Connect, and Node.js HTTP servers.
 
+For **Node Fastify** as a first-class subpath (`import { createFastifyPlugin, fastifyCachePlugin, fastifyCache } from 'tricache/fastify'`), see [Fastify Plugin](/integrations/fastify). The Fastify helpers below are the same implementation and remain exported from `tricache/http` for back-compat.
+
 ### Ready-to-run Express demo
 
 A self-contained microservice lives at [`examples/express-api`](https://github.com/Kareem411/TriCache/tree/main/examples/express-api). It exercises weak ETags, `If-None-Match` → `304`, deterministic query sorting, `headerWhitelist: ['accept-language']`, and `skipCache` for `Authorization`.
@@ -52,12 +54,12 @@ app.get(
 
 ## 2. Fastify Plugin (`createFastifyPlugin`)
 
-TriCache wraps Fastify middleware with `[Symbol.for('skip-override')] = true`, eliminating route encapsulation barriers.
+TriCache wraps Fastify middleware with `[Symbol.for('skip-override')] = true`, eliminating route encapsulation barriers. Prefer `import { … } from 'tricache/fastify'`; `tricache/http` re-exports the same functions.
 
 ### Global Plugin Registration
 ```typescript
 import Fastify from 'fastify';
-import { createFastifyPlugin } from 'tricache/http';
+import { createFastifyPlugin } from 'tricache/fastify';
 import { CacheService } from 'tricache';
 
 const fastify = Fastify();
@@ -73,12 +75,10 @@ await fastify.register(createFastifyPlugin({
 
 ### Route-Level `preHandler` Hook
 ```typescript
-import { createFastifyPlugin } from 'tricache/http';
-
-const plugin = createFastifyPlugin({ cache, ttl: 300 });
+import { fastifyCache } from 'tricache/fastify';
 
 fastify.get('/api/catalog', {
-  preHandler: plugin.preHandler,
+  preHandler: fastifyCache({ cache, ttl: 300, tags: ['catalog'] }),
 }, async (request, reply) => {
   return await fetchCatalog();
 });
