@@ -191,13 +191,29 @@ export function honoEdgeCache(options: HonoEdgeCacheOptions = {}) {
     }
 
     if (cached.etag && ifNoneMatch === cached.etag) {
-      return c.body(null, 304, { ETag: cached.etag });
+      return applyEdgeResponse(c, null, 304, { ETag: cached.etag });
     }
 
     const headers: Record<string, string> = {};
     if (cached.etag) headers['ETag'] = cached.etag;
     if (cached.contentType) headers['Content-Type'] = cached.contentType;
 
-    return c.body(cached.body, cached.status ?? 200, headers);
+    return applyEdgeResponse(c, cached.body, cached.status ?? 200, headers);
   };
+}
+
+/**
+ * Hono's `compose` ignores a middleware return value once `next()` has set
+ * `c.res` (`finalized === true`). Assigning `c.res` replaces the downstream
+ * body so weak ETags and 304s are visible on both cache miss and hit.
+ */
+function applyEdgeResponse(
+  c: any,
+  body: string | null,
+  status: number,
+  headers: Record<string, string>,
+): Response {
+  const response = c.body(body, status, headers);
+  c.res = response;
+  return response;
 }
