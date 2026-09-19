@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Node Hono middleware (`tricache/hono`)** — first-class `cacheMiddleware` on `CacheService` (ttl/tags/SWR, weak ETag, `If-None-Match` → 304, no cache for non-2xx). Distinct from the edge helper under `tricache/edge`.
+
 ## [0.8.0] — 2026-09-16
 
 ### Added

@@ -102,7 +102,7 @@ withDefaults(defineProps<Props>(), {
         </div>
         <div class="card-meta">
           <span class="card-name">Express / Hono</span>
-          <span class="card-desc">Edge Middleware</span>
+          <span class="card-desc">Node + Edge Middleware</span>
         </div>
       </a>
 

@@ -4,6 +4,8 @@
 
 TriCache provides enterprise-grade HTTP route caching middleware with weak ETag calculation, deterministic query sorting, and RFC 7232 `304 Not Modified` short-circuiting for Express, Fastify, Connect, and Node.js HTTP servers.
 
+For **Node Hono** (`CacheService`, `import { cacheMiddleware } from 'tricache/hono'`), see [Hono Node Middleware](/integrations/hono). The `honoCache` export from this package is the edge helper — prefer [`tricache/edge`](/integrations/edge) for Workers.
+
 ### Ready-to-run Express demo
 
 A self-contained microservice lives at [`examples/express-api`](https://github.com/Kareem411/TriCache/tree/main/examples/express-api). It exercises weak ETags, `If-None-Match` → `304`, deterministic query sorting, `headerWhitelist: ['accept-language']`, and `skipCache` for `Authorization`.
