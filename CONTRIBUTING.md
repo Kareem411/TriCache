@@ -91,7 +91,8 @@ tricache/
 │   ├── nestjs/                 # NestJS CacheModule & interceptors
 │   ├── prisma/                 # Prisma client caching extension
 │   ├── drizzle/                # Drizzle ORM query caching helper
-│   └── http/                   # HTTP reverse-proxy / fetch caching
+│   ├── http/                   # HTTP reverse-proxy / fetch caching
+│   ├── hono/                   # Node Hono middleware (CacheService)
 ├── tests/                      # Vitest unit & integration test suites
 ├── bench/                      # Microbenchmark suites
 ├── bin/                        # CLI binaries

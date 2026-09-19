@@ -463,7 +463,7 @@ The TriCache engine honors the following environment variables across all enviro
 
 ---
 
-## 9. HTTP & Framework Middlewares (`tricache/http` & `tricache/edge`)
+## 9. HTTP & Framework Middlewares (`tricache/http`, `tricache/hono` & `tricache/edge`)
 
 ### `createExpressMiddleware(cache, options?)`
 Creates an Express/Connect route middleware with deterministic query sorting, weak ETag calculation, and RFC 7232 `304 Not Modified` short-circuiting.
@@ -484,6 +484,17 @@ Creates an encapsulation-safe Fastify plugin (`[Symbol.for('skip-override')] = t
 import { createFastifyPlugin } from 'tricache/http';
 
 await fastify.register(createFastifyPlugin(cache, { ttlSeconds: 120 }));
+```
+
+### `cacheMiddleware(options?)` (`tricache/hono`)
+Creates Node Hono middleware on `CacheService` with Express-aligned ttl/tags/SWR, weak ETags, and RFC 7232 `304 Not Modified`. Non-2xx responses are not cached.
+
+```typescript
+import { cacheMiddleware } from 'tricache/hono';
+
+app.get('/api/posts', cacheMiddleware({ ttl: 300, tags: ['posts'] }), (c) => {
+  return c.json({ data: '...' });
+});
 ```
 
 ### `createHonoEdgeMiddleware(edgeCache, options?)`
