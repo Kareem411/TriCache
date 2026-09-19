@@ -17,6 +17,19 @@ pnpm dev
 
 Then follow the `curl -i` walkthrough in that README.
 
+### Ready-to-run Fastify demo
+
+A self-contained TypeScript app lives at [`examples/fastify-api`](https://github.com/Kareem411/TriCache/tree/main/examples/fastify-api). It exercises both official surfaces — global `createFastifyPlugin` / `fastifyCachePlugin` (`onRequest` short-circuit + `onSend` capture) and route-level `preHandler: fastifyCache(...)` — plus weak ETags and `If-None-Match` → `304`.
+
+```bash
+pnpm install && pnpm build
+cd examples/fastify-api
+pnpm install
+pnpm dev
+```
+
+Then follow the `curl -i` walkthrough in that README.
+
 ---
 
 ## 1. Express & Connect (`createExpressMiddleware`)
@@ -72,13 +85,14 @@ await fastify.register(createFastifyPlugin({
 ```
 
 ### Route-Level `preHandler` Hook
-```typescript
-import { createFastifyPlugin } from 'tricache/http';
 
-const plugin = createFastifyPlugin({ cache, ttl: 300 });
+`createFastifyPlugin` returns a Fastify plugin (lifecycle hooks), not an object with `.preHandler`. Use `fastifyCache` when you want the same options object as either a plugin or a route hook:
+
+```typescript
+import { fastifyCache } from 'tricache/http';
 
 fastify.get('/api/catalog', {
-  preHandler: plugin.preHandler,
+  preHandler: fastifyCache({ cache, ttl: 300 }),
 }, async (request, reply) => {
   return await fetchCatalog();
 });
