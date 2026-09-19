@@ -159,7 +159,7 @@ app.get(
 );
 ```
 
-The published options object is `{ cache, ttl, swr, etag, tags, headerWhitelist, skipCache }` — not `(cache, { ttlSeconds })`.
+The published options object is `{ cache, ttl, swr, etag, tags, headerWhitelist, skipCache }` — not `(cache, { ttlSeconds })`. After `next()`, Hono marks `c.res` finalized; `honoEdgeCache` assigns the cached `Response` onto `c.res` so weak ETags are visible on the miss path as well as on hits.
 
 Production L2: pass `new CloudflareKVAdapter(env.CACHE_KV)` or `new UpstashRedisAdapter({ url, token })` as `remoteStorage`. Those classes are exported from `tricache/edge`.
 
