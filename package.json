@@ -19,6 +19,7 @@
     "express",
     "fastify",
     "hono",
+    "koa",
     "edge",
     "cli",
     "nodejs"
@@ -70,6 +71,11 @@
       "import": "./dist/http/index.js",
       "require": "./dist/http/index.cjs"
     },
+    "./koa": {
+      "types": "./dist/koa/index.d.ts",
+      "import": "./dist/koa/index.js",
+      "require": "./dist/koa/index.cjs"
+    },
     "./dashboard": {
       "types": "./dist/dashboard/index.d.ts",
       "import": "./dist/dashboard/index.js",
@@ -93,7 +99,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup src/index.ts src/cli.ts src/serialize-worker.ts src/next/index.ts src/nestjs/index.ts src/prisma/index.ts src/drizzle/index.ts src/http/index.ts src/dashboard/index.ts src/edge/index.ts --format esm,cjs --dts --clean",
+    "build": "tsup src/index.ts src/cli.ts src/serialize-worker.ts src/next/index.ts src/nestjs/index.ts src/prisma/index.ts src/drizzle/index.ts src/http/index.ts src/koa/index.ts src/dashboard/index.ts src/edge/index.ts --format esm,cjs --dts --clean",
     "postbuild": "node --input-type=module -e \"import{readdirSync,rmSync,statSync}from'fs';import{join}from'path';function clean(d){for(const f of readdirSync(d)){const p=join(d,f);if(statSync(p).isDirectory())clean(p);else if(p.endsWith('.d.cts'))rmSync(p,{force:true});}}clean('dist');\"",
     "dev": "tsup src/index.ts src/serialize-worker.ts --format esm,cjs --dts --watch",
     "typecheck": "tsc --noEmit",

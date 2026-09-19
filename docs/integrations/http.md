@@ -1,8 +1,8 @@
-# Express & Fastify HTTP Middleware
+# Express, Fastify & Koa HTTP Middleware
 
-> Package entry: `tricache/http`
+> Package entries: `tricache/http` (Express / Fastify) and `tricache/koa` (Koa)
 
-TriCache provides enterprise-grade HTTP route caching middleware with weak ETag calculation, deterministic query sorting, and RFC 7232 `304 Not Modified` short-circuiting for Express, Fastify, Connect, and Node.js HTTP servers.
+TriCache provides enterprise-grade HTTP route caching middleware with weak ETag calculation, deterministic query sorting, and RFC 7232 `304 Not Modified` short-circuiting for Express, Fastify, Koa, Connect, and Node.js HTTP servers.
 
 ### Ready-to-run Express demo
 
@@ -86,7 +86,29 @@ fastify.get('/api/catalog', {
 
 ---
 
-## 3. RFC 7232 ETag Validation & Bandwidth Savings
+## 3. Koa (`koaCache`)
+
+> Package entry: `tricache/koa`
+
+Koa uses the same GET/HEAD-only contract as Express: deterministic keys, optional weak ETags + `304`, `ttl` / `swr` / `tags`, `skipCache`, and no persistence of non-2xx responses.
+
+```typescript
+import Koa from 'koa';
+import { koaCache } from 'tricache/koa';
+
+const app = new Koa();
+
+app.use(koaCache({
+  ttl: 60,
+  key: (ctx) => ctx.url,
+}));
+```
+
+`createKoaMiddleware` is an alias of `koaCache`. Pass `cache` to use an existing `CacheService`; otherwise the default singleton is created lazily.
+
+---
+
+## 4. RFC 7232 ETag Validation & Bandwidth Savings
 
 1. **Automatic Weak ETags**: TriCache generates fast weak ETags (`ETag: W/"<hash>"`) across cached response bodies.
 2. **Conditional Requests (`If-None-Match`)**: When clients or downstream CDNs present an `If-None-Match` header matching the cached ETag, TriCache halts execution before body serialization, returning an immediate `304 Not Modified` with zero response body bytes.
@@ -94,7 +116,7 @@ fastify.get('/api/catalog', {
 
 ---
 
-## 4. Deterministic Key Derivation & Query Sorting
+## 5. Deterministic Key Derivation & Query Sorting
 
 By default, TriCache generates deterministic cache keys using:
 - HTTP method (`GET`)
@@ -104,7 +126,7 @@ By default, TriCache generates deterministic cache keys using:
 
 ---
 
-## 5. Cache Bypass & Conditional Controls
+## 6. Cache Bypass & Conditional Controls
 
 TriCache respects standard HTTP client and server cache control semantics:
 
@@ -127,7 +149,7 @@ app.get(
 
 ---
 
-## 6. Options Reference
+## 7. Options Reference
 
 | Option | Type | Default | Description |
 |---|---|---|---|
@@ -135,6 +157,7 @@ app.get(
 | `ttl` | `number` | `300` | Time-to-live in seconds |
 | `swr` | `number` | `undefined` | Stale-While-Revalidate window in seconds |
 | `etag` | `boolean` | `true` | Generate and evaluate weak ETags (`W/"…"`) |
+| `key` | `(ctx) => string` | — | Koa-native cache key (`tricache/koa` only). Example: `(ctx) => ctx.url` |
 | `keyGenerator` | `(req) => string` | `buildDeterministicKey` | Custom cache key generator function |
 | `headerWhitelist` | `string[]` | `[]` | Request headers incorporated into the cache key |
 | `skipCache` | `(req) => boolean` | `undefined` | Predicate returning true to bypass cache |

@@ -4,7 +4,7 @@
 [![Docs](https://img.shields.io/badge/docs-VitePress-blue.svg)](https://kareem411.github.io/TriCache/)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
 [![npm downloads](https://img.shields.io/npm/dm/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-816%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-826%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 20](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
@@ -122,6 +122,7 @@ const cache = CacheService.preset('enterprise-hardened', { redisHost: 'redis.int
 | **Prisma ORM** | `tricache/prisma` | `$extends` client extension with query hashing and auto-mutation tag eviction. |
 | **Drizzle ORM** | `tricache/drizzle` | `withCache(query, opts)` query wrapper with SQL+parameters hashing and background SWR. |
 | **Express & Fastify** | `tricache/http` | Route caching middleware with deterministic query sorting, weak ETag, and `304 Not Modified`. |
+| **Koa** | `tricache/koa` | Official Koa middleware (`koaCache`) with the same GET/HEAD, ETag/`304`, ttl/swr/tags, and skipCache contract. |
 | **Hono & Edge Isolates** | `tricache/edge` | Zero-Node-dependency implementation for Cloudflare Workers, Fastly Compute, Hono, and Vercel Edge. |
 | **SSE Dashboard** | `tricache/dashboard` | Zero-dependency Server-Sent Events real-time admin dashboard. |
 | **Live CLI Top** | `npx tricache top` | Real-time terminal ASCII monitor over Unix sockets and Windows named pipes. |

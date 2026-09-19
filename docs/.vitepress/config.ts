@@ -136,7 +136,7 @@ export default defineConfig({
           { text: 'NestJS Dynamic Module', link: '/integrations/nestjs' },
           { text: 'Prisma ORM Extension', link: '/integrations/prisma' },
           { text: 'Drizzle ORM Wrapper', link: '/integrations/drizzle' },
-          { text: 'Express & Hono Middleware', link: '/integrations/http' },
+          { text: 'Express, Fastify & Koa Middleware', link: '/integrations/http' },
           { text: 'Edge Isolates (Workers)', link: '/integrations/edge' },
           { text: 'Visual Dashboard & CLI', link: '/integrations/dashboard' },
         ],

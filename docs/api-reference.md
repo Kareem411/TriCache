@@ -463,7 +463,7 @@ The TriCache engine honors the following environment variables across all enviro
 
 ---
 
-## 9. HTTP & Framework Middlewares (`tricache/http` & `tricache/edge`)
+## 9. HTTP & Framework Middlewares (`tricache/http`, `tricache/koa` & `tricache/edge`)
 
 ### `createExpressMiddleware(cache, options?)`
 Creates an Express/Connect route middleware with deterministic query sorting, weak ETag calculation, and RFC 7232 `304 Not Modified` short-circuiting.
@@ -484,6 +484,18 @@ Creates an encapsulation-safe Fastify plugin (`[Symbol.for('skip-override')] = t
 import { createFastifyPlugin } from 'tricache/http';
 
 await fastify.register(createFastifyPlugin(cache, { ttlSeconds: 120 }));
+```
+
+### `koaCache(options?)` / `createKoaMiddleware(options?)`
+Creates a Koa middleware (`tricache/koa`) with the same GET/HEAD, weak ETag, `304 Not Modified`, `ttl` / `swr` / `tags`, and `skipCache` contract as Express.
+
+```typescript
+import { koaCache } from 'tricache/koa';
+
+app.use(koaCache({
+  ttl: 60,
+  key: (ctx) => ctx.url,
+}));
 ```
 
 ### `createHonoEdgeMiddleware(edgeCache, options?)`
