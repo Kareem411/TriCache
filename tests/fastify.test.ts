@@ -203,6 +203,9 @@ describe('Fastify plugin (tricache/fastify)', () => {
       const etag = headers1['etag'];
       expect(etag).toBeDefined();
 
+      // preHandler persist is fire-and-forget (void cache.set)
+      await new Promise(r => setTimeout(r, 10));
+
       const headers2: Record<string, string> = {};
       let body2: any = null;
       const req2 = { method: 'GET', url: '/api/v1/products', headers: {} };
