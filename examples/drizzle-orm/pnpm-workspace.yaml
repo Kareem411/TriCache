@@ -1,0 +1,4 @@
+allowBuilds:
+  esbuild: false
+  msgpackr-extract: false
+  better-sqlite3: true

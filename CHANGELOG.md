@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-10-02
+
+### Added
+- **First-Class Node.js Hono Middleware Adapter (`src/hono/index.ts`, `tricache/hono`)** ([#9](https://github.com/Kareem411/TriCache/issues/9), [#45](https://github.com/Kareem411/TriCache/pull/45)):
+  - Dedicated package entry `tricache/hono` exporting `cacheMiddleware` and `createHonoMiddleware` for Node.js runtimes.
+  - Backed directly by Node `CacheService` with full three-tier caching (L1 RAM → L1.5 NVMe `/dev/shm` → L2 Redis), SWR background revalidation, and generational tag invalidation.
+  - Weak ETag generation (`W/"..."`), RFC 7232 `If-None-Match` conditional 304 Not Modified responses, deterministic query sorting, header whitelisting, and non-2xx status response gating.
+  - Comprehensive unit test coverage in `tests/hono.test.ts`.
+- **Drizzle ORM Query Caching Reference Example (`examples/drizzle-orm/`)** ([#28](https://github.com/Kareem411/TriCache/issues/28), [#37](https://github.com/Kareem411/TriCache/pull/37)):
+  - Full runnable SQLite + Drizzle reference demonstration showcasing `withCache` query extension.
+  - Demonstrates deterministic SQL query text + bind parameters fingerprinting (`generateDrizzleCacheKey`), background SWR revalidation (`swr: 60`), and tag invalidation across table mutations (`cache.invalidateTag('users')`).
+  - Automated verification test suite in `tests/drizzle-orm-example.test.ts`.
+- **Fastify REST API Reference Example (`examples/fastify-api/`)** ([#26](https://github.com/Kareem411/TriCache/issues/26), [#38](https://github.com/Kareem411/TriCache/pull/38)):
+  - Complete runnable Fastify REST API demo illustrating `createFastifyPlugin` (global application hook) and `fastifyCache` (route-level `preHandler` hook).
+  - Demonstrates `onRequest` short-circuiting, `onSend` response payload capture, weak ETags, and 304 conditional responses.
+  - Automated verification test suite in `tests/fastify-api-example.test.ts`.
+- **Hono & Cloudflare Workers Edge Caching Demo (`examples/edge-hono/`)** ([#27](https://github.com/Kareem411/TriCache/issues/27), [#39](https://github.com/Kareem411/TriCache/pull/39)):
+  - Standalone Cloudflare Workers + Wrangler reference architecture demonstrating `tricache/edge`.
+  - Pure Web Standards execution (`Request`, `Response`, `crypto.subtle`) with zero Node native dependencies.
+  - In-memory `Murmur3BloomFilter` defense against cold miss penetration.
+- **NestJS 11 Microservice Reference Example (`examples/nestjs-microservice/`)** ([#29](https://github.com/Kareem411/TriCache/issues/29), [#40](https://github.com/Kareem411/TriCache/pull/40)):
+  - Runnable NestJS 11 TypeScript service demonstrating `TriCacheModule.register()`.
+  - Method-level `@Cacheable({ ttl, tags })` and `@CacheEvict({ tags })` decorators, plus `@nestjs/cache-manager` v5/v6 store compatibility via `TriCacheStore`.
+  - Automated verification test suite in `tests/nestjs-microservice-example.test.ts`.
+- **Prometheus Observability Recipe & Express API Demo** ([#30](https://github.com/Kareem411/TriCache/issues/30), [#31](https://github.com/Kareem411/TriCache/pull/31), [#25](https://github.com/Kareem411/TriCache/issues/25), [#35](https://github.com/Kareem411/TriCache/pull/35)):
+  - Complete Prometheus `/metrics` scraping recipe with Grafana dashboard configuration (`docs/recipes/prometheus-metrics.md`).
+  - Production Express microservice demo in `examples/express-api/` with weak ETags and 304 validation.
+- **Configurable Backplane Delivery Assurance (`awaitInvalidationBackplane`) (`src/types.ts`, `src/cache-service.ts`)**:
+  - Introduced `awaitInvalidationBackplane?: boolean` in `CacheOptions`.
+  - When enabled, invalidation broadcasts (`set`, `delete`, `clear`, `invalidateTag`, `invalidateTags`) are awaited and propagate transport failures directly to callers rather than failing silently in the background, providing guaranteed delivery semantics for mission-critical write paths.
+
+### Fixed
+- **Core Concurrency Hardening & Mutation Epoch Fencing (`src/cache-service.ts`)**:
+  - **Mutation Epoch Fencing**: Added per-key monotonic mutation epoch tracking (`_keyMutationEpochs`). Both SingleFlight coalesced `get()` calls and SWR background revalidations (`_revalidate`) snapshot the key's mutation epoch before executing `fetchFn()`. If a concurrent `delete()`, `set()`, or `clear()` mutates the key while the fetch is in-flight, the stale commit to L1 and Redis is aborted, preventing zombie resurrection and race-condition data overwrites.
+  - **SingleFlight In-Flight Eviction on Mutations**: `set()`, `delete()`, `clear()`, and backplane invalidations synchronously evict entries from `this.inflight`, preventing subsequent reads from coalescing onto stale pre-mutation in-flight fetches. Additionally, in-flight reads that detect an epoch mismatch check L1 for fresher committed data before falling back.
+  - **Clock Domain Unification for Generational Tags**: Replaced `Date.now()` Unix epoch timestamps with monotonic `performance.now()` in `_setLocalTagVersion`, `invalidateTag`, `invalidateTags`, and backplane `tag_incr`. Eliminates an epoch inversion where negative deltas caused local tag versions to be treated as permanently fresh and never re-polled from Redis.
+  - **Global Epoch Monotonicity on Cache Flush**: Added a global monotonic epoch counter `_globalEpoch` incremented on `cache.clear()`. Ensures in-flight reads initiated prior to `clear()` detect the epoch divergence and abort committing purged keys back into L1 and Redis.
+  - **Distributed Lock Split-Brain Prevention (`failClosedOnRedisError` / `lockFailClosed`)**: Introduced configurable fail-closed locking for `cache.lock()`. When Redis encounters network partitions, disconnects, or errors, `lock()` rejects with an error rather than silently degrading to an in-process local mutex that would permit concurrent split-brain execution across cluster pods.
+  - **Disk Tier Pattern Tombstones**: Added in-memory pattern tombstones (`_patternTombstones`) checked during Tier 1.5 disk lookups (`get`, `peek`, `mget`). Prevents wildcard pattern deletions (`delete('prefix:*')`) from leaving unindexed SHA-256 hashed files on disk that could resurrect into L1 on subsequent reads.
+  - **Disk Deletion Tombstones**: Introduced `_pendingDiskDeletes` synchronous tombstoning to guard against deferred `setImmediate(() => this.disk.delete(k))` unlink races. Immediate same-tick reads (`peek`, `get`, `mget`) after `delete()` or remote backplane `del` are prevented from reading or resurrecting the stale disk file into L1.
+  - **Tag Retention & Invalidation Abortion during SWR**: `get()` snapshots and propagates `knownTagVersions` into `_revalidate()`. Even under severe L1 memory churn or OOM evictions where the entry is purged during a slow query, generational tag metadata is preserved when re-populating L1 and Redis. Furthermore, if a generational tag version was bumped during the in-flight revalidation fetch, the commit is aborted to prevent resurrecting invalidated tag state.
+  - **Strict Lifecycle Guards**: Hardened all public API and internal methods (`get`, `set`, `delete`, `peek`, `mget`, `mset`, `mdel`, `clear`, `increment`, `lock`, `touch`, `getIfFresh`, `has`, `ttl`, `scan`, `keys`, `values`, `entries`, `ping`, `drainToL2`, `rotateEncryptionKey`, `getRedis`) with `_assertActive()`. Operations invoked on destroyed `CacheService` instances immediately fast-fail with `TriCacheError` rather than leaking zombie state or reconnecting orphaned Redis clients.
+- **SWR Background Revalidation & Concurrency Cache Poisoning (`src/hono/index.ts`, `src/edge/hono.ts`)**:
+  Fixed vulnerability where non-2xx responses (e.g. 500/404) during background SWR revalidation or singleflight request coalescing could overwrite valid cached data in L1 memory and L2 Redis. Non-2xx responses now throw `NonCacheableHonoResponseError` / `NonCacheableEdgeResponseError` before storage, preventing cache corruption and allowing coalesced callers to fall back gracefully to their own `next()`.
+- **Server-Sent Events (SSE) Infinite Buffering Guard (`src/hono/index.ts`, `src/edge/hono.ts`)**:
+  Pre-inspects `Content-Type: text/event-stream` before calling response clone text buffering, preventing infinite event streams from blocking the Node event loop or V8 edge worker isolates.
+- **Response-Level Cache-Control Protection (`src/hono/index.ts`, `src/edge/hono.ts`)**:
+  Pre-inspects downstream `Cache-Control` response headers (`no-store`, `no-cache`, `private`), preventing authenticated or private responses from being saved to shared multi-user L1/L2 caches.
+- **RFC 7234 Section 3 HTTP 206 Partial Content Exclusion (`src/hono/index.ts`, `src/edge/hono.ts`)**:
+  Explicitly excludes HTTP 206 byte-range responses from full-response URL cache keys to prevent asset corruption.
+- **Downstream Response Headers Preservation & RFC 7232 304 Hygiene (`src/hono/index.ts`, `src/edge/hono.ts`)**:
+  Captures downstream headers (such as CORS `Access-Control-Allow-Origin` and custom response headers) on cache misses and restores them on L1/L2 hits; strips representation metadata on conditional 304 Not Modified responses.
+- **Dynamic CLI Version Resolution (`src/cli.ts`)**:
+  Resolved hardcoded version fallback by dynamically loading `version` from `package.json`.
+- **Peer Dependency Optimization for Hono (`package.json`)**:
+  Configured `hono` as an optional peer dependency (`peerDependenciesMeta: { "hono": { "optional": true } }`) ensuring non-Hono users (Fastify, Express, NestJS) do not incur extra bundle weight.
+- **Hono Edge Response Assignment (`src/edge/hono.ts`)** ([#39](https://github.com/Kareem411/TriCache/pull/39)):
+  - Fixed an issue where Hono's `compose` ignored middleware return values once `next()` sets `c.res`. Explicitly assigns `c.res = response` via `applyEdgeResponse` so weak ETags and 304s are preserved on both cache misses and hits.
+- **Windows Named Pipe Discovery & CLI Top Error Handling (`src/cli.ts`, `src/ipc-telemetry.ts`)**:
+  - Improved Windows named pipe path resolution (`\\.\pipe\tricache-<pid>`) and graceful error handling during `tricache top` monitoring.
+
 ## [0.8.0] — 2026-09-16
 
 ### Added

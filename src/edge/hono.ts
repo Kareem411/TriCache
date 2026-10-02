@@ -22,6 +22,7 @@ export interface HonoEdgeCacheOptions {
 export interface CachedEdgeHttpResponse {
   body: string;
   contentType: string;
+  headers?: Record<string, string>;
   etag?: string;
   status: number;
 }
@@ -95,6 +96,14 @@ export function buildEdgeDeterministicKey(c: any, options?: { keyGenerator?: (c:
   return key;
 }
 
+class NonCacheableEdgeResponseError extends Error {
+  readonly isNonCacheable = true;
+  constructor(readonly response: CachedEdgeHttpResponse) {
+    super(`Non-cacheable status: ${response.status}`);
+    this.name = 'NonCacheableEdgeResponseError';
+  }
+}
+
 /**
  * Pure Web Standards Hono middleware for V8 Edge Isolates (Cloudflare Workers, Fastly, Vercel Edge).
  *
@@ -150,54 +159,126 @@ export function honoEdgeCache(options: HonoEdgeCacheOptions = {}) {
     const ifNoneMatch = c.req.header?.('if-none-match') || c.req.header?.('If-None-Match');
     const resolvedTags = typeof tags === 'function' ? tags(c) : tags;
 
-    const cached = await cache.get(
-      key,
-      async () => {
-        await next();
-        const res = c.res;
-        if (!res) {
-          return null;
+    let ranNext = false;
+    try {
+      const cached = await cache.get(
+        key,
+        async () => {
+          ranNext = true;
+          await next();
+          const res = c.res;
+          if (!res) {
+            return null;
+          }
+
+          const contentType = res.headers?.get?.('content-type') || 'text/plain; charset=utf-8';
+          if (contentType.toLowerCase().includes('text/event-stream')) {
+            throw new NonCacheableEdgeResponseError({
+              body: '',
+              contentType,
+              status: 0,
+            });
+          }
+
+          const cc = res.headers?.get?.('cache-control');
+          if (cc) {
+            const lowerCc = cc.toLowerCase();
+            if (lowerCc.includes('no-store') || lowerCc.includes('no-cache') || lowerCc.includes('private')) {
+              throw new NonCacheableEdgeResponseError({
+                body: '',
+                contentType,
+                status: 0,
+              });
+            }
+          }
+
+          const statusCode = res.status ?? 200;
+          if (statusCode < 200 || statusCode >= 300 || statusCode === 206) {
+            throw new NonCacheableEdgeResponseError({
+              body: '',
+              contentType,
+              status: statusCode,
+            });
+          }
+
+          const clone = res.clone();
+          const text = await clone.text();
+          const bodyEtag = etag ? await computeEdgeETag(text) : undefined;
+
+          const capturedHeaders: Record<string, string> = {};
+          if (res.headers && typeof res.headers.forEach === 'function') {
+            res.headers.forEach((value: string, name: string) => {
+              const lower = name.toLowerCase();
+              if (
+                lower !== 'content-length' &&
+                lower !== 'transfer-encoding' &&
+                lower !== 'connection' &&
+                lower !== 'etag' &&
+                lower !== 'content-type'
+              ) {
+                capturedHeaders[name] = value;
+              }
+            });
+          }
+
+          const snapshot: CachedEdgeHttpResponse = {
+            body: text,
+            contentType,
+            headers: capturedHeaders,
+            etag: bodyEtag,
+            status: statusCode,
+          };
+
+          return snapshot;
+        },
+        ttl,
+        {
+          swr,
+          tags: resolvedTags,
+          ctx: c.executionCtx,
         }
+      );
 
-        const clone = res.clone();
-        const text = await clone.text();
-        const statusCode = res.status ?? 200;
-        const bodyEtag = etag ? await computeEdgeETag(text) : undefined;
-        const contentType = res.headers.get('content-type') || 'text/plain; charset=utf-8';
-
-        return {
-          body: text,
-          contentType,
-          etag: bodyEtag,
-          status: statusCode,
-        };
-      },
-      ttl,
-      {
-        swr,
-        tags: resolvedTags,
-        ctx: c.executionCtx,
+      if (!cached) {
+        return;
       }
-    );
 
-    if (!cached) {
-      return;
+      if (cached.etag && ifNoneMatch === cached.etag) {
+        const notModifiedHeaders: Record<string, string> = { ETag: cached.etag };
+        if (cached.headers?.['cache-control']) notModifiedHeaders['Cache-Control'] = cached.headers['cache-control'];
+        if (cached.headers?.['vary']) notModifiedHeaders['Vary'] = cached.headers['vary'];
+        return applyEdgeResponse(c, null, 304, notModifiedHeaders);
+      }
+
+      const headers: Record<string, string> = { ...cached.headers };
+      if (cached.etag) headers['ETag'] = cached.etag;
+      if (cached.contentType) headers['Content-Type'] = cached.contentType;
+
+      return applyEdgeResponse(c, cached.body, cached.status ?? 200, headers);
+    } catch (err: unknown) {
+      if (err instanceof NonCacheableEdgeResponseError) {
+        if (!ranNext) {
+          return await next();
+        }
+        return;
+      }
+      throw err;
     }
-
-    // Status gate: never cache error responses
-    if (typeof cached.status === 'number' && (cached.status < 200 || cached.status >= 300)) {
-      await cache.delete?.(key);
-      return;
-    }
-
-    if (cached.etag && ifNoneMatch === cached.etag) {
-      return c.body(null, 304, { ETag: cached.etag });
-    }
-
-    const headers: Record<string, string> = {};
-    if (cached.etag) headers['ETag'] = cached.etag;
-    if (cached.contentType) headers['Content-Type'] = cached.contentType;
-
-    return c.body(cached.body, cached.status ?? 200, headers);
   };
+}
+
+/**
+ * Hono's `compose` ignores a middleware return value once `next()` has set
+ * `c.res` (`finalized === true`). Assigning `c.res` replaces the downstream
+ * body so weak ETags and 304s are visible on both cache miss and hit.
+ */
+function applyEdgeResponse(
+  c: any,
+  body: string | null,
+  status: number,
+  headers: Record<string, string>,
+): Response {
+  const response = c.body(body, status, headers);
+  c.res = response;
+  return response;
 }

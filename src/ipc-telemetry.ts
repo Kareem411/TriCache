@@ -355,8 +355,36 @@ export async function findActiveSockets(): Promise<string[]> {
       await client.ping(100);
       active.push(currentPipe);
     } catch {
-      // Pipe not present or not active
+      // Pipe not present or not active on current PID
     }
+
+    try {
+      const { execFileSync } = await import('node:child_process');
+      const stdout = execFileSync(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', '[System.IO.Directory]::GetFiles("\\\\.\\pipe\\") | Where-Object { $_ -like "*tricache-*" }'],
+        { timeout: 1500, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+      );
+      const candidates = stdout
+        .split(/\r?\n/)
+        .map((name) => name.trim())
+        .filter((name) => name.length > 0 && !active.includes(name));
+
+      await Promise.all(
+        candidates.map(async (pipePath) => {
+          const testClient = new IpcTelemetryClient(pipePath);
+          try {
+            await testClient.ping(100);
+            active.push(pipePath);
+          } catch {
+            // Stale or non-responsive pipe
+          }
+        }),
+      );
+    } catch {
+      // Ignore enumeration errors (e.g. timeout or restricted environment)
+    }
+
     return active;
   }
 

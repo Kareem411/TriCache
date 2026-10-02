@@ -8,6 +8,7 @@
  *   npx tricache clear [--redis redis://localhost:6379] [--namespace <ns>] [--prefix <prefix>]
  */
 
+import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { CacheService } from './cache-service.js';
 import {
@@ -59,7 +60,14 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
   // (bin/tricache.js). Output must go directly to process stdout without logger prefixes
   // to support UNIX pipes, terminal formatting, and automated tooling.
   if (values.version || command === 'version') {
-    console.log('tricache v0.8.0');
+    let version = '0.9.0';
+    try {
+      const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+      if (pkg?.version) version = pkg.version;
+    } catch {
+      // fallback to default version
+    }
+    console.log(`tricache v${version}`);
     return;
   }
 
@@ -73,9 +81,18 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
       const active = await findActiveSockets();
       if (active.length > 0) {
         targetSocket = active[0];
-      } else {
-        targetSocket = resolveIpcSocketPath(process.pid);
       }
+    }
+
+    if (!targetSocket) {
+      console.error('No active TriCache instances found to monitor.\n');
+      console.error('To use `tricache top`:');
+      console.error('  1. Ensure your running application enables IPC telemetry:');
+      console.error("     const cache = new CacheService({ namespace: 'my-app', enableIpc: true, ... });\n");
+      console.error('  2. If the application is already running, specify its PID or socket:');
+      console.error('     npx tricache top --pid <pid>');
+      console.error('     npx tricache top --socket <path>\n');
+      process.exit(1);
     }
 
     const client = new IpcTelemetryClient(targetSocket);
@@ -148,7 +165,7 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
         const screen = renderTopDashboard(payload);
         process.stdout.write('\x1b[H' + screen + '\n  Press "q" or Ctrl+C to exit\n');
       } catch (err) {
-        process.stdout.write(`\x1b[HConnecting to ${targetSocket}...\nError: ${(err as Error).message}\n`);
+        process.stdout.write(`\x1b[HConnecting to ${targetSocket}...\nError: ${(err as Error).message}\n\nWaiting for TriCache IPC server. Ensure the target process is running with enableIpc: true.\nPress "q" or Ctrl+C to exit\n`);
       }
     };
 

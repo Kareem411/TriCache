@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitepress';
+import pkg from '../../package.json' with { type: 'json' };
 
 export default defineConfig({
   title: 'TriCache',
@@ -82,7 +83,7 @@ export default defineConfig({
       { text: 'API', link: '/api-reference' },
       { text: 'Benchmarks', link: '/benchmarks' },
       {
-        text: 'v0.8.0',
+        text: `v${pkg.version}`,
         items: [
           { text: 'Changelog', link: '/changelog' },
           { text: 'Contributing Guide', link: '/contributing' },
@@ -136,7 +137,8 @@ export default defineConfig({
           { text: 'NestJS Dynamic Module', link: '/integrations/nestjs' },
           { text: 'Prisma ORM Extension', link: '/integrations/prisma' },
           { text: 'Drizzle ORM Wrapper', link: '/integrations/drizzle' },
-          { text: 'Express & Hono Middleware', link: '/integrations/http' },
+          { text: 'Express & Fastify Middleware', link: '/integrations/http' },
+          { text: 'Hono Node Middleware', link: '/integrations/hono' },
           { text: 'Edge Isolates (Workers)', link: '/integrations/edge' },
           { text: 'Visual Dashboard & CLI', link: '/integrations/dashboard' },
         ],

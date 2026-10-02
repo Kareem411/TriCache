@@ -161,9 +161,10 @@ async lock<T>(
 **`LockOptions` Schema:**
 ```typescript
 interface LockOptions {
-  ttl?: number;            // Lock lease duration in seconds (default: 30)
-  acquireTimeout?: number; // Max wait time in ms before aborting (default: 5000)
-  retryInterval?: number;  // Polling interval in ms (default: 100)
+  ttl?: number;                     // Lock lease duration in seconds (default: 30)
+  acquireTimeout?: number;          // Max wait time in ms before aborting (default: 5000)
+  retryInterval?: number;           // Polling interval in ms (default: 100)
+  failClosedOnRedisError?: boolean; // Throws immediately on Redis errors instead of in-process fallback (prevents split-brain)
 }
 ```
 
@@ -438,6 +439,8 @@ Complete schema of options passed to `CacheService.create(options)`:
 | `adaptiveTtl` | `boolean` | `false` | Autonomous p95 fetch latency TTL tuning |
 | `autoPipeline` | `boolean` | `false` | Zero-latency microtask Redis command batching |
 | `maxPipelineBatchSize` | `number` | `100` | Immediate flush batch size threshold |
+| `awaitInvalidationBackplane` | `boolean` | `false` | Await backplane broadcast on mutations (`set`, `delete`, `clear`, `invalidateTag`) |
+| `lockFailClosed` | `boolean` | `false` | Fails closed (throws) on Redis errors during `cache.lock()` (prevents split-brain) |
 | `enableIpc` | `boolean` | `false` | Enables local IPC bridge for `tricache top` |
 | `ipcSocketPath` | `string` | `undefined` | Custom Unix domain socket or Windows named pipe |
 | `crossRegion` | `CrossRegionRelayOptions` | `undefined` | Multi-cluster cross-region invalidation relay |
@@ -463,7 +466,7 @@ The TriCache engine honors the following environment variables across all enviro
 
 ---
 
-## 9. HTTP & Framework Middlewares (`tricache/http` & `tricache/edge`)
+## 9. HTTP & Framework Middlewares (`tricache/http`, `tricache/hono` & `tricache/edge`)
 
 ### `createExpressMiddleware(cache, options?)`
 Creates an Express/Connect route middleware with deterministic query sorting, weak ETag calculation, and RFC 7232 `304 Not Modified` short-circuiting.
@@ -484,6 +487,17 @@ Creates an encapsulation-safe Fastify plugin (`[Symbol.for('skip-override')] = t
 import { createFastifyPlugin } from 'tricache/http';
 
 await fastify.register(createFastifyPlugin(cache, { ttlSeconds: 120 }));
+```
+
+### `cacheMiddleware(options?)` (`tricache/hono`)
+Creates Node Hono middleware on `CacheService` with Express-aligned ttl/tags/SWR, weak ETags, and RFC 7232 `304 Not Modified`. Non-2xx responses are not cached.
+
+```typescript
+import { cacheMiddleware } from 'tricache/hono';
+
+app.get('/api/posts', cacheMiddleware({ ttl: 300, tags: ['posts'] }), (c) => {
+  return c.json({ data: '...' });
+});
 ```
 
 ### `createHonoEdgeMiddleware(edgeCache, options?)`
