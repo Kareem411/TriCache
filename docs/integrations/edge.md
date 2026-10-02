@@ -83,9 +83,14 @@ app.get(
 ### Key Edge Middleware Features:
 * **Zero Node Native Dependencies**: Pure Web Standards (`crypto.subtle`, `Headers`, `Response`).
 * **Web Crypto Weak ETags**: Automatically calculates SHA-1 / Murmur3 digests using `crypto.subtle.digest('SHA-1', ...)`.
-* **RFC 7232 304 Not Modified**: Intercepts matching `If-None-Match` headers for instant 304 responses with 0 bytes transmitted.
+* **RFC 7232 304 Not Modified**: Intercepts matching `If-None-Match` headers for instant 304 responses, omitting representation headers per RFC 7232.
 * **Deterministic Query Sorting**: Groups identical query permutations into a single cache entry.
-* **Conditional Bypass**: Automatically honors `Cache-Control: no-cache, no-store` and custom `skipCache` rules.
+* **Non-2xx & 206 Status Gating**: Never caches error responses or `206 Partial Content` slices.
+* **SWR Revalidation Safety**: Rejects upstream error responses during background revalidations, preserving healthy stale cache entries.
+* **Response Cache-Control Protection**: Honors downstream `Cache-Control: no-store`, `no-cache`, and `private` headers.
+* **Streaming Response Passthrough**: Automatically bypasses Server-Sent Events (`text/event-stream`), avoiding isolate buffer hangs.
+* **Header Preservation**: Restores downstream custom headers (e.g. CORS and regional routing headers) on cache hits.
+* **Conditional Bypass**: Automatically honors request `Cache-Control: no-cache, no-store` and custom `skipCache` rules.
 
 ---
 

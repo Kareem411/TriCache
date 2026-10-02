@@ -53,12 +53,16 @@ app.get(
 
 ## Behavior
 
-* **Safe methods only**: `GET` and `HEAD` are cached; other methods pass through.
-* **Weak ETags**: SHA-1 weak validators (`ETag: W/"…"`) via the same Node helper as Express.
-* **304 Not Modified**: matching `If-None-Match` short-circuits with an empty body.
-* **Status gate**: non-2xx responses are never kept (4xx/5xx cannot poison a key).
-* **Bypass**: `Cache-Control: no-cache` / `no-store` and a custom `skipCache` predicate skip the cache.
-* **SWR & tags**: `ttl`, `swr`, and `tags` are forwarded to `CacheService.get`, matching Express middleware.
+* **Safe methods only**: `GET` and `HEAD` are cached; other HTTP methods pass through untouched.
+* **Weak ETags**: SHA-1 weak validators (`ETag: W/"…"`) via the Node cryptographic helper.
+* **RFC 7232 304 Not Modified**: matching `If-None-Match` short-circuits with a `304` status, omitting representation headers per RFC 7232.
+* **Status gate**: non-2xx responses and `206 Partial Content` are never cached (prevents error or truncated range poisoning).
+* **SWR error resilience**: if upstream fails with 5xx/4xx during background Stale-While-Revalidate, healthy stale data is retained instead of overwriting cache with errors.
+* **Response Cache-Control protection**: downstream responses with `Cache-Control: no-store`, `no-cache`, or `private` are strictly excluded from shared multi-user cache tiers.
+* **Streaming response passthrough**: Server-Sent Events (`Content-Type: text/event-stream`) bypass clone buffering automatically, preventing event-loop hangs.
+* **Response header preservation**: custom headers (CORS `Access-Control-Allow-Origin`, custom trace IDs) are captured on miss and restored on cache hits.
+* **Bypass**: request `Cache-Control: no-cache` / `no-store` and custom `skipCache` predicates bypass the cache.
+* **SWR & tags**: `ttl`, `swr`, and `tags` are forwarded to `CacheService.get` with multi-tier Redis/in-memory generational tag invalidation.
 
 ---
 

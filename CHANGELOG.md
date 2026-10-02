@@ -34,6 +34,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Production Express microservice demo in `examples/express-api/` with weak ETags and 304 validation.
 
 ### Fixed
+- **SWR Background Revalidation & Concurrency Cache Poisoning (`src/hono/index.ts`, `src/edge/hono.ts`)**:
+  Fixed vulnerability where non-2xx responses (e.g. 500/404) during background SWR revalidation or singleflight request coalescing could overwrite valid cached data in L1 memory and L2 Redis. Non-2xx responses now throw `NonCacheableHonoResponseError` / `NonCacheableEdgeResponseError` before storage, preventing cache corruption and allowing coalesced callers to fall back gracefully to their own `next()`.
+- **Server-Sent Events (SSE) Infinite Buffering Guard (`src/hono/index.ts`, `src/edge/hono.ts`)**:
+  Pre-inspects `Content-Type: text/event-stream` before calling response clone text buffering, preventing infinite event streams from blocking the Node event loop or V8 edge worker isolates.
+- **Response-Level Cache-Control Protection (`src/hono/index.ts`, `src/edge/hono.ts`)**:
+  Pre-inspects downstream `Cache-Control` response headers (`no-store`, `no-cache`, `private`), preventing authenticated or private responses from being saved to shared multi-user L1/L2 caches.
+- **RFC 7234 Section 3 HTTP 206 Partial Content Exclusion (`src/hono/index.ts`, `src/edge/hono.ts`)**:
+  Explicitly excludes HTTP 206 byte-range responses from full-response URL cache keys to prevent asset corruption.
+- **Downstream Response Headers Preservation & RFC 7232 304 Hygiene (`src/hono/index.ts`, `src/edge/hono.ts`)**:
+  Captures downstream headers (such as CORS `Access-Control-Allow-Origin` and custom response headers) on cache misses and restores them on L1/L2 hits; strips representation metadata on conditional 304 Not Modified responses.
+- **Dynamic CLI Version Resolution (`src/cli.ts`)**:
+  Resolved hardcoded version fallback by dynamically loading `version` from `package.json`.
+- **Peer Dependency Optimization for Hono (`package.json`)**:
+  Configured `hono` as an optional peer dependency (`peerDependenciesMeta: { "hono": { "optional": true } }`) ensuring non-Hono users (Fastify, Express, NestJS) do not incur extra bundle weight.
 - **Hono Edge Response Assignment (`src/edge/hono.ts`)** ([#39](https://github.com/Kareem411/TriCache/pull/39)):
   - Fixed an issue where Hono's `compose` ignored middleware return values once `next()` sets `c.res`. Explicitly assigns `c.res = response` via `applyEdgeResponse` so weak ETags and 304s are preserved on both cache misses and hits.
 - **Windows Named Pipe Discovery & CLI Top Error Handling (`src/cli.ts`, `src/ipc-telemetry.ts`)**:
