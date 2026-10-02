@@ -8,6 +8,7 @@
  *   npx tricache clear [--redis redis://localhost:6379] [--namespace <ns>] [--prefix <prefix>]
  */
 
+import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { CacheService } from './cache-service.js';
 import {
@@ -59,7 +60,14 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
   // (bin/tricache.js). Output must go directly to process stdout without logger prefixes
   // to support UNIX pipes, terminal formatting, and automated tooling.
   if (values.version || command === 'version') {
-    console.log('tricache v0.8.0');
+    let version = '0.9.0';
+    try {
+      const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+      if (pkg?.version) version = pkg.version;
+    } catch {
+      // fallback to default version
+    }
+    console.log(`tricache v${version}`);
     return;
   }
 
