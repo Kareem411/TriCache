@@ -429,4 +429,271 @@ describe('Systemic Invariant & Crack Hardening Audit Tests', () => {
       await cache.destroy();
     });
   });
+
+  describe('Failure Path 6: SingleFlight Zombie Coalescence & Post-Mutation Isolation', () => {
+    it('prevents post-delete reads from coalescing onto pre-delete in-flight fetch', async () => {
+      const cache = CacheService.reset({
+        namespace: 'sf_zombie_prevent',
+        disableRedis: true,
+        diskCacheDir: diskDir,
+      });
+
+      let resolveSlowFetch!: (val: string) => void;
+      const slowFetchPromise = new Promise<string>((resolve) => {
+        resolveSlowFetch = resolve;
+      });
+
+      // 1. Client A starts slow fetch
+      const clientAPromise = cache.get('order:100', () => slowFetchPromise, 60);
+
+      // 2. Client B deletes the key while slow fetch is still running
+      await cache.delete('order:100');
+
+      // 3. Client C calls get('order:100') AFTER delete has completed
+      let clientCFetchCalled = false;
+      const clientCPromise = cache.get('order:100', async () => {
+        clientCFetchCalled = true;
+        return 'fresh-order-data-from-client-c';
+      }, 60);
+
+      // 4. Now Client A's slow fetch completes
+      resolveSlowFetch('stale-pre-delete-order-data');
+
+      const [clientAResult, clientCResult] = await Promise.all([clientAPromise, clientCPromise]);
+
+      // Because Client C committed fresh data to L1, Client A also receives the fresher L1 data rather than stale data
+      expect(clientAResult).toBe('fresh-order-data-from-client-c');
+      // Client C MUST NOT have coalesced onto Client A's pre-delete fetch!
+      expect(clientCFetchCalled).toBe(true);
+      expect(clientCResult).toBe('fresh-order-data-from-client-c');
+      expect(cache.getIfFresh('order:100')).toBe('fresh-order-data-from-client-c');
+
+      await cache.destroy();
+    });
+
+    it('returns fresher L1 value if set() occurred during in-flight fetch', async () => {
+      const cache = CacheService.reset({
+        namespace: 'sf_fresher_l1',
+        disableRedis: true,
+        diskCacheDir: diskDir,
+      });
+
+      let resolveSlowFetch!: (val: string) => void;
+      const slowFetchPromise = new Promise<string>((resolve) => {
+        resolveSlowFetch = resolve;
+      });
+
+      const clientAPromise = cache.get('item:99', () => slowFetchPromise, 60);
+
+      // set() occurs mid-flight
+      await cache.set('item:99', 'fresher-item-data', 60);
+
+      resolveSlowFetch('stale-item-data');
+      const clientAResult = await clientAPromise;
+
+      // Client A receives the newer data rather than stale fetch data
+      expect(clientAResult).toBe('fresher-item-data');
+      expect(cache.getIfFresh('item:99')).toBe('fresher-item-data');
+
+      await cache.destroy();
+    });
+  });
+
+  describe('Failure Path 7: Clock Domain Inversion in Generational Tags', () => {
+    it('sets lastSyncedAt in monotonic performance.now() domain, expiring after tagVersionTtlMs', async () => {
+      let redisGetCount = 0;
+      let redisTagVer = 1;
+
+      const mockRedisClient = {
+        incr: vi.fn().mockImplementation(async () => ++redisTagVer),
+        get: vi.fn().mockImplementation(async () => String(redisTagVer)),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const cache = CacheService.reset({
+        namespace: 'tag_clock_domain',
+        disableRedis: false,
+        tagStrategy: 'generational',
+        tagVersionTtlMs: 25, // 25ms TTL
+        redisClient: mockRedisClient as any,
+        diskCacheDir: diskDir,
+      });
+
+      // Invalidate tag locally
+      await cache.invalidateTag('users');
+
+      // Read tag version internally
+      const v1 = await (cache as any)._getTagVersion('users');
+      expect(v1).toBe(2);
+
+      // Verify that local tag entry lastSyncedAt is in performance.now() domain (not ~1.76e12 epoch)
+      const localEntry = (cache as any).tagVersions.get('users');
+      expect(localEntry).toBeDefined();
+      expect(localEntry.lastSyncedAt).toBeLessThan(1_000_000_000); // monotonic uptime, not Unix epoch!
+
+      // Immediately reading again hits local cache without calling Redis
+      mockRedisClient.get.mockClear();
+      const v2 = await (cache as any)._getTagVersion('users');
+      expect(v2).toBe(2);
+      expect(mockRedisClient.get).not.toHaveBeenCalled();
+
+      // Wait 35ms (exceeds 25ms TTL)
+      await new Promise(r => setTimeout(r, 35));
+
+      // After TTL expires, it MUST query Redis again because time elapsed properly!
+      redisTagVer = 5; // simulated remote bump
+      const v3 = await (cache as any)._getTagVersion('users');
+      expect(mockRedisClient.get).toHaveBeenCalledWith(expect.stringContaining('tag_ver:users'));
+      expect(v3).toBe(5);
+
+      await cache.destroy();
+    });
+  });
+
+  describe('Failure Path 8: Global State Purge Monotonicity (clear() Epoch Fence)', () => {
+    it('aborts committing in-flight fetch that started before cache.clear()', async () => {
+      const cache = CacheService.reset({
+        namespace: 'clear_epoch_fence',
+        disableRedis: true,
+        diskCacheDir: diskDir,
+      });
+
+      let resolveSlowFetch!: (val: string) => void;
+      const slowFetchPromise = new Promise<string>((resolve) => {
+        resolveSlowFetch = resolve;
+      });
+
+      // Key has never been written, epoch is 0 at start
+      const getPromise = cache.get('theme:dark', () => slowFetchPromise, 60);
+
+      // Global clear() is invoked
+      await cache.clear();
+
+      // Slow DB query finishes after clear()
+      resolveSlowFetch('dark-theme-config');
+      const result = await getPromise;
+
+      expect(result).toBe('dark-theme-config');
+      // The key MUST NOT have been committed back to L1!
+      expect(cache.has('theme:dark')).toBe(false);
+      expect(cache.getIfFresh('theme:dark')).toBeNull();
+
+      await cache.destroy();
+    });
+  });
+
+  describe('Failure Path 9: Distributed Lock Fail-Closed Under Redis Outages', () => {
+    it('throws error when failClosedOnRedisError is true and Redis encounters an error', async () => {
+      const mockRedisClient = {
+        set: vi.fn().mockRejectedValue(new Error('Redis connection ETIMEDOUT')),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const cache = CacheService.reset({
+        namespace: 'lock_fail_closed',
+        disableRedis: false,
+        redisClient: mockRedisClient as any,
+        diskCacheDir: diskDir,
+      });
+
+      let criticalSectionExecuted = false;
+      await expect(
+        cache.lock('payout:batch_1', async () => {
+          criticalSectionExecuted = true;
+          return 'done';
+        }, { failClosedOnRedisError: true, acquireTimeout: 100 }),
+      ).rejects.toThrow('Distributed lock acquisition failed for resource "payout:batch_1" due to Redis error: Redis connection ETIMEDOUT');
+
+      expect(criticalSectionExecuted).toBe(false);
+
+      await cache.destroy();
+    });
+
+    it('respects global lockFailClosed option on CacheOptions', async () => {
+      const mockRedisClient = {
+        set: vi.fn().mockRejectedValue(new Error('ECONNRESET')),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const cache = CacheService.reset({
+        namespace: 'lock_global_fail_closed',
+        disableRedis: false,
+        lockFailClosed: true,
+        redisClient: mockRedisClient as any,
+        diskCacheDir: diskDir,
+      });
+
+      let criticalSectionExecuted = false;
+      await expect(
+        cache.lock('invoice:999', async () => {
+          criticalSectionExecuted = true;
+          return 'paid';
+        }, { acquireTimeout: 100 }),
+      ).rejects.toThrow('Distributed lock acquisition failed for resource "invoice:999" due to Redis error: ECONNRESET');
+
+      expect(criticalSectionExecuted).toBe(false);
+
+      await cache.destroy();
+    });
+
+    it('falls back to in-process mutex when failClosed is false (default backwards compatibility)', async () => {
+      const mockRedisClient = {
+        set: vi.fn().mockRejectedValue(new Error('ECONNREFUSED')),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const cache = CacheService.reset({
+        namespace: 'lock_fallback_default',
+        disableRedis: false,
+        lockFailClosed: false,
+        redisClient: mockRedisClient as any,
+        diskCacheDir: diskDir,
+      });
+
+      let executed = false;
+      const res = await cache.lock('local:job', async () => {
+        executed = true;
+        return 'success';
+      }, { acquireTimeout: 100 });
+
+      expect(executed).toBe(true);
+      expect(res).toBe('success');
+
+      await cache.destroy();
+    });
+  });
+
+  describe('Failure Path 10: Disk Tier Pattern Tombstone Invalidation', () => {
+    it('prevents reviving deleted keys from disk cache after pattern delete', async () => {
+      const cache = CacheService.reset({
+        namespace: 'disk_pat_tombstone',
+        disableRedis: true,
+        diskCacheDir: diskDir,
+      });
+
+      // 1. Manually write an entry to disk as if it was evicted from L1
+      const namespacedKey = (cache as any).nk('account:55:settings');
+      (cache as any).disk.save(namespacedKey, makeTestEntry({ theme: 'blue', notifications: true }));
+
+      // 2. Ensure L1 does NOT have the key
+      (cache as any).l1.delete(namespacedKey);
+      expect((cache as any).l1.get(namespacedKey)).toBeNull();
+
+      // 3. Perform a wildcard pattern delete
+      await cache.delete('account:55:*');
+
+      // 4. Client attempts to read 'account:55:settings'
+      let fetchCalled = false;
+      const result = await cache.get('account:55:settings', async () => {
+        fetchCalled = true;
+        return { theme: 'default', notifications: false };
+      });
+
+      // It must NOT hit disk and revive the pre-deletion settings!
+      expect(fetchCalled).toBe(true);
+      expect(result).toEqual({ theme: 'default', notifications: false });
+
+      await cache.destroy();
+    });
+  });
 });

@@ -470,6 +470,7 @@ export class CacheService {
     encryptionKey: string | undefined; encryptionMode: 'aes-256-gcm' | 'aes-128-gcm' | 'aes-128-ctr' | 'xor' | undefined; snapshotPath: string; snapshotMaxAgeMs: number;
     invalidationBackplane: boolean;
     awaitInvalidationBackplane: boolean;
+    lockFailClosed: boolean;
     oomProtection: boolean; oomHeapThreshold: number;
     oomCheckIntervalMs: number; oomEvictPercent: number;
     onMetrics: ((m: CacheMetrics) => void) | undefined;
@@ -575,7 +576,36 @@ export class CacheService {
   private _lastStreamId = '$';
   private _destroyed = false;
   private readonly _pendingDiskDeletes = new Set<string>();
+  private _globalEpoch = 0;
   private readonly _keyMutationEpochs = new Map<string, number>();
+  /**
+   * Pattern tombstones for disk tier.
+   * Files in the disk tier are keyed by SHA-256 of namespacedKey.
+   * Wildcard pattern deletes cannot scan the filesystem synchronously, so we maintain
+   * pattern tombstones in memory to intercept subsequent disk reads and evict matching files.
+   */
+  private readonly _patternTombstones: Array<{ prefix: string; createdAt: number }> = [];
+
+  private _addPatternTombstone(prefix: string): void {
+    const now = Date.now();
+    while (this._patternTombstones.length > 0 && (now - this._patternTombstones[0].createdAt > 3_600_000)) {
+      this._patternTombstones.shift();
+    }
+    if (this._patternTombstones.length >= 2_000) {
+      this._patternTombstones.shift();
+    }
+    this._patternTombstones.push({ prefix, createdAt: now });
+  }
+
+  private _isTombstonedByPattern(namespacedKey: string): boolean {
+    if (this._patternTombstones.length === 0) return false;
+    for (let i = this._patternTombstones.length - 1; i >= 0; i--) {
+      if (namespacedKey.startsWith(this._patternTombstones[i].prefix)) {
+        return true;
+      }
+    }
+    return false;
+  }
 
   private _assertActive(operation: string): void {
     if (this._destroyed) {
@@ -594,7 +624,7 @@ export class CacheService {
   }
 
   private _getKeyMutationEpoch(namespacedKey: string): number {
-    return this._keyMutationEpochs.get(namespacedKey) ?? 0;
+    return this._globalEpoch + (this._keyMutationEpochs.get(namespacedKey) ?? 0);
   }
   private _ipcServer?: IpcTelemetryServer;
   /** Timestamp (Date.now()) when the backplane subscriber last lost its connection. */
@@ -703,6 +733,7 @@ export class CacheService {
       snapshotMaxAgeMs:         options.snapshotMaxAgeMs ?? DEFAULT_SNAPSHOT_MAX_AGE,
       invalidationBackplane:    options.invalidationBackplane ?? true,
       awaitInvalidationBackplane: options.awaitInvalidationBackplane ?? false,
+      lockFailClosed:           options.lockFailClosed ?? false,
       oomProtection:            options.oomProtection      ?? true,
       oomHeapThreshold:         options.oomHeapThreshold   ?? 0.85,
       oomCheckIntervalMs:       options.oomCheckIntervalMs ?? 10_000,
@@ -1106,7 +1137,7 @@ export class CacheService {
     'redisHost', 'redisPort', 'redisTls', 'disableRedis',
     'redisClusterNodes', 'redisSentinel', 'encryptionKey', 'encryptionMode',
     'l1MaxBytes', 'l1MaxEntries', 'namespace', 'frozen', 'adaptiveTtl',
-    'l2WriteMode', 'instanceName', 'invalidationBackplane', 'awaitInvalidationBackplane',
+    'l2WriteMode', 'instanceName', 'invalidationBackplane', 'awaitInvalidationBackplane', 'lockFailClosed',
   ];
 
   /** Returns the names of options that differ between `a` and the live `b`. */
@@ -1154,6 +1185,7 @@ export class CacheService {
       adaptiveTtl:         o.adaptiveTtl,
       invalidationBackplane: o.invalidationBackplane,
       awaitInvalidationBackplane: o.awaitInvalidationBackplane,
+      lockFailClosed:      o.lockFailClosed,
       strictSingleton:     o.strictSingleton,
       remoteSnapshot:      o.remoteSnapshot,
       crossRegion:         o.crossRegion,
@@ -1473,6 +1505,7 @@ export class CacheService {
     if (op === 'del') {
       this.l1.delete(key);
       this._bumpKeyMutation(key);
+      this.inflight.delete(key);
       this._pendingDiskDeletes.add(key);
       setImmediate(() => {
         try {
@@ -1484,17 +1517,23 @@ export class CacheService {
       this._cascadeDependencies(key);
     } else if (op === 'del-glob') {
       this.l1.deletePattern(key);
-      // Invalidate in-flight mutations for any known live keys matching pattern
       const pfx = key.endsWith('*') ? key.slice(0, -1) : key;
       for (const liveKey of this.l1.liveKeys()) {
         if (liveKey.startsWith(pfx)) {
           this._bumpKeyMutation(liveKey);
         }
       }
+      for (const inflightKey of Array.from(this.inflight.keys())) {
+        if (inflightKey.startsWith(pfx)) {
+          this._bumpKeyMutation(inflightKey);
+          this.inflight.delete(inflightKey);
+        }
+      }
+      this._addPatternTombstone(pfx);
     } else if (op === 'tag_incr') {
       const tag = key;
       const ver = typeof tagVersion === 'number' ? tagVersion : ((this.tagVersions.get(tag)?.version ?? 0) + 1);
-      this._setLocalTagVersion(tag, ver, Date.now());
+      this._setLocalTagVersion(tag, ver, performance.now());
     }
     this.logger.debug('Backplane: invalidation applied', { op, key: key.slice(0, 60) });
   }
@@ -2327,8 +2366,11 @@ export class CacheService {
       try {
         // ── Tier 1.5: disk tier (evicted L1 entries) — protected by latency watchdog ──
         if (!this._diskDisabled && !this._pendingDiskDeletes.has(k)) {
-          const isDiskAllowed = this.watchdog.isDiskAllowed();
-          if (isDiskAllowed) {
+          if (this._isTombstonedByPattern(k)) {
+            try { this.disk.delete(k); } catch { /* ok */ }
+          } else {
+            const isDiskAllowed = this.watchdog.isDiskAllowed();
+            if (isDiskAllowed) {
             const diskStart = performance.now();
             const diskHit = this.disk.load(k);
             const diskElapsed = performance.now() - diskStart;
@@ -2374,6 +2416,7 @@ export class CacheService {
             }
           }
         }
+      }
 
         // ── Tier 2: Redis (distributed, production-only by default) ──
         if (!this._redisDisabled) {
@@ -2499,6 +2542,14 @@ export class CacheService {
         if (this._getKeyMutationEpoch(k) !== mutationEpochAtStart) {
           this.logger.debug('Aborting in-flight cache commit — key was mutated or deleted during fetch', { cacheKey });
           span.setAttribute('cache.aborted_mutation_race', true);
+          const current = this.l1.get(k);
+          if (current && !current.isStale && current.value !== undefined) {
+            const freshVal = current.value as T;
+            if (this.opts.frozen) deepFreeze(freshVal);
+            return (this.opts.cloneStrategy === 'structuredClone' && freshVal != null && typeof freshVal === 'object')
+              ? structuredClone(freshVal)
+              : freshVal;
+          }
           if (this.opts.frozen) deepFreeze(data);
           return (this.opts.cloneStrategy === 'structuredClone' && data != null && typeof data === 'object')
             ? structuredClone(data)
@@ -2741,6 +2792,7 @@ export class CacheService {
       const p     = priority ?? inferPriority(cacheKey);
       const k     = this.nk(cacheKey);
       this._bumpKeyMutation(k);
+      this.inflight.delete(k);
       this._pendingDiskDeletes.delete(k);
       this.counters.sets++;
 
@@ -2863,9 +2915,17 @@ export class CacheService {
             this._bumpKeyMutation(liveKey);
           }
         }
+        for (const inflightKey of Array.from(this.inflight.keys())) {
+          if (inflightKey.startsWith(pfx)) {
+            this._bumpKeyMutation(inflightKey);
+            this.inflight.delete(inflightKey);
+          }
+        }
+        this._addPatternTombstone(pfx);
         this.l1.deletePattern(k);
       } else {
         this._bumpKeyMutation(k);
+        this.inflight.delete(k);
         this.l1.delete(k);
         this._pendingDiskDeletes.add(k);
         setImmediate(() => {
@@ -2996,10 +3056,18 @@ export class CacheService {
             this._bumpKeyMutation(liveKey);
           }
         }
+        for (const inflightKey of Array.from(this.inflight.keys())) {
+          if (inflightKey.startsWith(pfx)) {
+            this._bumpKeyMutation(inflightKey);
+            this.inflight.delete(inflightKey);
+          }
+        }
+        this._addPatternTombstone(pfx);
         this.l1.deletePattern(k);
-        // Disk-tier pattern delete is not supported (files are keyed by SHA-256 hash);
-        // prefix-scoped clears only evict from L1, matching existing delete('glob*') semantics.
       } else {
+        this._globalEpoch++;
+        this.inflight.clear();
+        this._patternTombstones.length = 0;
         this.l1.clear();
         if (!this._diskDisabled) this.disk.clear();
         this._l1Counters.clear();
@@ -3212,7 +3280,10 @@ export class CacheService {
     }
 
     // 2. L1.5 Disk
-    if (!this._diskDisabled && !this._pendingDiskDeletes.has(k) && this.watchdog.isDiskAllowed()) {
+    if (!this._diskDisabled && !this._pendingDiskDeletes.has(k)) {
+      if (this._isTombstonedByPattern(k)) {
+        try { this.disk.delete(k); } catch { /* ok */ }
+      } else if (this.watchdog.isDiskAllowed()) {
       const diskStart = performance.now();
       const diskHit = this.disk.load(k);
       const diskElapsed = performance.now() - diskStart;
@@ -3238,6 +3309,7 @@ export class CacheService {
         }
       }
     }
+  }
 
     // 3. L2 Redis
     if (!this._redisDisabled && !this.cb.isOpen) {
@@ -3360,6 +3432,10 @@ export class CacheService {
         for (let j = missKeys.length - 1; j >= 0; j--) {
           const k = this.nk(missKeys[j]);
           if (this._pendingDiskDeletes.has(k)) continue;
+          if (this._isTombstonedByPattern(k)) {
+            try { this.disk.delete(k); } catch { /* ok */ }
+            continue;
+          }
           if (!this.watchdog.isDiskAllowed()) continue;
           const diskStart = performance.now();
           const diskHit = this.disk.load(k);
@@ -3582,7 +3658,7 @@ export class CacheService {
           const current = this.tagVersions.get(tag)?.version ?? 0;
           newVer = current + 1;
         }
-        this._setLocalTagVersion(tag, newVer, Date.now());
+        this._setLocalTagVersion(tag, newVer, performance.now());
         if (this.opts.awaitInvalidationBackplane) {
           await this.publishInvalidation('tag_incr', tag, newVer, false, true);
         } else {
@@ -3650,7 +3726,7 @@ export class CacheService {
     if (tags.length === 1) { await this.invalidateTag(tags[0]); return; }
 
     if (this.opts.tagStrategy === 'generational') {
-      const now = Date.now();
+      const now = performance.now();
       if (!this._redisDisabled) {
         try {
           const client = await this.getRedis();
@@ -3972,6 +4048,10 @@ export class CacheService {
         }
       } catch (err) {
         if ((err as Error).message.startsWith('Failed to acquire lock')) throw err;
+        const failClosed = options?.failClosedOnRedisError ?? this.opts.lockFailClosed;
+        if (failClosed) {
+          throw new Error(`Distributed lock acquisition failed for resource "${resourceKey}" due to Redis error: ${(err as Error).message}`);
+        }
         this.logger.debug('Distributed lock: Redis error, falling back to in-process mutex', {
           resourceKey, error: (err as Error).message,
         });

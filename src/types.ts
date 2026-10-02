@@ -685,6 +685,15 @@ export interface CacheOptions {
    */
   awaitInvalidationBackplane?: boolean;
 
+  /**
+   * If `true`, `cache.lock()` operations fail closed (throw an Error) if Redis
+   * encounters a connection or runtime error during lock acquisition, preventing
+   * split-brain concurrent execution across multiple cluster nodes.
+   *
+   * Default: `false` (falls back to local in-process mutex with a debug log).
+   */
+  lockFailClosed?: boolean;
+
   // ── Multi-Region / Cross-Cluster Invalidation Relay ─────────────────────
   /**
    * Optional cross-region invalidation relay configuration for geo-distributed deployments.
@@ -1107,6 +1116,12 @@ export interface LockOptions {
    * Default: `100` ms.
    */
   retryInterval?: number;
+  /**
+   * If `true`, lock acquisition will throw an error immediately if Redis encounters a
+   * connection or operational error rather than falling back to an in-process mutex.
+   * Overrides `CacheOptions.lockFailClosed`.
+   */
+  failClosedOnRedisError?: boolean;
 }
 
 /**
