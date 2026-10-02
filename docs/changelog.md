@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-10-02
+
+### Added
+- **First-Class Node.js Hono Middleware Adapter (`src/hono/index.ts`, `tricache/hono`)** ([#9](https://github.com/Kareem411/TriCache/issues/9), [#45](https://github.com/Kareem411/TriCache/pull/45)):
+  - Dedicated package entry `tricache/hono` exporting `cacheMiddleware` and `createHonoMiddleware` for Node.js runtimes.
+  - Backed directly by Node `CacheService` with full three-tier caching (L1 RAM → L1.5 NVMe `/dev/shm` → L2 Redis), SWR background revalidation, and generational tag invalidation.
+  - Weak ETag generation (`W/"..."`), RFC 7232 `If-None-Match` conditional 304 Not Modified responses, deterministic query sorting, header whitelisting, and non-2xx status response gating.
+  - Comprehensive unit test coverage in `tests/hono.test.ts`.
+- **Drizzle ORM Query Caching Reference Example (`examples/drizzle-orm/`)** ([#28](https://github.com/Kareem411/TriCache/issues/28), [#37](https://github.com/Kareem411/TriCache/pull/37)):
+  - Full runnable SQLite + Drizzle reference demonstration showcasing `withCache` query extension.
+  - Demonstrates deterministic SQL query text + bind parameters fingerprinting (`generateDrizzleCacheKey`), background SWR revalidation (`swr: 60`), and tag invalidation across table mutations (`cache.invalidateTag('users')`).
+  - Automated verification test suite in `tests/drizzle-orm-example.test.ts`.
+- **Fastify REST API Reference Example (`examples/fastify-api/`)** ([#26](https://github.com/Kareem411/TriCache/issues/26), [#38](https://github.com/Kareem411/TriCache/pull/38)):
+  - Complete runnable Fastify REST API demo illustrating `createFastifyPlugin` (global application hook) and `fastifyCache` (route-level `preHandler` hook).
+  - Demonstrates `onRequest` short-circuiting, `onSend` response payload capture, weak ETags, and 304 conditional responses.
+  - Automated verification test suite in `tests/fastify-api-example.test.ts`.
+- **Hono & Cloudflare Workers Edge Caching Demo (`examples/edge-hono/`)** ([#27](https://github.com/Kareem411/TriCache/issues/27), [#39](https://github.com/Kareem411/TriCache/pull/39)):
+  - Standalone Cloudflare Workers + Wrangler reference architecture demonstrating `tricache/edge`.
+  - Pure Web Standards execution (`Request`, `Response`, `crypto.subtle`) with zero Node native dependencies.
+  - In-memory `Murmur3BloomFilter` defense against cold miss penetration.
+- **NestJS 11 Microservice Reference Example (`examples/nestjs-microservice/`)** ([#29](https://github.com/Kareem411/TriCache/issues/29), [#40](https://github.com/Kareem411/TriCache/pull/40)):
+  - Runnable NestJS 11 TypeScript service demonstrating `TriCacheModule.register()`.
+  - Method-level `@Cacheable({ ttl, tags })` and `@CacheEvict({ tags })` decorators, plus `@nestjs/cache-manager` v5/v6 store compatibility via `TriCacheStore`.
+  - Automated verification test suite in `tests/nestjs-microservice-example.test.ts`.
+- **Prometheus Observability Recipe & Express API Demo** ([#30](https://github.com/Kareem411/TriCache/issues/30), [#31](https://github.com/Kareem411/TriCache/pull/31), [#25](https://github.com/Kareem411/TriCache/issues/25), [#35](https://github.com/Kareem411/TriCache/pull/35)):
+  - Complete Prometheus `/metrics` scraping recipe with Grafana dashboard configuration (`docs/recipes/prometheus-metrics.md`).
+  - Production Express microservice demo in `examples/express-api/` with weak ETags and 304 validation.
+
+### Fixed
+- **Hono Edge Response Assignment (`src/edge/hono.ts`)** ([#39](https://github.com/Kareem411/TriCache/pull/39)):
+  - Fixed an issue where Hono's `compose` ignored middleware return values once `next()` sets `c.res`. Explicitly assigns `c.res = response` via `applyEdgeResponse` so weak ETags and 304s are preserved on both cache misses and hits.
+- **Windows Named Pipe Discovery & CLI Top Error Handling (`src/cli.ts`, `src/ipc-telemetry.ts`)**:
+  - Improved Windows named pipe path resolution (`\\.\pipe\tricache-<pid>`) and graceful error handling during `tricache top` monitoring.
+
 ## [0.8.0] — 2026-09-16
 
 ### Added

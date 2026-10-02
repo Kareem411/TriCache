@@ -168,6 +168,25 @@ describe('Decoupled Hono Edge Middleware - Phase 2', () => {
       expect(res2.headers['ETag']).toBe(etag);
     });
 
+    it('replaces a Hono-finalized downstream Response so the miss path still emits ETag', async () => {
+      const middleware = honoEdgeCache({ cache: edgeCache, ttl: 60 });
+      const c = createMockHonoContext('/api/finalized-miss');
+      Object.defineProperty(c, 'finalized', { value: true, writable: true });
+
+      await middleware(c, async () => {
+        c.res = new Response(JSON.stringify({ miss: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+
+      const res = c.getResult();
+      expect(res.status).toBe(200);
+      expect(res.headers['ETag']?.startsWith('W/"')).toBe(true);
+      expect(c.res).toBeInstanceOf(Response);
+      expect((c.res as Response).headers.get('ETag')).toBe(res.headers['ETag']);
+    });
+
     it('bypasses cache when Cache-Control: no-store is passed', async () => {
       const middleware = honoEdgeCache({ cache: edgeCache, ttl: 60 });
       let callCount = 0;

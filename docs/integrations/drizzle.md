@@ -4,6 +4,20 @@
 
 TriCache provides a lightweight query wrapper for Drizzle ORM (`withCache`) that transparently caches query results using deterministic SQL + parameterized argument hashing.
 
+### Ready-to-run SQLite demo
+
+A self-contained TypeScript project lives at [`examples/drizzle-orm`](https://github.com/Kareem411/TriCache/tree/main/examples/drizzle-orm). It exercises query fingerprinting (`generateDrizzleCacheKey`), background SWR (`swr: 60`), and `cache.invalidateTag('users')` after mutations.
+
+```bash
+pnpm install && pnpm build
+cd examples/drizzle-orm
+pnpm install
+pnpm seed
+pnpm demo
+```
+
+Then follow the printed walkthrough (or `pnpm verify`) in that README.
+
 ---
 
 ## Usage
@@ -25,9 +39,9 @@ const query = db
 // Execute or return from TriCache
 const admins = await withCache(query, {
   cache,
-  ttlSec: 600,         // 10-minute hard TTL
-  swrSec: 60,          // 60-second SWR soft TTL
-  tags: ['admins'],    // Generational invalidation tag
+  ttl: 600,            // 10-minute hard TTL (WrapOptions.ttl, seconds)
+  swr: 60,             // 60-second SWR grace (WrapOptions.swr, seconds)
+  tags: ['admins'],    // Semantic tag for cache.invalidateTag()
 });
 ```
 

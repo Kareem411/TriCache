@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tricache-edge-hono",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-19",
+  // Intentionally no nodejs_compat — tricache/edge is Web Standards only
+  // (Request, Response, crypto.subtle). Do not import tricache (Node) from this Worker.
+  "vars": {
+    "ORIGIN_LATENCY_MS": "250"
+  }
+}
