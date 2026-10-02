@@ -705,8 +705,8 @@ describe('invalidateTags() batch invalidation', () => {
 
   it('is equivalent to calling invalidateTag() for each tag individually', async () => {
     const dir1 = tempDir(); const dir2 = tempDir();
-    const s1 = CacheService.reset({ disableRedis: true, diskCacheDir: dir1 });
-    const s2 = CacheService.reset({ disableRedis: true, diskCacheDir: dir2 });
+    const s1 = CacheService.reset({ namespace: 'tag_batch_1', disableRedis: true, diskCacheDir: dir1 });
+    const s2 = CacheService.reset({ namespace: 'tag_batch_2', disableRedis: true, diskCacheDir: dir2 });
     try {
       for (const s of [s1, s2]) {
         await s.set('p:1', 'v', 60, undefined, { tags: ['alpha'] });

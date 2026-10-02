@@ -675,6 +675,16 @@ export interface CacheOptions {
    */
   useShardedPubSub?: boolean;
 
+  /**
+   * If true, await backplane invalidation broadcasts during delete(), set(),
+   * clear(), and invalidateTag() operations rather than firing them in the background.
+   * Guarantees that remote cluster nodes receive the invalidation before the
+   * operation resolves to the caller.
+   *
+   * Default: `false` (asynchronous fire-and-forget for minimal caller latency).
+   */
+  awaitInvalidationBackplane?: boolean;
+
   // ── Multi-Region / Cross-Cluster Invalidation Relay ─────────────────────
   /**
    * Optional cross-region invalidation relay configuration for geo-distributed deployments.

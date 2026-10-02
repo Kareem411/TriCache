@@ -469,6 +469,7 @@ export class CacheService {
     redisHost: string; redisPort: number; redisTls: boolean; disableRedis: boolean;
     encryptionKey: string | undefined; encryptionMode: 'aes-256-gcm' | 'aes-128-gcm' | 'aes-128-ctr' | 'xor' | undefined; snapshotPath: string; snapshotMaxAgeMs: number;
     invalidationBackplane: boolean;
+    awaitInvalidationBackplane: boolean;
     oomProtection: boolean; oomHeapThreshold: number;
     oomCheckIntervalMs: number; oomEvictPercent: number;
     onMetrics: ((m: CacheMetrics) => void) | undefined;
@@ -573,6 +574,28 @@ export class CacheService {
   private streamClient:        AnyRedisClient | null = null;
   private _lastStreamId = '$';
   private _destroyed = false;
+  private readonly _pendingDiskDeletes = new Set<string>();
+  private readonly _keyMutationEpochs = new Map<string, number>();
+
+  private _assertActive(operation: string): void {
+    if (this._destroyed) {
+      throw new Error(`TriCacheError: Cannot perform '${operation}' on a destroyed CacheService instance (namespace: '${this._namespace || "(default)"}').`);
+    }
+  }
+
+  private _bumpKeyMutation(namespacedKey: string): number {
+    const next = (this._keyMutationEpochs.get(namespacedKey) ?? 0) + 1;
+    this._keyMutationEpochs.set(namespacedKey, next);
+    if (this._keyMutationEpochs.size > 50_000) {
+      const oldest = this._keyMutationEpochs.keys().next().value;
+      if (oldest !== undefined) this._keyMutationEpochs.delete(oldest);
+    }
+    return next;
+  }
+
+  private _getKeyMutationEpoch(namespacedKey: string): number {
+    return this._keyMutationEpochs.get(namespacedKey) ?? 0;
+  }
   private _ipcServer?: IpcTelemetryServer;
   /** Timestamp (Date.now()) when the backplane subscriber last lost its connection. */
   private _subDisconnectedAt:  number | null = null;
@@ -679,6 +702,7 @@ export class CacheService {
         os.tmpdir(), ns ? `tricache-snapshot-${ns}.msgpack` : 'tricache-snapshot.msgpack'),
       snapshotMaxAgeMs:         options.snapshotMaxAgeMs ?? DEFAULT_SNAPSHOT_MAX_AGE,
       invalidationBackplane:    options.invalidationBackplane ?? true,
+      awaitInvalidationBackplane: options.awaitInvalidationBackplane ?? false,
       oomProtection:            options.oomProtection      ?? true,
       oomHeapThreshold:         options.oomHeapThreshold   ?? 0.85,
       oomCheckIntervalMs:       options.oomCheckIntervalMs ?? 10_000,
@@ -1082,7 +1106,7 @@ export class CacheService {
     'redisHost', 'redisPort', 'redisTls', 'disableRedis',
     'redisClusterNodes', 'redisSentinel', 'encryptionKey', 'encryptionMode',
     'l1MaxBytes', 'l1MaxEntries', 'namespace', 'frozen', 'adaptiveTtl',
-    'l2WriteMode', 'instanceName', 'invalidationBackplane',
+    'l2WriteMode', 'instanceName', 'invalidationBackplane', 'awaitInvalidationBackplane',
   ];
 
   /** Returns the names of options that differ between `a` and the live `b`. */
@@ -1129,6 +1153,7 @@ export class CacheService {
       frozen:              o.frozen,
       adaptiveTtl:         o.adaptiveTtl,
       invalidationBackplane: o.invalidationBackplane,
+      awaitInvalidationBackplane: o.awaitInvalidationBackplane,
       strictSingleton:     o.strictSingleton,
       remoteSnapshot:      o.remoteSnapshot,
       crossRegion:         o.crossRegion,
@@ -1447,10 +1472,25 @@ export class CacheService {
   private _applyInvalidationEvent(op: string, key: string, tagVersion?: number): void {
     if (op === 'del') {
       this.l1.delete(key);
-      setImmediate(() => { if (!this._diskDisabled) this.disk.delete(key); });
+      this._bumpKeyMutation(key);
+      this._pendingDiskDeletes.add(key);
+      setImmediate(() => {
+        try {
+          if (!this._diskDisabled) this.disk.delete(key);
+        } finally {
+          this._pendingDiskDeletes.delete(key);
+        }
+      });
       this._cascadeDependencies(key);
     } else if (op === 'del-glob') {
       this.l1.deletePattern(key);
+      // Invalidate in-flight mutations for any known live keys matching pattern
+      const pfx = key.endsWith('*') ? key.slice(0, -1) : key;
+      for (const liveKey of this.l1.liveKeys()) {
+        if (liveKey.startsWith(pfx)) {
+          this._bumpKeyMutation(liveKey);
+        }
+      }
     } else if (op === 'tag_incr') {
       const tag = key;
       const ver = typeof tagVersion === 'number' ? tagVersion : ((this.tagVersions.get(tag)?.version ?? 0) + 1);
@@ -1497,7 +1537,11 @@ export class CacheService {
     if (!isCrossRegionRelay && this.opts.crossRegion) {
       const shouldBroadcast = isExplicitInvalidation || Boolean(this.opts.crossRegion.broadcastOnSet);
       if (shouldBroadcast) {
-        void this._broadcastCrossRegion(op, key, tagVersion);
+        if (this.opts.awaitInvalidationBackplane) {
+          await this._broadcastCrossRegion(op, key, tagVersion);
+        } else {
+          void this._broadcastCrossRegion(op, key, tagVersion);
+        }
       }
     }
     if (!this.opts.invalidationBackplane || this._redisDisabled) return;
@@ -1535,7 +1579,12 @@ export class CacheService {
         );
       }
       this.counters.invSent++;
-    } catch { /* non-critical — never block the caller */ }
+    } catch (err) {
+      this.logger.warn('Backplane invalidation publish failed', { op, key, error: (err as Error).message });
+      if (this.opts.awaitInvalidationBackplane) {
+        throw err;
+      }
+    }
   }
 
   private _markCrossRegionEventSeen(id: string): void {
@@ -1776,6 +1825,7 @@ export class CacheService {
   }
 
   private async getRedis(): Promise<AnyRedisClient> {
+    this._assertActive('getRedis');
     if (!this.cb.isAllowed()) throw new Error('tricache: L2 circuit breaker is open');
     if (this.redis) return this.redis;
     if (this.redisConnecting) return this.redisConnecting;
@@ -2152,6 +2202,7 @@ export class CacheService {
       tags?:        string[];
     } = {},
   ): Promise<T> {
+    this._assertActive('get');
     const span = this._startSpan('tricache.get');
     if (this.opts.tracer) span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
     const k = this.nk(cacheKey); // namespaced key used for all storage
@@ -2192,7 +2243,14 @@ export class CacheService {
           if (swrGraceMs > 0 && !this.revalidating.has(k)) {
             const priority = optPriority ?? inferPriority(cacheKey);
             this.revalidating.add(k);
-            void this._revalidate(k, fetchFn, ttlSeconds * 1_000, swrGraceMs, priority);
+            void this._revalidate(
+              k,
+              fetchFn,
+              ttlSeconds * 1_000,
+              swrGraceMs,
+              priority,
+              l1Hit.tagVersions ?? (optTags ? Object.fromEntries(optTags.map(t => [t, 0])) : undefined),
+            );
             this.counters.swrRevalidations++;
             this.logger.debug('SWR: serving stale, revalidating', { cacheKey });
           } else {
@@ -2217,7 +2275,14 @@ export class CacheService {
             if ((shouldRefreshAhead || shouldXFetch) && !this.revalidating.has(k)) {
               const priority = optPriority ?? inferPriority(cacheKey);
               this.revalidating.add(k);
-              void this._revalidate(k, fetchFn, entryTtl, optSwr * 1_000, priority);
+              void this._revalidate(
+                k,
+                fetchFn,
+                entryTtl,
+                optSwr * 1_000,
+                priority,
+                l1Hit.tagVersions ?? (optTags ? Object.fromEntries(optTags.map(t => [t, 0])) : undefined),
+              );
               this.counters.swrRevalidations++;
               this.logger.debug(
                 shouldXFetch ? 'XFetch: proactive background recompute' : 'Refresh-ahead: proactive background recompute',
@@ -2257,10 +2322,11 @@ export class CacheService {
       return existing as Promise<T>;
     }
 
+    const mutationEpochAtStart = this._getKeyMutationEpoch(k);
     const executionPromise: Promise<T> = (async () => {
       try {
         // ── Tier 1.5: disk tier (evicted L1 entries) — protected by latency watchdog ──
-        if (!this._diskDisabled) {
+        if (!this._diskDisabled && !this._pendingDiskDeletes.has(k)) {
           const isDiskAllowed = this.watchdog.isDiskAllowed();
           if (isDiskAllowed) {
             const diskStart = performance.now();
@@ -2430,6 +2496,15 @@ export class CacheService {
           }
         }
 
+        if (this._getKeyMutationEpoch(k) !== mutationEpochAtStart) {
+          this.logger.debug('Aborting in-flight cache commit — key was mutated or deleted during fetch', { cacheKey });
+          span.setAttribute('cache.aborted_mutation_race', true);
+          if (this.opts.frozen) deepFreeze(data);
+          return (this.opts.cloneStrategy === 'structuredClone' && data != null && typeof data === 'object')
+            ? structuredClone(data)
+            : data;
+        }
+
         this.l1.set(k, data, storeTtl, priority, staleAt, delta, activeTagVersions);
 
         if (!this._redisDisabled) {
@@ -2565,25 +2640,47 @@ export class CacheService {
     ttlMs:     number,
     swrGraceMs: number,
     priority:  CachePriority,
+    knownTagVersions?: Record<string, number>,
   ): Promise<void> {
+    const startEpoch = this._getKeyMutationEpoch(cacheKey);
     try {
       const fetchStart = Date.now();
       const data       = await fetchFn();
       const delta      = Date.now() - fetchStart;
       const staleAt    = Date.now() + ttlMs;
 
+      // Invalidation fence: if the key was deleted or mutated while fetchFn was in-flight, abort commit!
+      if (this._getKeyMutationEpoch(cacheKey) !== startEpoch) {
+        this.logger.debug('SWR: aborting revalidation commit — key was mutated or deleted during fetch', { cacheKey });
+        return;
+      }
+
       // Keep the latency tracker current during SWR background revalidations too
       if (this.latencyTracker && data != null) this.latencyTracker.record(cacheKey, delta);
 
       let activeTagVersions: Record<string, number> | undefined;
       const l1Existing = this.l1.get(cacheKey);
-      if (this.opts.tagStrategy === 'generational' && l1Existing?.tagVersions) {
-        const tags = Object.keys(l1Existing.tagVersions);
+      const tagVersionsSource = l1Existing?.tagVersions ?? knownTagVersions;
+      if (this.opts.tagStrategy === 'generational' && tagVersionsSource) {
+        const tags = Object.keys(tagVersionsSource);
         const vers = await Promise.all(tags.map(tag => this._getTagVersion(tag)));
         activeTagVersions = {};
         for (let i = 0; i < tags.length; i++) {
           activeTagVersions[tags[i]] = vers[i];
         }
+        if (knownTagVersions) {
+          for (const t of tags) {
+            if (knownTagVersions[t] !== undefined && activeTagVersions[t] !== knownTagVersions[t]) {
+              this.logger.debug('SWR: aborting revalidation commit — tag version bumped during revalidation', { cacheKey, tag: t });
+              return;
+            }
+          }
+        }
+      }
+
+      if (this._getKeyMutationEpoch(cacheKey) !== startEpoch) {
+        this.logger.debug('SWR: aborting revalidation commit — key was mutated or deleted during tag resolution', { cacheKey });
+        return;
       }
 
       this.l1.set(cacheKey, data, ttlMs + swrGraceMs, priority, staleAt, delta, activeTagVersions);
@@ -2629,6 +2726,7 @@ export class CacheService {
 
   /** Explicitly write a value into L1 (+ L2 in production). */
   async set<T>(cacheKey: string, data: T, ttlSeconds = 300, priority?: CachePriority, opts?: { tags?: string[]; dependsOn?: string[] }): Promise<void> {
+    this._assertActive('set');
     const span  = this._startSpan('tricache.set');
     if (this.opts.tracer) {
       span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
@@ -2642,6 +2740,8 @@ export class CacheService {
       const ttlMs = this._jitterTtl(effectiveTtlSeconds * 1_000);
       const p     = priority ?? inferPriority(cacheKey);
       const k     = this.nk(cacheKey);
+      this._bumpKeyMutation(k);
+      this._pendingDiskDeletes.delete(k);
       this.counters.sets++;
 
       let activeTagVersions: Record<string, number> | undefined;
@@ -2700,7 +2800,11 @@ export class CacheService {
         }
       }
 
-      void this.publishInvalidation('del', k);
+      if (this.opts.awaitInvalidationBackplane) {
+        await this.publishInvalidation('del', k);
+      } else {
+        void this.publishInvalidation('del', k);
+      }
     } catch (err) {
       span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
       span.recordException?.(err);
@@ -2744,6 +2848,7 @@ export class CacheService {
    * await cache.delete('user:abc:*');              // all keys for user abc
    */
   async delete(cacheKey: string): Promise<void> {
+    this._assertActive('delete');
     const span      = this._startSpan('tricache.delete');
     if (this.opts.tracer) span.setAttribute('cache.key_prefix', cacheKey.split(':')[0]);
     try {
@@ -2752,16 +2857,24 @@ export class CacheService {
       this.counters.deletes++;
 
       if (isPattern) {
+        const pfx = k.endsWith('*') ? k.slice(0, -1) : k;
+        for (const liveKey of this.l1.liveKeys()) {
+          if (liveKey.startsWith(pfx)) {
+            this._bumpKeyMutation(liveKey);
+          }
+        }
         this.l1.deletePattern(k);
       } else {
+        this._bumpKeyMutation(k);
         this.l1.delete(k);
-        // Defer the synchronous SHA-256 hash + fs syscalls to the next event-loop tick so
-        // the caller's await resolves without blocking.  Matches what the backplane handler
-        // already does for remote invalidations: setImmediate(() => this.disk.delete(msg.key)).
-        // A re-get in the narrow window before the deferred call fires would get an L1 miss
-        // and promote the disk entry back — acceptable for a cache (same trade-off the backplane
-        // path already accepts).
-        setImmediate(() => { if (!this._diskDisabled) this.disk.delete(k); });
+        this._pendingDiskDeletes.add(k);
+        setImmediate(() => {
+          try {
+            if (!this._diskDisabled) this.disk.delete(k);
+          } finally {
+            this._pendingDiskDeletes.delete(k);
+          }
+        });
         // Cascade: invalidate any key that declared it depends on this exact key's pattern
         this._cascadeDependencies(k);
         // Clean up: remove k from all dependency registrations (it is gone)
@@ -2788,7 +2901,11 @@ export class CacheService {
         }
       }
 
-      void this.publishInvalidation(isPattern ? 'del-glob' : 'del', k, undefined, false, true);
+      if (this.opts.awaitInvalidationBackplane) {
+        await this.publishInvalidation(isPattern ? 'del-glob' : 'del', k, undefined, false, true);
+      } else {
+        void this.publishInvalidation(isPattern ? 'del-glob' : 'del', k, undefined, false, true);
+      }
     } catch (err) {
       span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
       span.recordException?.(err);
@@ -2817,6 +2934,7 @@ export class CacheService {
    * fleet-wide.
    */
   async increment(cacheKey: string, ttlSeconds?: number): Promise<number> {
+    this._assertActive('increment');
     const k = this.nk(cacheKey);
 
     if (this._redisDisabled) {
@@ -2862,6 +2980,7 @@ export class CacheService {
    * await cache.clear('user:abc'); // flush all keys for one user
    */
   async clear(prefix?: string): Promise<void> {
+    this._assertActive('clear');
     const span = this._startSpan('tricache.clear');
     if (this.opts.tracer) span.setAttribute('cache.prefix', prefix || '*');
     try {
@@ -2871,6 +2990,12 @@ export class CacheService {
         : undefined;
 
       if (k) {
+        const pfx = k.endsWith('*') ? k.slice(0, -1) : k;
+        for (const liveKey of this.l1.liveKeys()) {
+          if (liveKey.startsWith(pfx)) {
+            this._bumpKeyMutation(liveKey);
+          }
+        }
         this.l1.deletePattern(k);
         // Disk-tier pattern delete is not supported (files are keyed by SHA-256 hash);
         // prefix-scoped clears only evict from L1, matching existing delete('glob*') semantics.
@@ -2880,6 +3005,8 @@ export class CacheService {
         this._l1Counters.clear();
         this.tagIndex.clear();
         this.tagVersions.clear();
+        this._pendingDiskDeletes.clear();
+        this._keyMutationEpochs.clear();
       }
 
       if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
@@ -2893,9 +3020,15 @@ export class CacheService {
         }
       }
 
-      void this.publishInvalidation('del-glob',
-        k ?? (this._namespace ? `${this._namespace}:*` : '*'),
-        undefined, false, true);
+      if (this.opts.awaitInvalidationBackplane) {
+        await this.publishInvalidation('del-glob',
+          k ?? (this._namespace ? `${this._namespace}:*` : '*'),
+          undefined, false, true);
+      } else {
+        void this.publishInvalidation('del-glob',
+          k ?? (this._namespace ? `${this._namespace}:*` : '*'),
+          undefined, false, true);
+      }
     } catch (err) {
       span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
       span.recordException?.(err);
@@ -2911,6 +3044,7 @@ export class CacheService {
    * Returns the number of entries evicted.
    */
   rebalance(): number {
+    this._assertActive('rebalance');
     return this.l1.rebalance();
   }
 
@@ -2920,6 +3054,7 @@ export class CacheService {
    * Only reflects L1 state — does not query Redis or disk.
    */
   ttl(cacheKey: string): number | null {
+    this._assertActive('ttl');
     return this.l1.ttl(this.nk(cacheKey));
   }
 
@@ -2928,6 +3063,7 @@ export class CacheService {
    * Bloom-filter fast path — no fetch, no disk or Redis round-trip.
    */
   has(cacheKey: string): boolean {
+    this._assertActive('has');
     return this.l1.has(this.nk(cacheKey));
   }
 
@@ -2940,6 +3076,7 @@ export class CacheService {
    * for (const key of cache.keys()) console.log(key);
    */
   *keys(): Generator<string> {
+    this._assertActive('keys');
     const prefix = this._namespace ? this._namespace + ':' : '';
     for (const key of this.l1.liveKeys()) {
       if (prefix && !key.startsWith(prefix)) continue;
@@ -2955,6 +3092,7 @@ export class CacheService {
    * for (const val of cache.values<User>()) console.log(val.id);
    */
   *values<T = unknown>(): Generator<T> {
+    this._assertActive('values');
     const prefix = this._namespace ? this._namespace + ':' : '';
     if (!prefix) {
       yield* this.l1.liveValues() as Generator<T>;
@@ -2974,6 +3112,7 @@ export class CacheService {
    * for (const [key, val] of cache.entries<User>()) console.log(key, val.id);
    */
   *entries<T = unknown>(): Generator<[string, T]> {
+    this._assertActive('entries');
     const prefix = this._namespace ? this._namespace + ':' : '';
     for (const [key, entry] of this.l1.liveEntries()) {
       if (prefix && !key.startsWith(prefix)) continue;
@@ -3002,6 +3141,7 @@ export class CacheService {
    *           `offset`  — `rawKey.slice(offset)` gives the bare key without namespace.
    */
   scan<T = unknown>(fn: (rawKey: string, value: T, offset: number) => void): void {
+    this._assertActive('scan');
     const prefixLen = this._namespace ? this._namespace.length + 1 : 0;
     this.l1.scan((key, entry, pfx) => {
       const value = (entry.value !== undefined ? entry.value : entry.data) as T;
@@ -3016,6 +3156,7 @@ export class CacheService {
    * @param newTtlSeconds - The new TTL from now, in seconds.
    */
   async touch(cacheKey: string, newTtlSeconds: number): Promise<boolean> {
+    this._assertActive('touch');
     const k   = this.nk(cacheKey);
     const hit = this.l1.touch(k, newTtlSeconds * 1_000);
     if (hit && !this._redisDisabled) {
@@ -3036,6 +3177,7 @@ export class CacheService {
    * if (fresh !== null) return fresh; // serve from L1, no network hop
    */
   getIfFresh<T = unknown>(cacheKey: string): T | null {
+    this._assertActive('getIfFresh');
     const k     = this.nk(cacheKey);
     const entry = this.l1.getEntry(k);
     if (!entry) return null;
@@ -3054,6 +3196,7 @@ export class CacheService {
    * const val = await cache.peek<User>('user:123');
    */
   async peek<T = unknown>(cacheKey: string): Promise<T | null> {
+    this._assertActive('peek');
     const k = this.nk(cacheKey);
 
     // 1. L1 RAM
@@ -3069,7 +3212,7 @@ export class CacheService {
     }
 
     // 2. L1.5 Disk
-    if (!this._diskDisabled && this.watchdog.isDiskAllowed()) {
+    if (!this._diskDisabled && !this._pendingDiskDeletes.has(k) && this.watchdog.isDiskAllowed()) {
       const diskStart = performance.now();
       const diskHit = this.disk.load(k);
       const diskElapsed = performance.now() - diskStart;
@@ -3139,6 +3282,7 @@ export class CacheService {
     ttl: number | ((key: string) => number) = 300,
     priority?: CachePriority,
   ): Promise<(T | undefined)[]> {
+    this._assertActive('mget');
     const span = this._startSpan('tricache.mget');
     if (this.opts.tracer) {
       span.setAttribute('cache.batch.size', keys.length);
@@ -3214,8 +3358,9 @@ export class CacheService {
       // ── Tier 1.5: disk spill (evicted L1 entries) ──
       if (!this._diskDisabled && missKeys.length > 0) {
         for (let j = missKeys.length - 1; j >= 0; j--) {
-          if (!this.watchdog.isDiskAllowed()) continue;
           const k = this.nk(missKeys[j]);
+          if (this._pendingDiskDeletes.has(k)) continue;
+          if (!this.watchdog.isDiskAllowed()) continue;
           const diskStart = performance.now();
           const diskHit = this.disk.load(k);
           const diskElapsed = performance.now() - diskStart;
@@ -3303,6 +3448,7 @@ export class CacheService {
   async mset<T = unknown>(
     entries: Record<string, { value: T; ttl?: number; priority?: CachePriority; tags?: string[]; dependsOn?: string[] }>,
   ): Promise<void> {
+    this._assertActive('mset');
     const span = this._startSpan('tricache.mset');
     const keys = Object.keys(entries);
     if (this.opts.tracer) {
@@ -3331,6 +3477,7 @@ export class CacheService {
    * await cache.mdel(['user:1', 'user:2', 'user:3']);
    */
   async mdel(keys: string[]): Promise<void> {
+    this._assertActive('mdel');
     const span = this._startSpan('tricache.mdel');
     if (this.opts.tracer) {
       span.setAttribute('cache.batch.size', keys.length);
@@ -3359,6 +3506,7 @@ export class CacheService {
    * console.log(`Warmed ${loaded} keys from Redis`);
    */
   async warmFromL2(pattern: string, opts?: { priority?: CachePriority }): Promise<number> {
+    this._assertActive('warmFromL2');
     if (this._redisDisabled) return 0;
     try {
       const client  = await this.getRedis();
@@ -3412,6 +3560,7 @@ export class CacheService {
    * await cache.invalidateTag('catalog'); // clears product:1 and any other tagged entries
    */
   async invalidateTag(tag: string): Promise<void> {
+    this._assertActive('invalidateTag');
     const span = this._startSpan('tricache.invalidate_tag');
     if (this.opts.tracer) {
       span.setAttribute('cache.tag', tag);
@@ -3434,7 +3583,11 @@ export class CacheService {
           newVer = current + 1;
         }
         this._setLocalTagVersion(tag, newVer, Date.now());
-        void this.publishInvalidation('tag_incr', tag, newVer, false, true);
+        if (this.opts.awaitInvalidationBackplane) {
+          await this.publishInvalidation('tag_incr', tag, newVer, false, true);
+        } else {
+          void this.publishInvalidation('tag_incr', tag, newVer, false, true);
+        }
         return;
       }
 
@@ -3444,7 +3597,15 @@ export class CacheService {
       // Remove from L1 + disk
       for (const k of members) {
         this.l1.delete(k);
-        if (!this._diskDisabled) this.disk.delete(k);
+        this._bumpKeyMutation(k);
+        this._pendingDiskDeletes.add(k);
+        setImmediate(() => {
+          try {
+            if (!this._diskDisabled) this.disk.delete(k);
+          } finally {
+            this._pendingDiskDeletes.delete(k);
+          }
+        });
       }
       this.tagIndex.delete(tagKey);
 
@@ -3484,6 +3645,7 @@ export class CacheService {
    * await cache.invalidateTags(['case:acme', 'org:acme', 'ai-chat:acme']);
    */
   async invalidateTags(tags: string[]): Promise<void> {
+    this._assertActive('invalidateTags');
     if (tags.length === 0) return;
     if (tags.length === 1) { await this.invalidateTag(tags[0]); return; }
 
@@ -3499,7 +3661,11 @@ export class CacheService {
             const [err, newVer] = results[i] ?? [null, null];
             const ver = (!err && typeof newVer === 'number') ? newVer : (this.tagVersions.get(tags[i])?.version ?? 0) + 1;
             this._setLocalTagVersion(tags[i], ver, now);
-            void this.publishInvalidation('tag_incr', tags[i], ver, false, true);
+            if (this.opts.awaitInvalidationBackplane) {
+              await this.publishInvalidation('tag_incr', tags[i], ver, false, true);
+            } else {
+              void this.publishInvalidation('tag_incr', tags[i], ver, false, true);
+            }
           }
           return;
         } catch (err) {
@@ -3509,7 +3675,11 @@ export class CacheService {
       for (const tag of tags) {
         const ver = (this.tagVersions.get(tag)?.version ?? 0) + 1;
         this._setLocalTagVersion(tag, ver, now);
-        void this.publishInvalidation('tag_incr', tag, ver, false, true);
+        if (this.opts.awaitInvalidationBackplane) {
+          await this.publishInvalidation('tag_incr', tag, ver, false, true);
+        } else {
+          void this.publishInvalidation('tag_incr', tag, ver, false, true);
+        }
       }
       return;
     }
@@ -3526,7 +3696,15 @@ export class CacheService {
     }
     for (const k of allMembers) {
       this.l1.delete(k);
-      this.disk.delete(k);
+      this._bumpKeyMutation(k);
+      this._pendingDiskDeletes.add(k);
+      setImmediate(() => {
+        try {
+          if (!this._diskDisabled) this.disk.delete(k);
+        } finally {
+          this._pendingDiskDeletes.delete(k);
+        }
+      });
     }
 
     if (!this._redisDisabled) {
@@ -3568,6 +3746,7 @@ export class CacheService {
    *          `l2` is `null` when Redis is disabled.
    */
   async ping(): Promise<CachePingResult> {
+    this._assertActive('ping');
     // L1: measure a has() call
     const t0 = Date.now();
     this.l1.has('__ping__');
@@ -3657,6 +3836,7 @@ export class CacheService {
    * Returns the number of keys written.
    */
   async drainToL2(): Promise<number> {
+    this._assertActive('drainToL2');
     if (this._redisDisabled) return 0;
     try {
       const client  = await this.getRedis();
@@ -3705,6 +3885,7 @@ export class CacheService {
    * if (!claimed) return res.status(409).json({ error: 'duplicate request' });
    */
   async setIfAbsent<T>(cacheKey: string, value: T, ttlSeconds = 300, priority?: CachePriority): Promise<boolean> {
+    this._assertActive('setIfAbsent');
     const k = this.nk(cacheKey);
 
     // Fast path: L1 check (process-local, no network hop)
@@ -3729,6 +3910,8 @@ export class CacheService {
 
     const ttlMs = this._jitterTtl(ttlSeconds * 1_000);
     const p     = priority ?? inferPriority(cacheKey);
+    this._bumpKeyMutation(k);
+    this._pendingDiskDeletes.delete(k);
     this.l1.set(k, value, ttlMs, p);
     this.counters.sets++;
     return true;
@@ -3753,6 +3936,7 @@ export class CacheService {
     fn: () => Promise<T>,
     options?: LockOptions,
   ): Promise<T> {
+    this._assertActive('lock');
     const ttlSeconds     = Math.max(1, options?.ttl ?? 30);
     const acquireTimeout = Math.max(0, options?.acquireTimeout ?? 5_000);
     const retryInterval  = Math.max(10, options?.retryInterval ?? 100);
@@ -4162,6 +4346,7 @@ export class CacheService {
    * the previous key for seamless fallback decryption of existing cache entries.
    */
   async rotateEncryptionKey(newKeyBase64: string, newMode?: EncryptionMode): Promise<void> {
+    this._assertActive('rotateEncryptionKey');
     this.enc.rotateKey(newKeyBase64, newMode);
     if (this._workerPool) {
       await this._workerPool.drainAndReinit(this.enc.toWorkerInit());
@@ -4172,6 +4357,8 @@ export class CacheService {
   /** Close Redis connections and stop all background timers. */
   async destroy(): Promise<void> {
     this._destroyed = true;
+    this._pendingDiskDeletes.clear();
+    this._keyMutationEpochs.clear();
     const g = globalThis as Record<string, unknown>;
     const key = CacheService.globalKey(this.opts);
     if (g[key] === this) {
