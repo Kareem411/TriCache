@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitepress';
+import pkg from '../../package.json' with { type: 'json' };
 
 export default defineConfig({
   title: 'TriCache',
@@ -82,7 +83,7 @@ export default defineConfig({
       { text: 'API', link: '/api-reference' },
       { text: 'Benchmarks', link: '/benchmarks' },
       {
-        text: 'v0.8.0',
+        text: `v${pkg.version}`,
         items: [
           { text: 'Changelog', link: '/changelog' },
           { text: 'Contributing Guide', link: '/contributing' },
