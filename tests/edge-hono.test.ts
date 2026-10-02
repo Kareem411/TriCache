@@ -205,5 +205,96 @@ describe('Decoupled Hono Edge Middleware - Phase 2', () => {
       await middleware(c2, async () => downstream(c2));
       expect(callCount).toBe(2);
     });
+
+    it('does not cache responses with response-level Cache-Control: no-store or private', async () => {
+      const middleware = honoEdgeCache({ cache: edgeCache, ttl: 60 });
+      let callCount = 0;
+
+      const downstream = async (c: any) => {
+        callCount++;
+        c.res = new Response(`token-${callCount}`, {
+          status: 200,
+          headers: { 'Cache-Control': 'no-store, private' },
+        });
+      };
+
+      const c1 = createMockHonoContext('/api/edge-private');
+      await middleware(c1, async () => downstream(c1));
+      expect(callCount).toBe(1);
+
+      const c2 = createMockHonoContext('/api/edge-private');
+      await middleware(c2, async () => downstream(c2));
+      expect(callCount).toBe(2);
+    });
+
+    it('never buffers or caches SSE streaming responses (text/event-stream)', async () => {
+      const middleware = honoEdgeCache({ cache: edgeCache, ttl: 60 });
+      let callCount = 0;
+
+      const downstream = async (c: any) => {
+        callCount++;
+        c.res = new Response('data: ping\n\n', {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      };
+
+      const c1 = createMockHonoContext('/api/edge-sse');
+      await middleware(c1, async () => downstream(c1));
+      expect(callCount).toBe(1);
+
+      const c2 = createMockHonoContext('/api/edge-sse');
+      await middleware(c2, async () => downstream(c2));
+      expect(callCount).toBe(2);
+    });
+
+    it('does not cache 206 Partial Content responses on edge', async () => {
+      const middleware = honoEdgeCache({ cache: edgeCache, ttl: 60 });
+      let callCount = 0;
+
+      const downstream = async (c: any) => {
+        callCount++;
+        c.res = new Response('partial-bytes', {
+          status: 206,
+          headers: { 'Content-Type': 'video/mp4' },
+        });
+      };
+
+      const c1 = createMockHonoContext('/video.mp4');
+      await middleware(c1, async () => downstream(c1));
+      expect(callCount).toBe(1);
+
+      const c2 = createMockHonoContext('/video.mp4');
+      await middleware(c2, async () => downstream(c2));
+      expect(callCount).toBe(2);
+    });
+
+    it('preserves custom response headers on cache hit', async () => {
+      const middleware = honoEdgeCache({ cache: edgeCache, ttl: 60 });
+      let callCount = 0;
+
+      const downstream = async (c: any) => {
+        callCount++;
+        c.res = new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Edge-Region': 'iad',
+            'Access-Control-Allow-Origin': '*',
+          },
+        });
+      };
+
+      const c1 = createMockHonoContext('/api/edge-headers');
+      await middleware(c1, async () => downstream(c1));
+      expect(callCount).toBe(1);
+
+      const c2 = createMockHonoContext('/api/edge-headers');
+      await middleware(c2, async () => downstream(c2));
+      expect(callCount).toBe(1);
+      const res2 = c2.getResult();
+      expect(res2.headers['x-edge-region']).toBe('iad');
+      expect(res2.headers['access-control-allow-origin']).toBe('*');
+    });
   });
 });

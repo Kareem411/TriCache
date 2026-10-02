@@ -63,6 +63,7 @@ export interface HonoCacheOptions extends Omit<WrapOptions, 'tags'>, Omit<KeyDer
 export interface CachedHonoResponse {
   body: string;
   contentType?: string;
+  headers?: Record<string, string>;
   etag?: string;
   status: number;
 }
@@ -117,8 +118,15 @@ function toRequestLike(c: HonoCacheContext, headerWhitelist?: string[]) {
   };
 }
 
-function isSuccessStatus(status: number): boolean {
-  return status >= 200 && status < 300;
+function isCacheableStatus(status: number): boolean {
+  // Only standard successful full responses (never 206 Partial Content or non-2xx)
+  return status >= 200 && status < 300 && status !== 206;
+}
+
+function hasNoStoreDirective(cacheControl: string | null | undefined): boolean {
+  if (!cacheControl) return false;
+  const lower = cacheControl.toLowerCase();
+  return lower.includes('no-store') || lower.includes('no-cache') || lower.includes('private');
 }
 
 function applyHonoCachedResponse(
@@ -127,14 +135,17 @@ function applyHonoCachedResponse(
   ifNoneMatch: string | undefined,
 ): unknown {
   if (cached.etag && ifNoneMatch === cached.etag) {
-    const result = c.body(null, 304, { ETag: cached.etag });
+    const notModifiedHeaders: Record<string, string> = { ETag: cached.etag };
+    if (cached.headers?.['cache-control']) notModifiedHeaders['Cache-Control'] = cached.headers['cache-control'];
+    if (cached.headers?.['vary']) notModifiedHeaders['Vary'] = cached.headers['vary'];
+    const result = c.body(null, 304, notModifiedHeaders);
     if (result != null) {
       c.res = result as HonoCacheContext['res'];
     }
     return result;
   }
 
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...cached.headers };
   if (cached.etag) headers['ETag'] = cached.etag;
   if (cached.contentType) headers['Content-Type'] = cached.contentType;
 
@@ -154,6 +165,23 @@ async function snapshotHonoResponse(
     return { body: '', status: 0 };
   }
 
+  const contentType = res.headers?.get?.('content-type') || 'text/plain; charset=utf-8';
+  if (contentType.toLowerCase().includes('text/event-stream')) {
+    // Never buffer or cache Server-Sent Events / infinite streams
+    return { body: '', contentType, status: 0 };
+  }
+
+  const cacheControl = res.headers?.get?.('cache-control');
+  if (hasNoStoreDirective(cacheControl)) {
+    // Response explicitly forbids caching / shared caching
+    return { body: '', contentType, status: 0 };
+  }
+
+  const status = res.status ?? 200;
+  if (!isCacheableStatus(status)) {
+    return { body: '', contentType, status };
+  }
+
   const clone = typeof res.clone === 'function' ? res.clone() : undefined;
   const text = clone && typeof clone.text === 'function'
     ? await clone.text()
@@ -161,22 +189,46 @@ async function snapshotHonoResponse(
       ? res.body
       : '';
 
-  const status = res.status ?? 200;
-  const contentType = res.headers?.get?.('content-type') || 'text/plain; charset=utf-8';
   const bodyEtag = etag ? generateETag(text) : undefined;
+
+  const capturedHeaders: Record<string, string> = {};
+  if (res.headers && typeof (res.headers as any).forEach === 'function') {
+    (res.headers as any).forEach((value: string, name: string) => {
+      const lower = name.toLowerCase();
+      if (
+        lower !== 'content-length' &&
+        lower !== 'transfer-encoding' &&
+        lower !== 'connection' &&
+        lower !== 'etag' &&
+        lower !== 'content-type'
+      ) {
+        capturedHeaders[name] = value;
+      }
+    });
+  }
 
   return {
     body: text,
     contentType,
+    headers: capturedHeaders,
     etag: bodyEtag,
     status,
   };
 }
 
+class NonCacheableHonoResponseError extends Error {
+  readonly isNonCacheable = true;
+  constructor(readonly response: CachedHonoResponse) {
+    super(`Non-cacheable response: status=${response.status}`);
+    this.name = 'NonCacheableHonoResponseError';
+  }
+}
+
 /**
  * Creates a Hono middleware that caches GET/HEAD responses through Node
  * `CacheService`, with Express-aligned ttl/tags/SWR options, weak ETags, and
- * RFC 7232 `If-None-Match` → `304 Not Modified`. Non-2xx responses are never kept.
+ * RFC 7232 `If-None-Match` → `304 Not Modified`. Non-2xx, 206 Partial Content,
+ * private/no-store, and streaming SSE responses are never kept.
  *
  * @example
  * import { Hono } from 'hono';
@@ -204,6 +256,8 @@ export function cacheMiddleware(options: HonoCacheOptions = {}): HonoMiddleware 
     headerWhitelist,
   } = options;
 
+  let resolvedCache = cache;
+
   return async (c, next) => {
     const method = (c.req.method || 'GET').toUpperCase();
     if (method !== 'GET' && method !== 'HEAD') {
@@ -215,11 +269,11 @@ export function cacheMiddleware(options: HonoCacheOptions = {}): HonoMiddleware 
       return await next();
     }
 
-    let activeCache = cache;
-    if (!activeCache) {
+    if (!resolvedCache) {
       const { CacheService } = await import('../cache-service.js');
-      activeCache = CacheService.create();
+      resolvedCache = CacheService.create();
     }
+    const activeCache = resolvedCache;
 
     const key = keyGenerator
       ? keyGenerator(c)
@@ -229,27 +283,32 @@ export function cacheMiddleware(options: HonoCacheOptions = {}): HonoMiddleware 
     const resolvedTags = typeof tags === 'function' ? tags(c) : tags;
 
     let ranNext = false;
-    const cached = await activeCache.get<CachedHonoResponse>(
-      key,
-      async () => {
-        ranNext = true;
-        await next();
-        return snapshotHonoResponse(c, etag);
-      },
-      ttl,
-      { swr, tags: resolvedTags },
-    );
+    try {
+      const cached = await activeCache.get<CachedHonoResponse>(
+        key,
+        async () => {
+          ranNext = true;
+          await next();
+          const snapshot = await snapshotHonoResponse(c, etag);
+          if (!isCacheableStatus(snapshot.status)) {
+            throw new NonCacheableHonoResponseError(snapshot);
+          }
+          return snapshot;
+        },
+        ttl,
+        { swr, tags: resolvedTags },
+      );
 
-    // Status gate: only cache 2xx successful responses
-    if (typeof cached.status === 'number' && !isSuccessStatus(cached.status)) {
-      await activeCache.delete(key).catch(() => {});
-      if (!ranNext) {
-        return await next();
+      return applyHonoCachedResponse(c, cached, ifNoneMatch);
+    } catch (err: unknown) {
+      if (err instanceof NonCacheableHonoResponseError) {
+        if (!ranNext) {
+          return await next();
+        }
+        return;
       }
-      return;
+      throw err;
     }
-
-    return applyHonoCachedResponse(c, cached, ifNoneMatch);
   };
 }
 
