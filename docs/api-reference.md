@@ -176,16 +176,31 @@ async increment(cacheKey: string, ttlSeconds?: number): Promise<number>
 ```
 
 ### `cache.mget<T>(keys, fetchFn?, ttl?, priority?)`
-Pipelined multi-key batch retrieval. Tiers are checked in parallel chunks, resolving misses via `fetchFn(missKeys)` and returning ordered results.
+Differential multi-tier batch retrieval. Cascades through L1 RAM, L2 Redis (pipelined `MULTI`), and L1.5 disk spill, invoking `fetchFn(missKeys)` **only for the true remainder of unfulfilled keys**.
 
 ```typescript
 async mget<T>(
   keys: string[],
-  fetchFn?: (missKeys: string[]) => Promise<Record<string, T>>,
+  fetchFn?: (missKeys: string[]) => Promise<Record<string, T> | Map<string, T>>,
   ttl?: number | ((key: string) => number),
   priority?: CachePriority
 ): Promise<(T | undefined)[]>
 ```
+
+#### Parameters:
+* `keys` (`string[]`): Array of keys to retrieve.
+* `fetchFn` (`(missKeys: string[]) => Promise<Record<string, T> | Map<string, T>>`, optional): Origin query handler invoked only if there are unresolved misses after scanning L1, L2, and L1.5 disk tiers.
+* `ttl` (`number | ((key: string) => number)`, optional, default: `300`): Cache lifetime in seconds for newly fetched values. Accepts a constant number or a per-key function enabling heterogeneous TTLs in a single batch call.
+* `priority` (`CachePriority`, optional): Eviction priority (`LOW`, `NORMAL`, `HIGH`, `CRITICAL`) assigned to newly fetched entries during backfill.
+
+#### Return Value:
+* `Promise<(T | undefined)[]>`: Deterministic array whose elements correspond 1:1 with the input `keys` array (`results[i]` represents `keys[i]`). Missing keys that are not returned by `fetchFn` are populated as `undefined`.
+
+#### Performance & Guarantees:
+* **Zero I/O Warm Path**: Keys resident in L1 RAM return references immediately without string deserialization.
+* **Pipelined L2 Batch**: L1 misses are fetched from Redis in a single network round-trip via `.multi().get(...)`.
+* **Tombstone Protection**: L1.5 disk lookups check active in-memory deletion tombstones (`_pendingDiskDeletes`) and pattern tombstones to prevent resurrection of recently invalidated data.
+* **Concurrent Backfill**: All newly fetched origin values are concurrently backfilled to L1 and L2 via `Promise.all` with TTL jitter.
 
 ### `cache.mset<T>(entries)`
 Pipelined multi-key write across all tiers in a single network round-trip.
@@ -216,12 +231,16 @@ Deletes a key from all local tiers and broadcasts an invalidation message across
 async delete(cacheKey: string): Promise<void>
 ```
 
-### `cache.invalidateTag(tag)` & `cache.invalidateTags(tags)`
-Invalidates all cache entries tagged with the specified identifier(s). Under `tagStrategy: 'generational'`, executes in $O(1)$ time via atomic version increment.
+### `cache.invalidateTag(tag, opts?)` & `cache.invalidateTags(tags, opts?)`
+Invalidates all cache entries tagged with the specified identifier(s), glob wildcard pattern(s), or hierarchical namespace(s). Under `tagStrategy: 'generational'`, executes via atomic version increments.
+
+* **Wildcard Tag Matching**: Use `*` (zero or more characters) or `?` (single character) in tag names (e.g. `cache.invalidateTag('org:123:*')` or `cache.invalidateTag('*:comments')`).
+* **Parent-Child Tag Cascading**: Pass `{ cascade: true }` to invalidate a tag and all descendant namespaces (e.g. `cache.invalidateTag('org:123', { cascade: true })` invalidates `org:123` and `org:123:dept:456`).
+* **Automatic Tag Expansion**: When `hierarchicalTags: true` is configured in `CacheOptions`, tags (e.g. `['org:123:dept:456']`) are automatically expanded into all ancestor namespaces (`['org', 'org:123', 'org:123:dept', 'org:123:dept:456']`).
 
 ```typescript
-async invalidateTag(tag: string): Promise<void>
-async invalidateTags(tags: string[]): Promise<void>
+async invalidateTag(tag: string, opts?: InvalidateTagOptions): Promise<void>
+async invalidateTags(tags: string[], opts?: InvalidateTagOptions): Promise<void>
 ```
 
 ### `cache.getTagVersion(tag)`
@@ -431,10 +450,14 @@ Complete schema of options passed to `CacheService.create(options)`:
 | `previousEncryptionKey` | `string` | `undefined` | Fallback key for zero-downtime key rotation |
 | `workerThreads` | `boolean` | `false` | Offloads crypto & compression to worker pool |
 | `workerThresholdBytes`| `number` | `131072` (128KB)| Payload size threshold for worker delegation |
-| `compression` | `'brotli' \| 'gzip' \| 'none'`| `'none'` | Transparent payload compression |
+| `compression` | `'zstd' \| 'lz4' \| 'brotli' \| 'gzip' \| 'none'`| `'zstd'` | Transparent payload compression (Zstandard via WebAssembly, LZ4, Brotli, Gzip) |
+| `compressionThresholdBytes`| `number` | `1024` (1 KB) | Minimum byte size threshold before compression is applied |
+| `customCompressor` | `CustomCompressor` | `undefined` | Pluggable custom compressor engine (`{ name, compress, decompress }`) |
 | **Fleet Resilience** | | | |
 | `namespace` | `string` | `''` | Cluster tenant key prefix |
 | `tagStrategy` | `'set' \| 'generational'` | `'generational'` | $O(1)$ generational tag versioning |
+| `hierarchicalTags` | `boolean` | `false` | Automatically expand tags into ancestor namespaces (e.g. `'org:1:dept:2'` $\rightarrow$ `'org'`, `'org:1'`, `'org:1:dept'`) |
+| `tagHierarchyDelimiter` | `string` | `':'` | Separator used for splitting hierarchical tags |
 | `ttlJitterFactor` | `number` | `0.0` | Randomize TTL by $\pm \text{factor} \times \text{ttl}$ |
 | `adaptiveTtl` | `boolean` | `false` | Autonomous p95 fetch latency TTL tuning |
 | `autoPipeline` | `boolean` | `false` | Zero-latency microtask Redis command batching |

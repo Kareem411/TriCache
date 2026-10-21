@@ -119,16 +119,52 @@ await cache.set('config:rate-limits', rateLimits, 3600, {
 });
 ```
 
-### 3. Cluster-Wide Tag Invalidation (`cache.invalidateTag`)
+### 3. Cluster-Wide Tag Invalidation (`cache.invalidateTag` & `cache.invalidateTags`)
 
-Invalidates all keys associated with a tag in $O(1)$ time without scanning Redis:
+Invalidates all keys associated with tags across the entire cluster. Under `tagStrategy: 'generational'`, invalidations execute in $O(1)$ time via atomic version counters.
 
+#### Discrete Tags & Batch Invalidation:
 ```typescript
-// Atomically increments the tag version counter
+// Invalidate a single tag
 await cache.invalidateTag('products');
 
-// Supports multiple tags
-await cache.invalidateTags(['products', 'inventory']);
+// Invalidate multiple tags in a pipelined batch
+await cache.invalidateTags(['products', 'inventory', 'pricing']);
+```
+
+#### Wildcard Glob Matching (`*` and `?`):
+```typescript
+// Invalidate all tags starting with "org:123:" (e.g. org:123:users, org:123:settings)
+await cache.invalidateTag('org:123:*');
+
+// Invalidate all comment tags regardless of entity type (e.g. post:1:comments, case:42:comments)
+await cache.invalidateTag('*:comments');
+
+// Single character wildcard matching
+await cache.invalidateTag('tenant:?:active');
+```
+
+#### Parent-Child Tag Cascading:
+```typescript
+// Invalidates 'org:123' and all descendant namespaces (e.g. 'org:123:dept:456')
+// Preserves delimiter boundary safety (will never accidentally match 'org:1234')
+await cache.invalidateTag('org:123', { cascade: true });
+```
+
+#### Hierarchical Tag Auto-Expansion:
+Enable `hierarchicalTags: true` in `CacheOptions` to automatically associate entries with all ancestor namespaces:
+```typescript
+const cache = CacheService.create({
+  hierarchicalTags: true,
+  tagHierarchyDelimiter: ':', // default ':' (or '/' for 'geo/us/west')
+});
+
+// Tagging with 'org:123:dept:456' automatically expands to:
+// ['org', 'org:123', 'org:123:dept', 'org:123:dept:456']
+await cache.set('payroll', data, 3600, { tags: ['org:123:dept:456'] });
+
+// Invalidating any parent tag now automatically purges the entry:
+await cache.invalidateTag('org:123'); // Or await cache.invalidateTag('org');
 ```
 
 ### 4. Direct Key Deletion (`cache.delete`)
@@ -139,20 +175,88 @@ Deletes a key across all local tiers and publishes an invalidation event across 
 await cache.delete(`user:${userId}`);
 ```
 
-### 5. Multi-Key Operations (`cache.mget` & `cache.mset`)
+### 5. Multi-Key Operations (`cache.mget`, `cache.mset`, `cache.mdel`)
 
-Pipelined multi-key retrieval and batch writing across all three tiers:
+TriCache provides enterprise-grade batch operations with **differential multi-tier waterfall resolution**, eliminating the classic $N+1$ query problem across distributed cache tiers.
+
+#### Cascading Batch Read (`cache.mget`)
+`cache.mget` queries L1 RAM first. Unresolved keys fall through to a pipelined Redis `MULTI` call, then to L1.5 disk spill. **Only the remaining unfulfilled keys** are passed to `fetchFn(missKeys)`:
 
 ```typescript
-// Batch fetch with tier fallthrough
-const results = await cache.mget(['key:1', 'key:2', 'key:3']);
+// Solve N+1 database queries in high-throughput endpoints
+const userIds = ['user:101', 'user:102', 'user:103', 'user:104'];
 
-// Batch write
-await cache.mset([
-  { key: 'key:1', value: data1, ttl: 300 },
-  { key: 'key:2', value: data2, ttl: 300 },
-]);
+const users = await cache.mget<User>(
+  userIds,
+  async (missKeys) => {
+    // missKeys contains ONLY keys that missed L1, L2, and L1.5 disk!
+    // Example: If user:101 and user:102 were cached, missKeys is ['user:103', 'user:104']
+    const ids = missKeys.map(k => k.replace('user:', ''));
+    const rows = await db.query('SELECT * FROM users WHERE id = ANY($1)', [ids]);
+
+    // Return as Record<string, User> or Map<string, User>
+    const result: Record<string, User> = {};
+    for (const row of rows) {
+      result[`user:${row.id}`] = row;
+    }
+    return result;
+  },
+  // Dynamic per-key TTL: pass a number (seconds) or a function for heterogeneous TTLs
+  (key) => (key.includes('admin') ? 60 : 3600),
+);
+
+// Results preserve exact input ordering: users[i] corresponds to userIds[i]
+// users -> [(User 101), (User 102), (User 103), (User 104)]
 ```
+
+#### Converting `mget` Results to a `Map`
+If your service prefers a lookup Map rather than an index-aligned array:
+
+```typescript
+function toLookupMap<T>(keys: string[], values: (T | undefined)[]): Map<string, T> {
+  const map = new Map<string, T>();
+  for (let i = 0; i < keys.length; i++) {
+    const val = values[i];
+    if (val !== undefined) map.set(keys[i], val);
+  }
+  return map;
+}
+
+const userMap = toLookupMap(userIds, users);
+const user101 = userMap.get('user:101');
+```
+
+#### Batch Writes & Deletions (`cache.mset` & `cache.mdel`)
+```typescript
+// Pipelined multi-key write across all tiers in a single network round-trip
+await cache.mset({
+  'item:1': { value: data1, ttl: 300, tags: ['catalog'] },
+  'item:2': { value: data2, ttl: 600, tags: ['catalog'] },
+});
+
+// Pipelined multi-key deletion across L1, disk, and L2
+await cache.mdel(['item:1', 'item:2']);
+```
+
+---
+
+### 6. Automatic Compression Layer (`'zstd'`, `'lz4'`, `'brotli'`, `'gzip'`)
+
+For cached payloads exceeding a configurable threshold (e.g. large analytics datasets or activity histories), payload size is the primary bottleneck for Redis network throughput and memory costs. TriCache provides transparent compression before writing to L1.5 disk or L2 Redis:
+
+```typescript
+const cache = CacheService.create({
+  // 'zstd' (WebAssembly, ultra-high ratio) | 'lz4' (ultra-low latency) | 'brotli' | 'gzip' | 'none'
+  compression: 'zstd',
+  // Compress payloads larger than 1 KB (default: 1024 bytes)
+  compressionThresholdBytes: 1024,
+});
+```
+
+* **Zstandard (`'zstd'`)**: Powered by official WebAssembly build (`zstd-codec`), achieving 70–90% payload reduction with zero native C++ build requirements (`node-gyp`).
+* **LZ4 (`'lz4'`)**: Ultra-fast compression and decompression with negligible CPU overhead for latency-critical high-throughput microservices.
+* **Format Auto-Detection**: Magic header sniffing auto-detects Zstandard (`0x28 0xB5 0x2F 0xFD`), LZ4 (`0x04 0x22 0x4D 0x18`), and Gzip frames, enabling seamless algorithm transitions without cache purges.
+* **Pluggable Compressor**: Supply `customCompressor: { name, compress, decompress }` to plug in your own proprietary compression or serialization engine.
 
 ---
 

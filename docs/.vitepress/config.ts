@@ -110,6 +110,7 @@ export default defineConfig({
           { text: 'Architectural Deep Dive', link: '/architecture-internals' },
           { text: 'Window TinyLFU & CMS', link: '/architecture-internals#1-native-window-tinylfu-w-tinylfu-admission-engine' },
           { text: 'WASM & Murmur3 Filter', link: '/architecture-internals#2-webassembly-murmur3-bloom-filter' },
+          { text: 'Differential Waterfall (mget)', link: '/architecture-internals#15-differential-multi-tier-waterfall-resolution-cachemget' },
           { text: 'Zero-Dependency SigV4', link: '/architecture-internals#6-zero-dependency-aws-sigv4-snapshot-signer' },
           { text: 'Cold-Start Cloud Hydration', link: '/cold-start-cloud-hydration' },
         ],

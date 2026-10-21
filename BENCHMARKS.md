@@ -662,3 +662,17 @@ Now: `_handleBackplaneMessage` calls `_cascadeDependencies(msg.key)` on receipt.
 const cache = CacheService.create({ warmKeys: 'user:*' });
 await cache.ready(); // blocks only the first caller; subsequent awaits resolve immediately
 ```
+
+---
+
+## v1.0.0 — Transparent Compression Engines (Redis & Disk Tier)
+
+TriCache defaults to WebAssembly Zstandard (`zstd`) for payloads exceeding 1 KB (`compressionThresholdBytes: 1024`). Measured across 102 KB JSON catalog payloads (`pnpm bench:compression`):
+
+| Algorithm | Stored Size | Reduction | Compression Speed | Compression Latency | Decompression Speed |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| **`zstd` (WASM Default)** | **4,762 B** | **-95.4%** | **5,512 ops/s** | **181.4 µs** | **5,315 ops/s** |
+| `lz4` | 10,906 B | -89.6% | 4,247 ops/s | 235.5 µs | 2,704 ops/s |
+| `brotli` | 4,471 B | -95.7% | 2,180 ops/s | 458.8 µs | 6,522 ops/s |
+| `gzip` | 5,272 B | -95.0% | 1,365 ops/s | 732.8 µs | 6,749 ops/s |
+

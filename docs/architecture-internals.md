@@ -288,4 +288,55 @@ const envelope = new EnvelopeEncryption({
 * **Tamper Rejection**: Any alteration to the header, IV, tag, or encrypted DEK fails authentication before memory allocation.
 * **KMS Extensibility**: Supports custom `kmsWrapKey` and `kmsUnwrapKey` hooks for direct integration with AWS KMS, Google Cloud KMS, or HashiCorp Vault.
 
+---
+
+## 15. Differential Multi-Tier Waterfall Resolution (`cache.mget`)
+
+Most caching systems implement batch lookups as naive loops over single-key `get()` calls, or limit batching to a single remote tier (`MGET` in Redis). TriCache implements a **differential waterfall resolution engine** that cascades through heterogeneous local and remote tiers, querying downstream tiers and origin databases **only for the differential remainder of unresolved keys**.
+
+```
+                   keys: [k1, k2, k3, k4, k5]
+                               │
+            ┌──────────────────▼──────────────────┐
+            │   Tier 1: In-Memory L1 Scan (RAM)   │ ── Warm hits (0 I/O) ──> [k1]
+            └──────────────────┬──────────────────┘
+                               │ Misses: [k2, k3, k4, k5]
+            ┌──────────────────▼──────────────────┐
+            │  Tier 2: Redis Pipelined MULTI/GET  │ ── Remote hits ────────> [k2, k4]
+            │     (Single Network Round-Trip)     │    (Promoted to L1)
+            └──────────────────┬──────────────────┘
+                               │ Misses: [k3, k5]
+            ┌──────────────────▼──────────────────┐
+            │ Tier 1.5: Off-Heap /dev/shm & NVMe  │ ── Disk spill hits ────> [k3]
+            │   (Tombstone & Canary Protected)    │    (Promoted to L1)
+            └──────────────────┬──────────────────┘
+                               │ Misses: [k5]
+            ┌──────────────────▼──────────────────┐
+            │   Tier 3: fetchFn(missKeys) Origin  │ ── Origin hit ─────────> [k5]
+            │   (Only True Remainder Passed to DB)│    (Backfilled to L1/L2)
+            └──────────────────┬──────────────────┘
+                               │
+            ┌──────────────────▼──────────────────┐
+            │   Deterministic Ordered Results     │
+            │      [val1, val2, val3, val4, val5] │
+            └─────────────────────────────────────┘
+```
+
+### Cascading Execution Lifecycle:
+1. **Zero-Overhead L1 Scan**:
+   Keys are evaluated against resident V8 memory in a single synchronous pass. Warm hits return references directly, bypassing string serialization and network I/O.
+2. **Pipelined L2 Batching**:
+   Any keys missing from L1 are batched into a single Redis `client.multi().get(...)` pipeline. Hits are decrypted, deserialized, promoted into L1 with jittered TTL, and recorded to the latency watchdog.
+3. **Off-Heap Disk Spill (Tier 1.5)**:
+   For remaining unfulfilled keys, TriCache checks SQLite `/dev/shm` or NVMe storage. To prevent resurrection races, this lookup is guarded by:
+   - Synchronous delete tombstones (`_pendingDiskDeletes`)
+   - Wildcard pattern tombstones (`_patternTombstones`)
+   - Hardware canary latency checks via the `LatencyWatchdog`
+4. **Selective Origin Batch Execution (`fetchFn`)**:
+   Origin systems (PostgreSQL, Aurora, REST APIs) are invoked **only** with the true remainder (`missKeys`). For example, in a batch of 50 keys where 45 are warm across L1/L2, `fetchFn` receives an array of exactly 5 keys.
+   - `fetchFn` may return either a `Record<string, T>` or a `Map<string, T>`.
+5. **Deterministic Order & Concurrent Backfill**:
+   The returned array `(T | undefined)[]` strictly preserves the original index ordering (`result[i]` corresponds to `keys[i]`). Newly fetched values are concurrently backfilled across tiers using `Promise.all` with optional dynamic per-key TTLs `(key: string) => number`.
+
+
 

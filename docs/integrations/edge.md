@@ -140,3 +140,45 @@ const cache = new EdgeCacheService({
 });
 ```
 
+---
+
+## 5. Pipelined Batch Reads (`EdgeCacheService.mget`)
+
+In edge isolates, batch requests frequently require resolving multiple keys (e.g. tenant configurations, user claims, or localized product catalogs). `EdgeCacheService.mget()` resolves warm keys locally in isolate memory, falls back to remote HTTP storage (Upstash Redis or Cloudflare KV), and calls `fetchFn(missKeys)` **only for unfulfilled keys**:
+
+```typescript
+const keys = ['tenant:org_1', 'tenant:org_2', 'tenant:org_3'];
+
+const configs = await cache.mget<TenantConfig>(
+  keys,
+  async (missKeys) => {
+    // Only invoked with keys that missed isolate memory and remote L2
+    const remoteData = await fetchTenantConfigsFromOrigin(missKeys);
+    return remoteData; // Record<string, TenantConfig> or Map<string, TenantConfig>
+  },
+  300 // TTL seconds
+);
+
+// configs -> [(Config 1), (Config 2), (Config 3)] in deterministic order
+```
+
+---
+
+## 6. Wildcard & Cascading Tag Invalidation in Edge Isolates
+
+`EdgeCacheService` supports both wildcard pattern matching (`*`, `?`) and parent-child namespace cascading across isolate memory and remote storage:
+
+```typescript
+// Tag items during set
+await cache.set('user:101', userData, 300, { tags: ['org:123:users'] });
+await cache.set('settings:101', settingsData, 300, { tags: ['org:123:settings'] });
+
+// Invalidate all tags under "org:123:" using wildcards
+await cache.invalidateTag('org:123:*');
+
+// Parent-child cascading invalidation
+await cache.invalidateTag('org:123', { cascade: true });
+```
+
+
+
