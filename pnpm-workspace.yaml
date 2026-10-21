@@ -3,6 +3,9 @@ allowBuilds:
   msgpackr-extract: false
 
 overrides:
-  vite: '^8.2.2'
+  vitest: '>=4.1.12'
+  '@vitest/mocker': '>=4.1.12'
+  vite: '>=8.2.4'
+  source-map-js: '>=1.2.2'
   esbuild: '^0.28.1'
   '@xmldom/xmldom': '>=0.9.12'
