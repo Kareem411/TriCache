@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] — 2026-10-21
+
+### Added
+- **Zstandard (zstd) & Ultra-Fast LZ4 Compression Engines (`src/compression.ts`, `src/cache-service.ts`, `package.json`)**:
+  - Integrated WebAssembly Zstandard codec (`zstd-codec`) with magic header byte detection (`0x28 0xB5 0x2F 0xFD`), asynchronous auto-initialization (`initZstd()`), and graceful fallback to fast Brotli. Promoted to the **out-of-the-box default compression algorithm** (`compression: 'zstd'`), delivering ~96% size reduction and 2.5× faster write compression than Brotli for payloads $> 1$ KB.
+  - Integrated ultra-fast LZ4 frame compression via `lz4js` with magic frame header detection (`0x04 0x22 0x4D 0x18`) for microsecond-scale compression with minimal CPU footprint.
+  - Added `customCompressor?: CustomCompressor` to `CacheOptions` (`{ name, compress, decompress }`), enabling pluggable custom or proprietary compression pipelines.
+  - Intelligent multi-algorithm automatic decompression: payloads written with `brotli`, `gzip`, `lz4`, or `zstd` are dynamically inspected via magic bytes and successfully decompressed without requiring reconfiguration.
+- **Differential Multi-Tier Waterfall Batch Engine (`cache.mget`, `EdgeCacheService.mget`) (`src/cache-service.ts`, `src/edge/cache.ts`)**:
+  - Full cascading differential resolution across heterogeneous tiers:
+    - **Tier 1 (L1 RAM)**: Zero-I/O memory scan for warm hits returning directly without deserialization.
+    - **Tier 2 (L2 Redis)**: Pipelined `.multi().get(...)` batch execution in a single network round-trip for L1 misses.
+    - **Tier 1.5 (Disk Spill)**: Off-heap `/dev/shm` / NVMe lookup for remaining unfulfilled keys, protected by delete and pattern tombstones.
+    - **Tier 3 (Origin DB / `fetchFn`)**: Passes **only the true remaining misses** to origin databases (e.g. PostgreSQL `WHERE id = ANY($1)`), eliminating the distributed $N+1$ query problem across distributed cache tiers.
+  - Flexible `fetchFn` return type: supports both `Record<string, T>` and `Map<string, T>`.
+  - Optional `fetchFn`: callers can invoke `cache.mget(['k1', 'k2'])` without a fallback function to read existing cached values, returning `undefined` for misses.
+  - Dynamic per-key TTL: `ttl` parameter accepts a function `(key: string) => number` for heterogeneous expirations in a single batch.
+  - Deterministic ordered output: returned array `(T | undefined)[]` strictly preserves the original input key order.
+  - Full batch support in Edge isolates via `EdgeCacheService.mget()`.
+- **Wildcard & Hierarchical Tag Invalidation (`cache.invalidateTag`, `cache.invalidateTags`) (`src/utils/tag-matcher.ts`, `src/cache-service.ts`, `src/edge/cache.ts`)**:
+  - Glob pattern matching (`*` and `?`) in tag names with zero-regex fast-paths (prefix/suffix string matching) and bounded RegExp caching (1,000 entries max).
+  - Parent-child tag cascading: `await cache.invalidateTag('org:123', { cascade: true })` invalidates the tag and all descendant child namespaces while strictly preserving delimiter boundaries (`org:123` will never match `org:1234`).
+  - Hierarchical tag auto-expansion: `hierarchicalTags: true` in `CacheOptions` automatically associates tagged entries with all ancestor namespaces on both `set()` and `get()` miss paths.
+  - Customizable delimiter: `tagHierarchyDelimiter` (defaults to `:`, configurable to `/`, `.`, etc.).
+  - Cluster-wide synchronization & cross-region relay: `tag_pattern_incr` and `tag_pattern_del` operations in Redis Pub/Sub backplane and `CrossRegionInvalidationEvent` for cluster peers and multi-region meshes.
+  - Universal Edge support: `EdgeCacheService.invalidateTag` supports both wildcard patterns and `{ cascade: true }` cascading.
+- **Negative Caching Protection (`notFoundTtl`) (`src/cache-service.ts`, `src/types.ts`)**:
+  - Added `opts.notFoundTtl?: number` in `cache.get()` allowing callers to cache `null` / `undefined` results with a shorter TTL (e.g. 5 seconds) to shield origin databases against non-existent key enumeration and cold-miss penetration attacks.
+
+### Changed
+- **Monomorphic Options Normalization (`src/cache-service.ts`)**:
+  - Collapsed polymorphic `opts` lookups (`opts.swr`, `opts.priority`, `opts.refreshAhead`, `opts.xfetchBeta`, `opts.notFoundTtl`, `opts.tags`) into monomorphic local variables at the entry of `get()`, eliminating V8 polymorphic inline cache (IC) deoptimizations.
+- **Edge Cache API Ergonomics (`src/edge/cache.ts`)**:
+  - `EdgeCacheService.set()` now accepts both `{ tags?: string[]; swr?: number }` options object or direct `string[]` array for tags.
+
+### Fixed
+- **Namespace-Aware L1 Scanning (`src/cache-service.ts`)**:
+  - Fixed `prefixLen` property initialization on `CacheService` ensuring namespace-scoped L1 scans accurately strip namespace prefixes.
+- **Generational Tag Single-Tag Cascading Delegation (`src/cache-service.ts`)**:
+  - Ensured `opts` are forwarded when `invalidateTags([singleTag], opts)` resolves to a single tag.
+
 ## [0.9.0] — 2026-10-02
 
 ### Added

@@ -4,7 +4,7 @@
 [![Docs](https://img.shields.io/badge/docs-VitePress-blue.svg)](https://kareem411.github.io/TriCache/)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
 [![npm downloads](https://img.shields.io/npm/dm/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-862%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-903%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 20](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
@@ -73,10 +73,12 @@ await cache.invalidateTag('users');
 ```
 
 * **Window TinyLFU (W-TinyLFU)**: ~1% Window LRU absorbs recency bursts; 4-row Count-Min Sketch rejects table scans. [[Internals $\rightarrow$](https://kareem411.github.io/TriCache/architecture-internals)]
+* **WebAssembly Zstandard Compression**: Out-of-the-box `zstd` WASM engine compresses payloads $>1$ KB by ~95% with automatic Brotli fallback and optional LZ4.
 * **Off-Heap `/dev/shm` RAM Spill**: Targets Linux POSIX shared memory tmpfs ($\ge 256\text{MB}$ total, $\ge 128\text{MB}$ free), burning 0 cloud IOPS. [[SRE Guide $\rightarrow$](https://kareem411.github.io/TriCache/kubernetes-production-guide)]
 * **Dynamic Latency Watchdog**: Graduated shedding (0% $\rightarrow$ 25% $\rightarrow$ 75% $\rightarrow$ 100%) with asymmetric Redis hysteresis (15ms cutoff, 10ms recovery floor).
 * **Ephemeral Quotas & K8s Eviction Defense**: Chunked watermark pruning (80% $\rightarrow$ 60% in 500-entry batches) and proactive $<10\%$ space spill pauses.
-* **Generational Tag Invalidation ($O(1)$)**: Version counters (`INCR tag_ver:<tag>`) eliminate blocking Redis `KEYS`/`SMEMBERS` scans.
+* **Wildcard & Hierarchical Tag Invalidation**: Glob matching (`user:*`) and parent-child tree cascading (`{ cascade: true }`) over $O(1)$ generational version counters.
+* **Differential Multi-Tier Waterfall Batching**: Cascading `cache.mget` resolves L1 $\rightarrow$ L2 $\rightarrow$ Disk $\rightarrow$ DB miss fetch with zero $N+1$ queries.
 * **Zero-Dependency Cloud Hydration (SigV4)**: Hydrates cold pods from S3/R2 in milliseconds via native Web Crypto. [[Cloud Guide $\rightarrow$](https://kareem411.github.io/TriCache/cold-start-cloud-hydration)]
 
 ---
@@ -88,8 +90,10 @@ await cache.invalidateTag('users');
 | **Storage Hierarchy** | In-Memory only | Single Remote (Redis) | Memory + Redis | **Three-Tier (RAM $\rightarrow$ `/dev/shm` $\rightarrow$ Redis)** |
 | **Warm Hit Latency** | ~300 ns | 1,200,000 ns (1.2 ms) | ~400 ns | **356 ns (2.81M ops/sec)** |
 | **Thundering-Herd Defense**| ❌ No | ❌ External plugin | ❌ No | **✅ Native Singleflight Coalescing** |
-| **Tag Invalidation** | ❌ None | $O(N)$ blocking scan | $O(N)$ Redis Set | **✅ $O(1)$ Generational Versions** |
+| **Tag Invalidation** | ❌ None | $O(N)$ blocking scan | $O(N)$ Redis Set | **✅ $O(1)$ Generational + Wildcards & Cascades** |
 | **Cluster Sync Backplane**| ❌ None | At-most-once Pub/Sub | Pub/Sub | **✅ Durable Redis Streams (`XADD`/`XREAD`)** |
+| **Compression** | ❌ None | ❌ Manual | ❌ None | **✅ WebAssembly Zstandard (Default) & LZ4** |
+| **Waterfall Batching (`mget`)**| ❌ None | ❌ Manual loops | ❌ None | **✅ Multi-Tier Cascading ($0$ $N+1$ Queries)** |
 | **Container Memory Safety**| Unbounded GC | N/A (Remote only) | Heap-bound | **✅ Off-heap tmpfs + 80% OOM Guard** |
 | **Encryption at Rest** | ❌ None | ❌ None | ❌ None | **✅ AES-256-GCM / Web Crypto AEAD** |
 

@@ -1,6 +1,6 @@
 {
   "name": "tricache",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "description": "Three-tier Node.js cache: L1 smart RAM (adaptive LFU/LRU + Count-Min Sketch) → L1.5 NVMe disk spill → L2 Redis/Valkey. Includes AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, and thundering-herd prevention.",
   "keywords": [
     "cache",
@@ -110,6 +110,7 @@
     "test:watch": "vitest",
     "bench": "node --expose-gc --max-old-space-size=8192 --import tsx/esm bench/benchmark.ts",
     "bench:roi": "tsx bench/cloud-roi-simulation.ts",
+    "bench:compression": "tsx bench/compression.bench.ts",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs",
@@ -133,7 +134,9 @@
   },
   "dependencies": {
     "ioredis": "6.0.0",
-    "msgpackr": "2.1.0"
+    "lz4js": "^0.2.0",
+    "msgpackr": "2.1.2",
+    "zstd-codec": "^0.1.5"
   },
   "devDependencies": {
     "@nestjs/common": "^11.0.0",
@@ -146,9 +149,9 @@
     "tsup": "^8.5.1",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",
-    "vite": "^8.2.2",
+    "vite": "^8.3.5",
     "vitepress": "2.0.0-alpha.20",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "engines": {
     "node": ">=20.10.0"
