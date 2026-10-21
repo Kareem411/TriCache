@@ -247,6 +247,18 @@ describe('Universal Edge Portability: EdgeCacheService', () => {
     expect(await cache.get('k2')).toBe('fetched-2');
   });
 
+  it('mget() supports fetchFn returning Map<string, T>', async () => {
+    const cache = new EdgeCacheService();
+    await cache.set('warm', 'ram');
+    const results = await cache.mget(['warm', 'miss'], async (keys) => {
+      const map = new Map<string, string>();
+      for (const k of keys) map.set(k, `from-map-${k}`);
+      return map;
+    }, 60);
+    expect(results).toEqual(['ram', 'from-map-miss']);
+    expect(await cache.get('miss')).toBe('from-map-miss');
+  });
+
   it('promotes accessed keys to MRU position so frequently read keys survive maxKeys eviction', async () => {
     const cache = new EdgeCacheService({ maxKeys: 3 });
 

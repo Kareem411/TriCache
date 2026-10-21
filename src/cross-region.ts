@@ -14,7 +14,7 @@ export interface CrossRegionInvalidationEvent {
   /** Instance ID that initiated the invalidation */
   originInstanceId: string;
   /** Invalidation operation */
-  op: 'del' | 'del-glob' | 'tag_incr';
+  op: 'del' | 'del-glob' | 'tag_incr' | 'tag_pattern_incr' | 'tag_pattern_del';
   /** Cache key or tag name */
   key: string;
   /** New tag version for generational tag invalidation */
