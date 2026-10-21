@@ -1,5 +1,6 @@
 import type { RemoteSnapshotOptions } from './remote-snapshot';
 import type { CrossRegionRelayOptions } from './cross-region';
+import type { CompressionAlgorithm, CustomCompressor } from './compression';
 
 /**
  * tricache — shared types and interfaces
@@ -568,13 +569,22 @@ export interface CacheOptions {
 
   // ── Compression ──────────────────────────────────────────────────────────
   /**
-   * Optional compression algorithm for L2 (Redis) strings and disk-tier binary blobs.
-   * - `'brotli'` (default when enabled) — superior compression ratio for JSON / text payloads.
-   * - `'gzip'` — faster compression / lower CPU overhead.
+   * Compression algorithm for L2 (Redis) strings and disk-tier binary blobs.
+   * - `'zstd'` (default) — Facebook Zstandard (via WebAssembly) for ultra-high throughput and ~96% ratio.
+   * - `'lz4'` — Ultra-fast compression/decompression for high-throughput, latency-critical workloads.
+   * - `'brotli'` — High compression ratio for JSON / text payloads.
+   * - `'gzip'` — Standard Deflate/Gzip compression.
    * - `'none'` — disable compression.
-   * Default: `'none'` (uncompressed).
+   * Default: `'zstd'`.
    */
-  compression?: 'brotli' | 'gzip' | 'none';
+  compression?: CompressionAlgorithm;
+
+  /**
+   * Custom compression engine plugin. When provided, overrides the built-in algorithms
+   * and delegates compression/decompression to this provider.
+   */
+  customCompressor?: CustomCompressor;
+
   /**
    * Minimum payload size in bytes before compression is applied.
    * Payloads smaller than this threshold remain uncompressed to avoid compression overhead.
@@ -1034,6 +1044,22 @@ export interface CacheOptions {
   tagVersionTtlMs?: number;
 
   /**
+   * Automatically expand hierarchical tags into their ancestor namespaces.
+   * For example, tagging an entry with `'org:123:dept:456'` will also associate
+   * it with `'org:123'` and `'org'`, allowing `invalidateTag('org:123')` or
+   * `invalidateTag('org')` to automatically cascade down to this entry.
+   *
+   * Default: `false`.
+   */
+  hierarchicalTags?: boolean;
+
+  /**
+   * The delimiter used for splitting hierarchical tags when `hierarchicalTags` is enabled.
+   * Default: `':'`.
+   */
+  tagHierarchyDelimiter?: string;
+
+  /**
    * Read safety strategy for returned cached objects:
    * - `'none'` (default): Returns raw in-memory references for sub-microsecond performance (~350 ns).
    * - `'structuredClone'`: Clones values via native `structuredClone()` on L1 hits, L2 promotions,
@@ -1073,6 +1099,18 @@ export interface CacheOptions {
    * Compatible with `@opentelemetry/api` Meter.
    */
   meter?: ICacheMeter;
+}
+
+/**
+ * Options for tag invalidation operations (`cache.invalidateTag()` and `cache.invalidateTags()`).
+ */
+export interface InvalidateTagOptions {
+  /**
+   * When true, invalidates both the specified tag and any descendant child tags
+   * in the hierarchy (e.g. invalidating 'org:123' also invalidates 'org:123:*').
+   * Default: `false`.
+   */
+  cascade?: boolean;
 }
 
 /**

@@ -417,6 +417,59 @@ describe('cache.mget()', () => {
     expect(results[0]).toBe(42);
     expect(results[1]).toBeUndefined();
   });
+
+  it('supports fetchFn returning a Map<string, T>', async () => {
+    await svc.set('warm', 'ram-data', 60);
+    const results = await svc.mget(
+      ['warm', 'miss1', 'miss2'],
+      async (missKeys) => {
+        const map = new Map<string, string>();
+        for (const k of missKeys) map.set(k, `val-${k}`);
+        return map;
+      },
+      60,
+    );
+    expect(results).toEqual(['ram-data', 'val-miss1', 'val-miss2']);
+    // Verify backfilled into L1
+    expect(await svc.peek('miss1')).toBe('val-miss1');
+  });
+
+  it('works when fetchFn is omitted, returning hits and undefined for misses', async () => {
+    await svc.set('exists', 'hello', 60);
+    const results = await svc.mget(['exists', 'nonexistent']);
+    expect(results).toEqual(['hello', undefined]);
+  });
+
+  it('handles missing keys in fetchFn resolver gracefully without throwing', async () => {
+    // DB returns only k1, but k2 is deleted/non-existent
+    const fetch = vi.fn().mockResolvedValue({ k1: 'found' });
+    const results = await svc.mget(['k1', 'k2'], fetch, 60);
+
+    expect(results).toEqual(['found', undefined]);
+  });
+
+  it('caches negative hits with notFoundTtl when configured in mget', async () => {
+    const negativeSvc = new CacheService({
+      disableDisk: true,
+      disableRedis: true,
+      notFoundTtl: 10, // 10s negative caching
+    });
+
+    const fetch = vi.fn().mockResolvedValue({ valid: 'data' }); // 'missing' not returned
+
+    // 1st call: queries fetch
+    const r1 = await negativeSvc.mget(['valid', 'missing'], fetch, 60);
+    expect(r1).toEqual(['data', undefined]);
+    expect(fetch).toHaveBeenCalledOnce();
+
+    // 2nd call: 'valid' is in cache, and 'missing' was negative-cached as null/undefined
+    const r2 = await negativeSvc.mget(['valid', 'missing'], fetch, 60);
+    expect(r2[0]).toBe('data');
+    expect(r2[1]).toBe(null); // negative cache hit
+    expect(fetch).toHaveBeenCalledOnce(); // No second DB query!
+
+    await negativeSvc.destroy();
+  });
 });
 
 // ─── Tag system ───────────────────────────────────────────────────────────────

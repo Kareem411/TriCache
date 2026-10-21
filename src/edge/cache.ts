@@ -1,4 +1,4 @@
-import type { ICacheSpan, ICacheTracer } from '../types';
+import type { ICacheSpan, ICacheTracer, InvalidateTagOptions } from '../types';
 import type {
   EdgeCacheOptions,
   EdgeGetOptions,
@@ -13,6 +13,7 @@ import type {
 import { WebCryptoEncryption } from './crypto';
 import { WasmBloomFilter } from '../wasm/bloom-filter-wasm';
 import { Murmur3BloomFilter } from './utils/murmur3';
+import { isWildcardTag, matchesTagPattern, isChildTag } from '../utils/tag-matcher';
 
 interface EdgeL1Entry<T = unknown> {
   value: T;
@@ -398,19 +399,20 @@ export class EdgeCacheService {
     key: string,
     value: T,
     ttlSeconds?: number,
-    options?: { tags?: string[]; swr?: number },
+    options?: { tags?: string[]; swr?: number } | string[],
   ): Promise<void> {
     const span = this._startSpan('tricache.set');
     span.setAttribute('cache.key', key);
     const nsKey = this.nk(key);
     const resolvedTtl = ttlSeconds ?? this.defaultTtl;
     const now = Date.now();
-    const swrSeconds = options?.swr ?? 0;
+    const optObj = Array.isArray(options) ? { tags: options } : options;
+    const swrSeconds = optObj?.swr ?? 0;
 
     try {
       let activeTagVersions: Record<string, number> | undefined;
-      if (options?.tags?.length) {
-        activeTagVersions = await this._batchGetTagVersions(options.tags);
+      if (optObj?.tags?.length) {
+        activeTagVersions = await this._batchGetTagVersions(optObj.tags);
       }
 
       const serialized = JSON.stringify(value);
@@ -426,7 +428,7 @@ export class EdgeCacheService {
         bytes,
         expiresAt: now + resolvedTtl * 1000,
         staleUntil: now + (resolvedTtl + swrSeconds) * 1000,
-        tags: options?.tags,
+        tags: optObj?.tags,
         tagVersions: activeTagVersions,
       };
 
@@ -434,8 +436,8 @@ export class EdgeCacheService {
       this.currentBytes += bytes;
 
       // Index tags
-      if (options?.tags) {
-        for (const tag of options.tags) {
+      if (optObj?.tags) {
+        for (const tag of optObj.tags) {
           let s = this.tagIndex.get(tag);
           if (!s) {
             s = new Set<string>();
@@ -492,11 +494,35 @@ export class EdgeCacheService {
   /**
    * Invalidates all cached entries associated with a tag.
    */
-  async invalidateTag(tag: string): Promise<void> {
+  async invalidateTag(tag: string, opts?: InvalidateTagOptions): Promise<void> {
     const span = this._startSpan('tricache.invalidate_tag');
     span.setAttribute('cache.tag', tag);
+    if (opts?.cascade) span.setAttribute('cache.cascade', true);
 
     try {
+      const isPattern = isWildcardTag(tag);
+      const shouldCascade = Boolean(opts?.cascade);
+      if (isPattern || shouldCascade) {
+        const matched = new Set<string>();
+        const tagMatches = (t: string) => {
+          if (t === tag) return true;
+          if (isPattern && matchesTagPattern(tag, t)) return true;
+          if (shouldCascade && isChildTag(tag, t, ':')) return true;
+          return false;
+        };
+        for (const t of this.tagIndex.keys()) {
+          if (tagMatches(t)) matched.add(t);
+        }
+        for (const t of this.tagVersionCache.keys()) {
+          if (tagMatches(t)) matched.add(t);
+        }
+        if (shouldCascade && !isPattern) matched.add(tag);
+        for (const t of matched) {
+          await this.invalidateTag(t);
+        }
+        return;
+      }
+
       let newVer = 1;
       if (this.remoteStorage) {
         try {
@@ -568,7 +594,7 @@ export class EdgeCacheService {
    */
   async mget<T>(
     keys: string[],
-    fetchFn?: (missKeys: string[]) => Promise<Record<string, T>>,
+    fetchFn?: (missKeys: string[]) => Promise<Record<string, T> | Map<string, T>>,
     ttlSeconds?: number,
   ): Promise<(T | null)[]> {
     const span = this._startSpan('tricache.mget');
@@ -594,9 +620,10 @@ export class EdgeCacheService {
 
       if (missKeys.length > 0 && fetchFn) {
         const fetchedMap = await fetchFn(missKeys);
+        const isMap = fetchedMap instanceof Map;
         for (let j = 0; j < missKeys.length; j++) {
           const k = missKeys[j];
-          const fetchedVal = fetchedMap[k];
+          const fetchedVal = isMap ? (fetchedMap as Map<string, T>).get(k) : (fetchedMap as Record<string, T>)[k];
           if (fetchedVal !== undefined) {
             results[missIndices[j]] = fetchedVal;
             await this.set(k, fetchedVal, ttlSeconds);

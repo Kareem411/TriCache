@@ -49,6 +49,7 @@ import {
   WTinyLfuStats,
   CachePresetType,
   CacheHealthStatus,
+  InvalidateTagOptions,
 } from './types';
 import { CacheEncryption, EnvelopeEncryption, type EncryptionMode } from './encryption';
 import { SmartMemoryCache }  from './smart-memory-cache';
@@ -60,10 +61,18 @@ import { IpcTelemetryServer } from './ipc-telemetry.js';
 import {
   compressBuffer,
   decompressBuffer,
+  initZstd,
   PREFIX_COMPRESSED,
   PREFIX_ENC_COMPRESSED,
   type CompressionAlgorithm,
+  type CustomCompressor,
 } from './compression';
+import {
+  isWildcardTag,
+  matchesTagPattern,
+  isChildTag,
+  expandHierarchicalTags,
+} from './utils/tag-matcher.js';
 
 // ─── Lua scripts ─────────────────────────────────────────────────────────────
 
@@ -501,11 +510,14 @@ export class CacheService {
     redisProtocol: 2 | 3 | undefined;
     useShardedPubSub: boolean;
     compression: CompressionAlgorithm;
+    customCompressor?: CustomCompressor;
     compressionThresholdBytes: number;
     strictSingleton: boolean;
     failClosed: boolean;
     tagStrategy: 'set' | 'generational';
     tagVersionTtlMs: number;
+    hierarchicalTags: boolean;
+    tagHierarchyDelimiter: string;
     cloneStrategy: 'none' | 'structuredClone';
     backplaneMode: 'pubsub' | 'stream';
     backplaneStreamMaxLen: number;
@@ -536,6 +548,7 @@ export class CacheService {
   };
   /** Pre-computed once — opts.namespace never changes after construction. */
   private readonly _namespace:      string;
+  private readonly prefixLen:       number;
   /** Pre-computed once — disableRedis and redisHost never change after construction. */
   private readonly _redisDisabled:  boolean;
   private readonly watchdog:        TierLatencyWatchdog;
@@ -765,12 +778,15 @@ export class CacheService {
       redisSentinel:            options.redisSentinel,
       redisProtocol:            options.redisProtocol,
       useShardedPubSub:         options.useShardedPubSub ?? false,
-      compression:              options.compression ?? 'none',
+      compression:              options.compression ?? 'zstd',
+      customCompressor:         options.customCompressor,
       compressionThresholdBytes: options.compressionThresholdBytes ?? 1024,
       strictSingleton:          options.strictSingleton ?? false,
       failClosed:               options.failClosed ?? false,
       tagStrategy:              options.tagStrategy ?? 'set',
       tagVersionTtlMs:          options.tagVersionTtlMs ?? 5_000,
+      hierarchicalTags:         options.hierarchicalTags ?? false,
+      tagHierarchyDelimiter:    options.tagHierarchyDelimiter ?? ':',
       cloneStrategy:            options.cloneStrategy ?? 'none',
       backplaneMode:            options.backplaneMode ?? 'pubsub',
       backplaneStreamMaxLen:    options.backplaneStreamMaxLen ?? 10_000,
@@ -854,6 +870,7 @@ export class CacheService {
     });
 
     this._namespace     = ns;
+    this.prefixLen      = ns ? ns.length + 1 : 0;
     // disableRedis takes unconditional precedence; otherwise, L2 is active when
     // at least one of host / cluster nodes / sentinel is configured.
     this._redisDisabled = this.opts.disableRedis
@@ -991,6 +1008,9 @@ export class CacheService {
 
     // Auto-warm from remote snapshot or L2 if configured; ready() waits for completion.
     const startupPromises: Promise<void>[] = [];
+    if (this.opts.compression === 'zstd') {
+      startupPromises.push(initZstd().then(() => undefined));
+    }
     if (this.opts.remoteSnapshot) {
       startupPromises.push(this.loadRemoteSnapshot().then(() => undefined));
     }
@@ -1534,6 +1554,50 @@ export class CacheService {
       const tag = key;
       const ver = typeof tagVersion === 'number' ? tagVersion : ((this.tagVersions.get(tag)?.version ?? 0) + 1);
       this._setLocalTagVersion(tag, ver, performance.now());
+    } else if (op === 'tag_pattern_incr') {
+      const pattern = key;
+      const now = performance.now();
+      for (const [tag, info] of this.tagVersions) {
+        if (matchesTagPattern(pattern, tag)) {
+          this._setLocalTagVersion(tag, info.version + 1, now);
+        }
+      }
+      this.l1.scan((k, entry) => {
+        if (entry.tagVersions) {
+          for (const tag of Object.keys(entry.tagVersions)) {
+            if (matchesTagPattern(pattern, tag)) {
+              this.l1.delete(k);
+              this._bumpKeyMutation(k);
+              break;
+            }
+          }
+        }
+      }, 0);
+    } else if (op === 'tag_pattern_del') {
+      const pattern = key;
+      const matchedTagKeys: string[] = [];
+      const prefix = this.nk('_tag_:');
+      for (const [tagKey, members] of this.tagIndex) {
+        const tag = tagKey.startsWith(prefix) ? tagKey.slice(prefix.length) : tagKey;
+        if (matchesTagPattern(pattern, tag)) {
+          matchedTagKeys.push(tagKey);
+          for (const k of members) {
+            this.l1.delete(k);
+            this._bumpKeyMutation(k);
+            this._pendingDiskDeletes.add(k);
+            setImmediate(() => {
+              try {
+                if (!this._diskDisabled) this.disk.delete(k);
+              } finally {
+                this._pendingDiskDeletes.delete(k);
+              }
+            });
+          }
+        }
+      }
+      for (const tagKey of matchedTagKeys) {
+        this.tagIndex.delete(tagKey);
+      }
     }
     this.logger.debug('Backplane: invalidation applied', { op, key: key.slice(0, 60) });
   }
@@ -1548,7 +1612,7 @@ export class CacheService {
         Array.isArray(msg) ||
         typeof msg.src !== 'string' ||
         typeof msg.key !== 'string' ||
-        (msg.op !== 'del' && msg.op !== 'del-glob' && msg.op !== 'tag_incr')
+        (msg.op !== 'del' && msg.op !== 'del-glob' && msg.op !== 'tag_incr' && msg.op !== 'tag_pattern_incr' && msg.op !== 'tag_pattern_del')
       ) {
         this.logger.warn('Backplane: rejected invalid pubsub message format', {
           raw: typeof message === 'string' ? message.slice(0, 100).replace(/[\r\n\t]/g, ' ') : String(message),
@@ -1567,7 +1631,7 @@ export class CacheService {
   }
 
   private async publishInvalidation(
-    op: 'del' | 'del-glob' | 'tag_incr',
+    op: 'del' | 'del-glob' | 'tag_incr' | 'tag_pattern_incr' | 'tag_pattern_del',
     key: string,
     tagVersion?: number,
     isCrossRegionRelay = false,
@@ -1640,7 +1704,7 @@ export class CacheService {
   }
 
   private async _broadcastCrossRegion(
-    op: 'del' | 'del-glob' | 'tag_incr',
+    op: 'del' | 'del-glob' | 'tag_incr' | 'tag_pattern_incr' | 'tag_pattern_del',
     key: string,
     tagVersion?: number,
   ): Promise<void> {
@@ -1767,12 +1831,12 @@ export class CacheService {
    * Offloads to worker thread if pool is active and payload exceeds threshold.
    */
   private async _serializeAndEncrypt(serialized: string): Promise<string> {
-    const isCompressed = this.opts.compression && this.opts.compression !== 'none' && serialized.length > this.opts.compressionThresholdBytes;
-    if (this._workerPool && (this.enc.isEnabled || isCompressed) && serialized.length > this.opts.workerThresholdBytes) {
+    const isCompressed = (this.opts.customCompressor || (this.opts.compression && this.opts.compression !== 'none')) && serialized.length > this.opts.compressionThresholdBytes;
+    if (this._workerPool && !this.opts.customCompressor && (this.enc.isEnabled || isCompressed) && serialized.length > this.opts.workerThresholdBytes) {
       return this._workerPool.encrypt(serialized);
     }
     if (isCompressed) {
-      const compressed = compressBuffer(Buffer.from(serialized, 'utf8'), this.opts.compression);
+      const compressed = compressBuffer(Buffer.from(serialized, 'utf8'), this.opts.compression, this.opts.customCompressor);
       if (this.enc.isEnabled) {
         const encrypted = this.enc.encryptBuffer(compressed);
         return PREFIX_ENC_COMPRESSED + encrypted.toString('base64');
@@ -1788,16 +1852,16 @@ export class CacheService {
    */
   private async _decryptAndDeserialize<T>(raw: string): Promise<T> {
     let plain: string;
-    if (this._workerPool && raw.length > this.opts.workerThresholdBytes) {
+    if (this._workerPool && !this.opts.customCompressor && raw.length > this.opts.workerThresholdBytes) {
       plain = await this._workerPool.decrypt(raw);
     } else if (raw.startsWith(PREFIX_ENC_COMPRESSED)) {
       const encBuf = Buffer.from(raw.slice(PREFIX_ENC_COMPRESSED.length), 'base64');
       const decBuf = this.enc.decryptBuffer(encBuf);
-      const decompressed = decompressBuffer(decBuf, this.opts.compression !== 'none' ? this.opts.compression : 'brotli');
+      const decompressed = decompressBuffer(decBuf, this.opts.compression !== 'none' ? this.opts.compression : 'brotli', this.opts.customCompressor);
       plain = decompressed.toString('utf8');
     } else if (raw.startsWith(PREFIX_COMPRESSED)) {
       const cmpBuf = Buffer.from(raw.slice(PREFIX_COMPRESSED.length), 'base64');
-      const decompressed = decompressBuffer(cmpBuf, this.opts.compression !== 'none' ? this.opts.compression : 'brotli');
+      const decompressed = decompressBuffer(cmpBuf, this.opts.compression !== 'none' ? this.opts.compression : 'brotli', this.opts.customCompressor);
       plain = decompressed.toString('utf8');
     } else if (raw.startsWith('enc:v1:') || this.enc.isEnabled) {
       plain = this.enc.decrypt(raw);
@@ -2257,7 +2321,9 @@ export class CacheService {
     const optRefreshAhead = opts.refreshAhead;
     const optXfetchBeta   = opts.xfetchBeta;
     const optNotFoundTtl  = opts.notFoundTtl;
-    const optTags         = opts.tags;
+    const optTags         = opts.tags
+      ? (this.opts.hierarchicalTags ? expandHierarchicalTags(opts.tags, this.opts.tagHierarchyDelimiter) : opts.tags)
+      : undefined;
 
     // L1: in-memory (fastest path)
     const l1Hit = this.l1.get(k);
@@ -2797,15 +2863,19 @@ export class CacheService {
       this.counters.sets++;
 
       let activeTagVersions: Record<string, number> | undefined;
-      if (opts?.tags?.length) {
+      const tagsToRegister = opts?.tags?.length
+        ? (this.opts.hierarchicalTags ? expandHierarchicalTags(opts.tags, this.opts.tagHierarchyDelimiter) : opts.tags)
+        : undefined;
+
+      if (tagsToRegister?.length) {
         if (this.opts.tagStrategy === 'generational') {
-          const vers = await Promise.all(opts.tags.map(tag => this._getTagVersion(tag)));
+          const vers = await Promise.all(tagsToRegister.map(tag => this._getTagVersion(tag)));
           activeTagVersions = {};
-          for (let i = 0; i < opts.tags.length; i++) {
-            activeTagVersions[opts.tags[i]] = vers[i];
+          for (let i = 0; i < tagsToRegister.length; i++) {
+            activeTagVersions[tagsToRegister[i]] = vers[i];
           }
         } else {
-          await this._registerTags(k, opts.tags, ttlSeconds);
+          await this._registerTags(k, tagsToRegister, ttlSeconds);
         }
       }
 
@@ -3350,7 +3420,7 @@ export class CacheService {
    */
   async mget<T>(
     keys: string[],
-    fetchFn: (missKeys: string[]) => Promise<Record<string, T>>,
+    fetchFn?: (missKeys: string[]) => Promise<Record<string, T> | Map<string, T>>,
     ttl: number | ((key: string) => number) = 300,
     priority?: CachePriority,
   ): Promise<(T | undefined)[]> {
@@ -3461,16 +3531,24 @@ export class CacheService {
       }
 
       // ── Tier 3: fetchFn for whatever still missed ──
-      if (missKeys.length > 0) {
+      if (missKeys.length > 0 && fetchFn) {
         this.counters.fetches++;
         const fetched = await fetchFn(missKeys);
+        const isMap = fetched instanceof Map;
         const setPromises: Promise<void>[] = [];
         for (let j = 0; j < missKeys.length; j++) {
-          const v = fetched[missKeys[j]];
+          const k = missKeys[j];
+          const v = isMap ? (fetched as Map<string, T>).get(k) : (fetched as Record<string, T>)[k];
           result[missIndexes[j]] = v;
-          if (v !== undefined) {
-            const resolvedTtl = typeof ttl === 'function' ? ttl(missKeys[j]) : ttl;
-            setPromises.push(this.set(missKeys[j], v, resolvedTtl, priority));
+          if (v !== undefined && v !== null) {
+            const resolvedTtl = typeof ttl === 'function' ? ttl(k) : ttl;
+            setPromises.push(this.set(k, v, resolvedTtl, priority));
+          } else if (v == null && this.opts.notFoundTtl > 0) {
+            // Negative caching: cache null/missing records with notFoundTtl to protect origin DB
+            setPromises.push(this.set(k, null as unknown as T, this.opts.notFoundTtl, priority));
+          } else if (v === null) {
+            const resolvedTtl = typeof ttl === 'function' ? ttl(k) : ttl;
+            setPromises.push(this.set(k, null as unknown as T, resolvedTtl, priority));
           }
         }
         if (setPromises.length > 0) {
@@ -3628,21 +3706,131 @@ export class CacheService {
   }
 
   /**
-   * Invalidate all keys associated with a tag.
-   * Deletes from L1, disk, and Redis (both the keyed values and the tag set).
+   * Discovers all concrete tag names in the system that match `tag` either via
+   * glob wildcards ('*' or '?') or parent-child hierarchy cascading.
+   * Scans local in-memory indices (tagIndex, tagVersions, L1 entries) and Redis (if connected).
+   */
+  private async _resolveMatchingTags(tag: string, shouldCascade: boolean): Promise<Set<string>> {
+    const isPattern = isWildcardTag(tag);
+    const delim = this.opts.tagHierarchyDelimiter;
+    const matched = new Set<string>();
+
+    const tagMatches = (t: string): boolean => {
+      if (t === tag) return true;
+      if (isPattern && matchesTagPattern(tag, t)) return true;
+      if (shouldCascade && isChildTag(tag, t, delim)) return true;
+      return false;
+    };
+
+    if (shouldCascade && !isPattern) {
+      matched.add(tag);
+    }
+
+    // 1. Scan in-process tagIndex (set strategy)
+    const tagPrefix = this.nk('_tag_:');
+    for (const tagKey of this.tagIndex.keys()) {
+      const t = tagKey.startsWith(tagPrefix) ? tagKey.slice(tagPrefix.length) : tagKey;
+      if (tagMatches(t)) matched.add(t);
+    }
+
+    // 2. Scan in-process tagVersions (generational strategy)
+    for (const t of this.tagVersions.keys()) {
+      if (tagMatches(t)) matched.add(t);
+    }
+
+    // 3. Scan in-process L1 entries for any active tags
+    this.l1.scan((_k, entry) => {
+      if (entry.tagVersions) {
+        for (const t of Object.keys(entry.tagVersions)) {
+          if (tagMatches(t)) matched.add(t);
+        }
+      }
+    }, 0);
+
+    // 4. Scan Redis if connected
+    if (!this._redisDisabled) {
+      try {
+        const client = await this.getRedis();
+        if (this.opts.tagStrategy === 'generational') {
+          const redisPattern = isPattern
+            ? this.nk(`tag_ver:${tag}`)
+            : this.nk(`tag_ver:${tag}${delim}*`);
+          const scannedKeys = await this._scanKeys(client, redisPattern);
+          const pfx = this.nk('tag_ver:');
+          for (const sk of scannedKeys) {
+            const t = sk.startsWith(pfx) ? sk.slice(pfx.length) : sk;
+            if (tagMatches(t)) matched.add(t);
+          }
+        } else {
+          const redisPattern = isPattern
+            ? this.nk(`_tag_:${tag}`)
+            : this.nk(`_tag_:${tag}${delim}*`);
+          const scannedKeys = await this._scanKeys(client, redisPattern);
+          const pfx = this.nk('_tag_:');
+          for (const sk of scannedKeys) {
+            const t = sk.startsWith(pfx) ? sk.slice(pfx.length) : sk;
+            if (tagMatches(t)) matched.add(t);
+          }
+        }
+      } catch (err) {
+        this.logger.debug('_resolveMatchingTags: Redis scan failed', { tag, error: (err as Error).message });
+      }
+    }
+
+    return matched;
+  }
+
+  /**
+   * Invalidate all keys associated with a tag, wildcard glob pattern, or hierarchical namespace.
+   * Deletes from L1, disk, and Redis (both the keyed values and the tag metadata).
+   *
+   * @param tag Tag name or wildcard glob pattern (e.g. `'catalog'`, `'org:123:*'`, `'*:comments'`).
+   * @param opts Optional invalidation options, including `{ cascade: true }` to invalidate child namespaces.
    *
    * @example
    * await cache.set('product:1', data, 60, undefined, { tags: ['catalog'] });
    * await cache.invalidateTag('catalog'); // clears product:1 and any other tagged entries
+   *
+   * @example
+   * // Wildcard pattern invalidation
+   * await cache.invalidateTag('org:123:*');
+   *
+   * @example
+   * // Hierarchical tag cascading (clears 'org:123' and all child tags like 'org:123:dept:456')
+   * await cache.invalidateTag('org:123', { cascade: true });
    */
-  async invalidateTag(tag: string): Promise<void> {
+  async invalidateTag(tag: string, opts?: InvalidateTagOptions): Promise<void> {
     this._assertActive('invalidateTag');
     const span = this._startSpan('tricache.invalidate_tag');
     if (this.opts.tracer) {
       span.setAttribute('cache.tag', tag);
       span.setAttribute('cache.tag_strategy', this.opts.tagStrategy);
+      if (opts?.cascade) span.setAttribute('cache.cascade', true);
     }
     try {
+      const isPattern = isWildcardTag(tag);
+      const shouldCascade = Boolean(opts?.cascade || this.opts.hierarchicalTags);
+
+      if (isPattern || shouldCascade) {
+        const matchedTags = await this._resolveMatchingTags(tag, shouldCascade);
+        const delim = this.opts.tagHierarchyDelimiter;
+        const broadcastPattern = isPattern ? tag : `${tag}${delim}*`;
+
+        if (matchedTags.size > 0) {
+          await this.invalidateTags(Array.from(matchedTags));
+        }
+
+        // Broadcast wildcard invalidation across backplane and cross-region
+        const op = this.opts.tagStrategy === 'generational' ? 'tag_pattern_incr' : 'tag_pattern_del';
+        if (this.opts.awaitInvalidationBackplane) {
+          await this.publishInvalidation(op, broadcastPattern, undefined, false, true);
+        } else {
+          void this.publishInvalidation(op, broadcastPattern, undefined, false, true);
+        }
+        return;
+      }
+
+      // Fast-path: single discrete tag
       if (this.opts.tagStrategy === 'generational') {
         let newVer = 1;
         if (!this._redisDisabled) {
@@ -3710,20 +3898,37 @@ export class CacheService {
 
   /**
    * Invalidate all keys associated with any of the given tags in a single operation.
-   * Combines multiple `invalidateTag()` calls into one Redis pipeline round-trip,
-   * reducing latency when invalidating several related tags together.
+   * Supports discrete tags, wildcard glob patterns, and hierarchical cascading.
+   * Combines multiple tag invalidations into Redis pipeline round-trips.
    *
-   * Note: Redis pipelines are batched, not atomic. All L1/disk deletes happen
-   * synchronously before the Redis round-trip.
+   * @param tags Array of tag names or wildcard patterns (e.g. `['case:acme', 'org:*']`).
+   * @param opts Optional invalidation options, including `{ cascade: true }`.
    *
    * @example
-   * // Instead of three serial round-trips:
-   * await cache.invalidateTags(['case:acme', 'org:acme', 'ai-chat:acme']);
+   * await cache.invalidateTags(['case:acme', 'org:acme', 'ai-chat:*']);
    */
-  async invalidateTags(tags: string[]): Promise<void> {
+  async invalidateTags(tags: string[], opts?: InvalidateTagOptions): Promise<void> {
     this._assertActive('invalidateTags');
     if (tags.length === 0) return;
-    if (tags.length === 1) { await this.invalidateTag(tags[0]); return; }
+
+    const hasWildcards = tags.some(t => isWildcardTag(t));
+    const shouldCascade = Boolean(opts?.cascade || this.opts.hierarchicalTags);
+
+    if (hasWildcards || shouldCascade) {
+      const allResolvedTags = new Set<string>();
+      for (const t of tags) {
+        if (isWildcardTag(t) || shouldCascade) {
+          const resolved = await this._resolveMatchingTags(t, shouldCascade);
+          for (const rt of resolved) allResolvedTags.add(rt);
+        } else {
+          allResolvedTags.add(t);
+        }
+      }
+      if (allResolvedTags.size === 0) return;
+      tags = Array.from(allResolvedTags);
+    }
+
+    if (tags.length === 1) { await this.invalidateTag(tags[0], opts); return; }
 
     if (this.opts.tagStrategy === 'generational') {
       const now = performance.now();

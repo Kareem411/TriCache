@@ -501,7 +501,6 @@ describe('Systemic Invariant & Crack Hardening Audit Tests', () => {
 
   describe('Failure Path 7: Clock Domain Inversion in Generational Tags', () => {
     it('sets lastSyncedAt in monotonic performance.now() domain, expiring after tagVersionTtlMs', async () => {
-      let redisGetCount = 0;
       let redisTagVer = 1;
 
       const mockRedisClient = {

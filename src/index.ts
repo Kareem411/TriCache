@@ -36,7 +36,7 @@ export {
 export { DiskTier, resolveDefaultDiskDir } from './disk-tier';
 export { TierLatencyWatchdog, type LatencyWatchdogOptions, type LatencyWatchdogTelemetry } from './latency-watchdog';
 export { WasmBloomFilter }     from './wasm/bloom-filter-wasm';
-export { type CompressionAlgorithm } from './compression';
+export { type CompressionAlgorithm, type CustomCompressor, initZstd } from './compression';
 export { CacheCodec, defaultCodec, type CacheCodecOptions } from './codec';
 export {
   createHttpSnapshotAdapter,
@@ -114,6 +114,7 @@ export {
   type ICacheBatchObservableCallback,
   type ICacheMeter,
   type CacheHealthStatus,
+  type InvalidateTagOptions,
 } from './types';
 
 export {
@@ -121,6 +122,13 @@ export {
   formatTraceParent,
   type ParsedTraceParent,
 } from './utils/tracing';
+
+export {
+  isWildcardTag,
+  matchesTagPattern,
+  isChildTag,
+  expandHierarchicalTags,
+} from './utils/tag-matcher';
 
 export {
   tricacheDashboard,
