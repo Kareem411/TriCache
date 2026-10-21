@@ -20,6 +20,7 @@ import type { ILogger } from './types.ts';
 import {
   compressBuffer,
   decompressBuffer,
+  initZstd,
   PREFIX_COMPRESSED,
   PREFIX_ENC_COMPRESSED,
   type CompressionAlgorithm,
@@ -53,13 +54,16 @@ const enc = new CacheEncryption(
   prevMode,
 );
 
-const cmpAlgo = compression ?? 'none';
+const cmpAlgo = compression ?? 'zstd';
 const cmpThreshold = compressionThresholdBytes ?? 1024;
 
 parentPort!.on(
   'message',
-  ({ id, type, payload }: { id: number; type: 'encrypt' | 'decrypt'; payload: string | Uint8Array }) => {
+  async ({ id, type, payload }: { id: number; type: 'encrypt' | 'decrypt'; payload: string | Uint8Array }) => {
     try {
+      if (cmpAlgo === 'zstd') {
+        await initZstd();
+      }
       const textPayload =
         typeof payload === 'string'
           ? payload
