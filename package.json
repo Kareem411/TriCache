@@ -135,7 +135,7 @@
   "dependencies": {
     "ioredis": "6.0.0",
     "lz4js": "^0.2.0",
-    "msgpackr": "2.1.2",
+    "msgpackr": "2.1.4",
     "zstd-codec": "^0.1.5"
   },
   "devDependencies": {
