@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-11-10
+
+### Fixed
+- **Infinite Async Mutual Recursion in Tag Invalidation (`src/cache-service.ts`, `src/edge/cache.ts`)**:
+  - Separated concrete tag invalidation (`_invalidateConcreteTag`, `_invalidateConcreteTags`) from pattern/cascade resolution in `CacheService.invalidateTag()` and `CacheService.invalidateTags()`. Fixes an unbounded Promise microtask recursion hang and OOM crash whenever `hierarchicalTags: true`, `{ cascade: true }`, or a wildcard resolved to a single tag (such as discrete or leaf tags), and eliminates $N+1$ `_resolveMatchingTags()` scans on multi-tag matches.
+  - Updated `EdgeCacheService.invalidateTag()` to invoke `_invalidateConcreteTag()` directly for matched tags, preventing duplicate spans and recursion when indexed tags contain literal wildcard characters.
+- **Stream Backplane Pattern Invalidation Rejection (`src/cache-service.ts`)**:
+  - Updated `_processStreamEntry()` to accept `'tag_pattern_incr'` and `'tag_pattern_del'` operations alongside `'del'`, `'del-glob'`, and `'tag_incr'`, restoring cross-instance wildcard and hierarchical tag invalidation in `backplaneMode: 'stream'` (default for `'nextjs'`, `'microservice'`, and `'enterprise-hardened'` presets).
+- **Unbounded In-Memory Index Leaks & Container Cgroup OOM Guard (`src/cache-service.ts`, `src/edge/cache.ts`)**:
+  - Added reverse tracking (`keyTags`, `keyDependencies`) and L1 eviction/expiry/delete cleanup so `tagIndex`, `dependencyIndex`, and `_l1Counters` are bounded and pruned on `delete()`, wildcard `delete()`, `clear(prefix)`, full `clear()`, `destroy()`, and L1 TTL/capacity eviction (preserving `tagIndex` for L1.5 disk-spilled entries until invalidated or expired).
+  - Bounded `EdgeCacheService.tagVersionCache` to 10,000 entries.
+  - Updated `oomProtection` (`_runOomCheck()`) to evaluate Linux container cgroup RSS (`process.memoryUsage().rss / readCgroupMemoryLimit()`) alongside V8 heap usage so emergency L1 eviction fires before kernel OOM kills even when `--max-old-space-size` exceeds the cgroup ceiling.
+- **Redis Connection Cleanup & Cluster/Scale-Safe `DEL` (`src/cache-service.ts`)**:
+  - Cleared the 15s connection timeout timer and event listeners once settled in `getRedis()`, and disconnected orphaned `ioredis` clients on initial connection failure, timeout, or concurrent `destroy()`.
+  - Added `_deleteRedisKeys()` to chunk `DEL` calls in batches of 1,000 keys and route `RedisCluster` deletes via per-key pipelines, avoiding V8 argument stack overflows and `CROSSSLOT` errors.
+- **Generational Tag Consistency in `peek()`, `mget()`, and Redis Cleanup (`src/cache-service.ts`, `src/smart-memory-cache.ts`, `src/adapters/node-redis.ts`, `src/types.ts`)**:
+  - Added generational `tagVersions` validation and Redis Hash (`HGETALL`) support (with `WRONGTYPE` fallback to `GET`) to `peek()` and `mget()`, plus `hgetall` support in `NodeRedisAdapter` / `NodeRedisPipelineAdapter`.
+  - Synchronized `setAt` timestamps between `SmartMemoryCache.set()` and Redis `HSET` writes (`writeTs`) so `LUA_COMPARE_AND_DELETE` matches cleanly across async serialization delays, and added the `mutationEpochAtStart` race guard to `get()` L2 Redis hit promotion.
+- **Next.js Cache Handler & HTTP Middleware Fixes (`src/next/cache-handler.ts`, `src/next/isr-handler.ts`, `src/http/fastify.ts`, `src/http/express.ts`)**:
+  - Switched `TriCacheHandler.get()`, `TriCacheISRHandler.get()`, and Fastify `onRequest` probes to `cache.peek()`, preventing cache misses from persisting `null` for 300s or issuing invalid Redis `SETEX ... 0` writes.
+  - Hardened `createExpressMiddleware()` so coalesced concurrent callers on non-2xx responses resolve cleanly without hanging, wrapped `res` methods are restored, and premature response `'close'` events clear `inflight`.
+
+### Tests
+- Added regression coverage in `tests/hierarchical-wildcard-tags.test.ts`, `tests/stream-backplane.test.ts`, `tests/generational-tagging.test.ts`, `tests/next-cache-handler.test.ts`, `tests/http-middlewares.test.ts`, `tests/resilience-leaks-hardening.test.ts`, and `tests/e2e-tag-invalidation-backplane.test.ts` (926 passing tests across 90 files).
+
 ## [1.0.0] — 2026-10-21
 
 ### Added
