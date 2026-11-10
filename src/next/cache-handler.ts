@@ -111,10 +111,7 @@ export class TriCacheHandler {
    * and returns a fresh unlocked ReadableStream if the stored value was a stream.
    */
   async get(cacheKey: string, ctx?: CacheHandlerContext): Promise<CacheHandlerValue | undefined> {
-    const stored = await this.cache.get<StoredNextCacheEntry | null>(
-      cacheKey,
-      async () => null,
-    );
+    const stored = await this.cache.peek<StoredNextCacheEntry>(cacheKey);
 
     if (!stored || stored.data == null) {
       return undefined;

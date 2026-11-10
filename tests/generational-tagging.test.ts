@@ -213,5 +213,190 @@ describe('Generational Tag Invalidation (tagStrategy: generational)', () => {
 
     await cache.destroy();
   });
+
+  it('peek() and mget() detect generational tag invalidation across L1, disk, and L2 Redis hashes', async () => {
+    let redisVer = 0;
+    const redisStore = new Map<string, any>();
+
+    const mockRedis = {
+      get: vi.fn(async (key: string) => {
+        if (key.includes('tag_ver:')) return String(redisVer);
+        const val = redisStore.get(key);
+        if (val && typeof val === 'object') throw new Error('WRONGTYPE Operation against a key holding the wrong kind of value');
+        return val ?? null;
+      }),
+      set: vi.fn(async () => 'OK'),
+      setex: vi.fn(async (k: string, _ttl: number, val: string) => { redisStore.set(k, val); return 'OK'; }),
+      hgetall: vi.fn(async (k: string) => {
+        const val = redisStore.get(k);
+        if (typeof val === 'string') throw new Error('WRONGTYPE Operation against a key holding the wrong kind of value');
+        return val ?? {};
+      }),
+      hset: vi.fn(async (k: string, data: any) => { redisStore.set(k, data); return 1; }),
+      multi: () => {
+        const ops: Array<() => [Error | null, any]> = [];
+        return {
+          get(k: string) {
+            ops.push(() => {
+              const v = redisStore.get(k);
+              if (v && typeof v === 'object') return [new Error('WRONGTYPE Operation against a key holding the wrong kind of value'), null];
+              return [null, v ?? null];
+            });
+            return this;
+          },
+          hgetall(k: string) {
+            ops.push(() => {
+              const v = redisStore.get(k);
+              if (typeof v === 'string') return [new Error('WRONGTYPE Operation against a key holding the wrong kind of value'), null];
+              return [null, v ?? {}];
+            });
+            return this;
+          },
+          hset(k: string, data: any) { ops.push(() => { redisStore.set(k, data); return [null, 1]; }); return this; },
+          expire() { ops.push(() => [null, 1]); return this; },
+          async exec() { return ops.map(fn => fn()); },
+        };
+      },
+      incr: vi.fn(async () => ++redisVer),
+      eval: vi.fn(async () => 1),
+      publish: vi.fn(async () => 1),
+      subscribe: vi.fn(async () => 'OK'),
+      disconnect: vi.fn(async () => {}),
+      on: vi.fn(),
+      status: 'ready',
+    };
+
+    svc = new CacheService({
+      tagStrategy: 'generational',
+      tagVersionTtlMs: 20,
+      disableRedis: false,
+      disableDisk: true,
+      invalidationBackplane: false,
+      compression: 'none',
+    });
+    (svc as any).redis = mockRedis;
+    (svc as any)._redisDisabled = false;
+
+    await svc.set('tagged:1', 'v1', 60, undefined, { tags: ['grp'] });
+    await svc.set('plain:1', 'plain-v1', 60);
+    // Simulate a legacy untagged string in Redis
+    redisStore.set('legacy:1', JSON.stringify('legacy-v1'));
+
+    expect(await svc.peek('tagged:1')).toBe('v1');
+    expect(await svc.mget(['tagged:1', 'plain:1'])).toEqual(['v1', 'plain-v1']);
+
+    // Evict L1 so peek/mget hit L2 Redis
+    (svc as any).l1.clear();
+    expect(await svc.peek('tagged:1')).toBe('v1');
+    expect(await svc.peek('legacy:1')).toBe('legacy-v1');
+
+    (svc as any).l1.clear();
+    expect(await svc.mget(['tagged:1', 'legacy:1'])).toEqual(['v1', 'legacy-v1']);
+
+    // Invalidate tag -> peek() returns null and mget() invokes fetchFn
+    await svc.invalidateTag('grp');
+    expect(await svc.peek('tagged:1')).toBeNull();
+
+    let fetchedKeys: string[] = [];
+    const mgetAfterInv = await svc.mget(['tagged:1', 'plain:1'], async (missKeys) => {
+      fetchedKeys = missKeys;
+      return { 'tagged:1': 'v2' };
+    });
+    expect(fetchedKeys).toEqual(['tagged:1']);
+    expect(mgetAfterInv).toEqual(['v2', 'plain-v1']);
+  });
+
+  it('passes matching setAt timestamp to LUA_COMPARE_AND_DELETE even when async serialization takes >= 5ms', async () => {
+    let redisVer = 0;
+    const redisStore = new Map<string, any>();
+    const evalCalls: Array<{ key: string; tsArg: string; storedTs: string | undefined }> = [];
+
+    const mockRedis = {
+      get: vi.fn(async (key: string) => (key.includes('tag_ver:') ? String(redisVer) : (redisStore.get(key) ?? null))),
+      setex: vi.fn(async (k: string, _ttl: number, val: string) => { redisStore.set(k, val); return 'OK'; }),
+      hgetall: vi.fn(async (k: string) => redisStore.get(k) ?? {}),
+      multi: () => {
+        const ops: Array<() => [Error | null, any]> = [];
+        return {
+          hset(k: string, data: any) { ops.push(() => { redisStore.set(k, data); return [null, 1]; }); return this; },
+          expire() { ops.push(() => [null, 1]); return this; },
+          async exec() { return ops.map(fn => fn()); },
+        };
+      },
+      incr: vi.fn(async () => ++redisVer),
+      eval: vi.fn(async (_script: string, _numKeys: number, key: string, tsArg: string) => {
+        const storedTs = redisStore.get(key)?.t;
+        evalCalls.push({ key, tsArg, storedTs });
+        if (storedTs === tsArg) {
+          redisStore.delete(key);
+          return 1;
+        }
+        return 0;
+      }),
+      publish: vi.fn(async () => 1),
+      disconnect: vi.fn(async () => {}),
+    };
+
+    svc = new CacheService({
+      tagStrategy: 'generational',
+      disableRedis: false,
+      disableDisk: true,
+      invalidationBackplane: false,
+      compression: 'none',
+    });
+    (svc as any).redis = mockRedis;
+    (svc as any)._redisDisabled = false;
+
+    const origSerialize = (svc as any)._serializeAndEncrypt.bind(svc);
+    (svc as any)._serializeAndEncrypt = async (s: string) => {
+      await new Promise(r => setTimeout(r, 10)); // force >= 10ms gap
+      return origSerialize(s);
+    };
+
+    await svc.set('ts:key', 'old', 60, undefined, { tags: ['ts-tag'] });
+    await svc.invalidateTag('ts-tag');
+    await svc.get('ts:key', async () => 'new', 60, { tags: ['ts-tag'] });
+
+    expect(evalCalls.length).toBe(1);
+    expect(evalCalls[0].tsArg).toBe(evalCalls[0].storedTs);
+  });
+
+  it('does not resurrect deleted key into L1 when delete() races with an in-flight L2 Redis read', async () => {
+    const redisStore = new Map<string, string>();
+    let releaseRedisGet: (() => void) | null = null;
+    const getStarted = new Promise<void>(resolve => {
+      const mockRedis = {
+        get: vi.fn(async (k: string) => {
+          resolve();
+          await new Promise<void>(r => { releaseRedisGet = r; });
+          return redisStore.get(k) ?? null;
+        }),
+        del: vi.fn(async (k: string) => { redisStore.delete(k); return 1; }),
+        setex: vi.fn(async (k: string, _ttl: number, v: string) => { redisStore.set(k, v); return 'OK'; }),
+        disconnect: vi.fn(async () => {}),
+      };
+
+      svc = new CacheService({
+        disableRedis: false,
+        disableDisk: true,
+        invalidationBackplane: false,
+        compression: 'none',
+      });
+      (svc as any).redis = mockRedis;
+      (svc as any)._redisDisabled = false;
+    });
+
+    redisStore.set('race:key', JSON.stringify('stale-value'));
+
+    const readPromise = svc!.get('race:key', async () => 'fresh', 60);
+    await getStarted;
+
+    // Delete happens while L2 Redis GET is still in flight
+    await svc!.delete('race:key');
+    releaseRedisGet!();
+
+    await readPromise;
+    expect(svc!.has('race:key')).toBe(false);
+  });
 });
 

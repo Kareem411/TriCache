@@ -50,12 +50,13 @@ import {
   CachePresetType,
   CacheHealthStatus,
   InvalidateTagOptions,
+  EvictionReason,
 } from './types';
 import { CacheEncryption, EnvelopeEncryption, type EncryptionMode } from './encryption';
 import { SmartMemoryCache }  from './smart-memory-cache';
 import { DiskTier, resolveDefaultDiskDir } from './disk-tier';
 import { TierLatencyWatchdog } from './latency-watchdog';
-import { resolveAutonomousL1MaxBytes } from './utils/cgroup';
+import { resolveAutonomousL1MaxBytes, readCgroupMemoryLimit } from './utils/cgroup';
 import { AutoPipeliner } from './adapters/auto-pipeliner';
 import { IpcTelemetryServer } from './ipc-telemetry.js';
 import {
@@ -558,6 +559,8 @@ export class CacheService {
   private readonly _l1Counters = new Map<string, { value: number; expiresAt: number }>();
   /** tag → Set of namespaced cache keys; maintained in-process for O(1) invalidateTag() */
   private readonly tagIndex    = new Map<string, Set<string>>();
+  /** Reverse index of namespaced key → { tags, expiresAt } for bounded cleanup on eviction/delete */
+  private readonly keyTags     = new Map<string, { tags: string[]; expiresAt: number }>();
   /** tag → { version, lastSyncedAt } for generational tag invalidation (bounded to 10,000 entries) */
   private readonly tagVersions = new Map<string, { version: number; lastSyncedAt: number }>();
   /**
@@ -565,6 +568,9 @@ export class CacheService {
    * When an exact-key delete matches a registered pattern, all dependents are cascaded.
    */
   private readonly dependencyIndex = new Map<string, Set<string>>();
+  /** Reverse index of namespaced dependent key → source glob patterns */
+  private readonly keyDependencies = new Map<string, string[]>();
+  private readonly _cgroupMemoryLimit: number;
   private redis:               AnyRedisClient | null = null;
   private redisConnecting:     Promise<AnyRedisClient> | null = null;
   private readonly cb:         L2CircuitBreaker;
@@ -639,6 +645,97 @@ export class CacheService {
   private _getKeyMutationEpoch(namespacedKey: string): number {
     return this._globalEpoch + (this._keyMutationEpochs.get(namespacedKey) ?? 0);
   }
+
+  private _removeKeyTags(namespacedKey: string): void {
+    const entry = this.keyTags.get(namespacedKey);
+    if (!entry) return;
+    for (const tag of entry.tags) {
+      const tagKey = this.nk(`_tag_:${tag}`);
+      const members = this.tagIndex.get(tagKey);
+      if (members) {
+        members.delete(namespacedKey);
+        if (members.size === 0) this.tagIndex.delete(tagKey);
+      }
+    }
+    this.keyTags.delete(namespacedKey);
+  }
+
+  private _removeKeyDependencies(namespacedKey: string): void {
+    const patterns = this.keyDependencies.get(namespacedKey);
+    if (patterns) {
+      for (const pat of patterns) {
+        const deps = this.dependencyIndex.get(pat);
+        if (deps) {
+          deps.delete(namespacedKey);
+          if (deps.size === 0) this.dependencyIndex.delete(pat);
+        }
+      }
+      this.keyDependencies.delete(namespacedKey);
+    } else if (this.dependencyIndex.size > 0) {
+      for (const [pat, deps] of this.dependencyIndex) {
+        deps.delete(namespacedKey);
+        if (deps.size === 0) this.dependencyIndex.delete(pat);
+      }
+    }
+  }
+
+  private _handleL1Eviction(namespacedKey: string, reason: EvictionReason): void {
+    const spilledToDisk = !this._diskDisabled && (
+      reason === 'capacity' ||
+      reason === 'category' ||
+      reason === 'rebalance' ||
+      reason === 'oom'
+    );
+    if (!spilledToDisk) {
+      this._removeKeyTags(namespacedKey);
+      this._removeKeyDependencies(namespacedKey);
+    }
+  }
+
+  private _removePrefixFromIndices(prefix: string): void {
+    for (const k of Array.from(this.keyTags.keys())) {
+      if (k.startsWith(prefix)) this._removeKeyTags(k);
+    }
+    for (const k of Array.from(this.keyDependencies.keys())) {
+      if (k.startsWith(prefix)) this._removeKeyDependencies(k);
+    }
+    for (const k of Array.from(this._l1Counters.keys())) {
+      if (k.startsWith(prefix)) this._l1Counters.delete(k);
+    }
+  }
+
+  private _sweepExpiredMetadata(): void {
+    const now = Date.now();
+    for (const [k, c] of this._l1Counters) {
+      if (c.expiresAt <= now) this._l1Counters.delete(k);
+    }
+    for (const [k, meta] of this.keyTags) {
+      if (meta.expiresAt <= now && !this.l1.has(k)) {
+        this._removeKeyTags(k);
+        this._removeKeyDependencies(k);
+      }
+    }
+  }
+
+  private _runOomCheck(): void {
+    const heap = v8.getHeapStatistics();
+    const heapUsed = heap.used_heap_size / heap.heap_size_limit;
+    const cgroupUsed = Number.isFinite(this._cgroupMemoryLimit) && this._cgroupMemoryLimit > 0
+      ? process.memoryUsage().rss / this._cgroupMemoryLimit
+      : 0;
+    const used = Math.max(heapUsed, cgroupUsed);
+    if (used >= this.opts.oomHeapThreshold) {
+      const evicted = this.l1.evictPercentage(this.opts.oomEvictPercent);
+      this.counters.oomEvictions++;
+      this.counters.oomLastAt = Date.now();
+      this.logger.warn('tricache OOM guard: emergency L1 eviction', {
+        heapUsedPct: Math.round(heapUsed * 100),
+        cgroupUsedPct: cgroupUsed > 0 ? Math.round(cgroupUsed * 100) : undefined,
+        threshold:   Math.round(this.opts.oomHeapThreshold * 100),
+        evicted,
+      });
+    }
+  }
   private _ipcServer?: IpcTelemetryServer;
   /** Timestamp (Date.now()) when the backplane subscriber last lost its connection. */
   private _subDisconnectedAt:  number | null = null;
@@ -688,6 +785,7 @@ export class CacheService {
   constructor(options: CacheOptions = {}) {
     const logger = options.logger ?? consoleLogger;
     this.logger  = logger;
+    this._cgroupMemoryLimit = readCgroupMemoryLimit();
 
     // Resolve namespace: trim whitespace, default to empty string
     const ns = options.namespace?.trim() ?? '';
@@ -903,7 +1001,10 @@ export class CacheService {
         // backplane handler already does for remote invalidations.
         setImmediate(() => { void this.disk.save(key, entry as unknown as DiskCacheEntry); });
       },
-      onEviction: options.onEviction,
+      onEviction: (key: string, reason: EvictionReason) => {
+        this._handleL1Eviction(key, reason);
+        options.onEviction?.(key, reason);
+      },
       logger,
     });
 
@@ -952,6 +1053,7 @@ export class CacheService {
     // here to avoid a synchronous O(fileCount) event-loop stall at scale.
     this.cleanupInterval = setInterval(() => {
       const cleaned = this.l1.cleanup();
+      this._sweepExpiredMetadata();
       if (cleaned > 0) this.logger.debug('Periodic L1 cleanup', { cleaned });
     }, 5 * 60 * 1000);
     if (this.cleanupInterval.unref) this.cleanupInterval.unref(); // don't block process exit
@@ -965,21 +1067,10 @@ export class CacheService {
       if (this.diskJanitorInterval.unref) this.diskJanitorInterval.unref();
     }
 
-    // OOM protection: evict coldest L1 entries when heap pressure rises
+    // OOM protection: evict coldest L1 entries when heap or container RSS pressure rises
     if (this.opts.oomProtection) {
       this.oomInterval = setInterval(() => {
-        const heap = v8.getHeapStatistics();
-        const used = heap.used_heap_size / heap.heap_size_limit;
-        if (used >= this.opts.oomHeapThreshold) {
-          const evicted = this.l1.evictPercentage(this.opts.oomEvictPercent);
-          this.counters.oomEvictions++;
-          this.counters.oomLastAt = Date.now();
-          this.logger.warn('tricache OOM guard: emergency L1 eviction', {
-            heapUsedPct: Math.round(used * 100),
-            threshold:   Math.round(this.opts.oomHeapThreshold * 100),
-            evicted,
-          });
-        }
+        this._runOomCheck();
       }, this.opts.oomCheckIntervalMs);
       if (this.oomInterval.unref) this.oomInterval.unref();
     }
@@ -1492,7 +1583,12 @@ export class CacheService {
       else if (f === 'tagVersion') tagVersionRaw = v;
     }
 
-    const validOp = op === 'del' || op === 'del-glob' || op === 'tag_incr';
+    const validOp =
+      op === 'del' ||
+      op === 'del-glob' ||
+      op === 'tag_incr' ||
+      op === 'tag_pattern_incr' ||
+      op === 'tag_pattern_del';
     if (!validOp || typeof key !== 'string' || !key || typeof src !== 'string') {
       this.logger.warn('Backplane: rejected invalid stream entry', {
         op: String(op).slice(0, 40),
@@ -1796,6 +1892,84 @@ export class CacheService {
     this.tagVersions.set(tag, { version: finalVersion, lastSyncedAt: now });
   }
 
+  private async _isGenerationalEntryStale(tagVersions?: Record<string, number>): Promise<boolean> {
+    if (this.opts.tagStrategy !== 'generational' || !tagVersions) return false;
+    const tags = Object.keys(tagVersions);
+    if (tags.length === 0) return false;
+    const currentVers = await Promise.all(tags.map(tag => this._getTagVersion(tag)));
+    for (let i = 0; i < tags.length; i++) {
+      if (currentVers[i] > tagVersions[tags[i]]) return true;
+    }
+    return false;
+  }
+
+  private async _deleteRedisKeys(client: AnyRedisClient, keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    const CHUNK_SIZE = 1_000;
+    if (client instanceof RedisCluster) {
+      for (let i = 0; i < keys.length; i += CHUNK_SIZE) {
+        const chunk = keys.slice(i, i + CHUNK_SIZE);
+        const pl = client.pipeline();
+        for (const k of chunk) pl.del(k);
+        await pl.exec();
+      }
+      return;
+    }
+    for (let i = 0; i < keys.length; i += CHUNK_SIZE) {
+      const chunk = keys.slice(i, i + CHUNK_SIZE);
+      await client.del(...chunk);
+    }
+  }
+
+  private async _parseGenerationalRedisHash<T>(
+    k: string,
+    hashData: Record<string, string>,
+  ): Promise<{ value?: T; tagVersions?: Record<string, number>; stale: boolean } | null> {
+    if (!hashData || !hashData.d) return null;
+    let storedTagVersions: Record<string, number> = {};
+    if (hashData.tv) {
+      try { storedTagVersions = JSON.parse(hashData.tv); } catch { /* ignore */ }
+    }
+    if (await this._isGenerationalEntryStale(storedTagVersions)) {
+      const setAtMs = parseInt(hashData.t, 10) || 0;
+      this._deleteIfStale(k, setAtMs);
+      return { stale: true };
+    }
+    const value = await this._decryptAndDeserialize<T>(hashData.d);
+    return { value, tagVersions: storedTagVersions, stale: false };
+  }
+
+  private async _readRedisEntry<T>(
+    client: AnyRedisClient,
+    k: string,
+    allowAutoPipeline = false,
+  ): Promise<{ value?: T; tagVersions?: Record<string, number>; stale: boolean } | null> {
+    if (this.opts.tagStrategy === 'generational' && typeof (client as any).hgetall === 'function') {
+      try {
+        const hashData = await client.hgetall(k);
+        if (typeof hashData === 'string') {
+          const value = await this._decryptAndDeserialize<T>(hashData);
+          return { value, stale: false };
+        }
+        if (hashData && hashData.d) {
+          return await this._parseGenerationalRedisHash<T>(k, hashData);
+        }
+        return null;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes('WRONGTYPE')) throw err;
+        // Fall through to GET if key was stored as a plain string without tags
+      }
+    }
+
+    const raw = (allowAutoPipeline && this.opts.autoPipeline && this.pipeliner)
+      ? await this.pipeliner.get(k)
+      : await client.get(k);
+    if (raw == null) return null;
+    const value = await this._decryptAndDeserialize<T>(raw);
+    return { value, stale: false };
+  }
+
   private async _getTagVersion(tag: string): Promise<number> {
     const now = performance.now();
     const local = this.tagVersions.get(tag);
@@ -1948,10 +2122,9 @@ export class CacheService {
     }
 
     this.redisConnecting = (async () => {
+      let client: AnyRedisClient | null = null;
       try {
         // ── Fix 4: Cluster / Sentinel / single-node connection factory ──────
-        let client: AnyRedisClient;
-
         if (this.opts.redisClusterNodes?.length) {
           // Redis Cluster — ioredis handles slot routing and multi-node pooling.
           client = new RedisCluster(this.opts.redisClusterNodes, {
@@ -2018,14 +2191,44 @@ export class CacheService {
           client.on('reconnecting', () => this.logger.debug('Redis reconnecting'));
         }
 
+        const pendingClient = client;
         await new Promise<void>((resolve, reject) => {
-          client.once('ready', resolve);
-          client.once('error', (e: Error) => {
+          let settled = false;
+          const cleanupListeners = () => {
+            pendingClient.removeListener?.('ready', onReady);
+            pendingClient.removeListener?.('error', onError);
+          };
+          const onReady = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            cleanupListeners();
+            resolve();
+          };
+          const onError = (e: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            cleanupListeners();
             this._checkAndLogResp3Hint(e);
             reject(e);
-          });
-          setTimeout(() => reject(new Error('Redis connection timeout')), 15_000);
+          };
+          const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            cleanupListeners();
+            reject(new Error('Redis connection timeout'));
+          }, 15_000);
+          if (timer.unref) timer.unref();
+
+          pendingClient.once('ready', onReady);
+          pendingClient.once('error', onError);
         });
+
+        if (this._destroyed) {
+          try { client.disconnect(); } catch { /* ok */ }
+          this._assertActive('getRedis');
+        }
 
         this.cb.onSuccess();
         this.redis = client;
@@ -2036,6 +2239,7 @@ export class CacheService {
         this.redisConnecting = null;
         return client;
       } catch (err) {
+        try { client?.disconnect(); } catch { /* ok */ }
         this.cb.onFailure();
         this.redisConnecting = null; // allow retry on next call — fixes the cached-rejection bug
         this._checkAndLogResp3Hint(err as Error);
@@ -2328,17 +2532,7 @@ export class CacheService {
     // L1: in-memory (fastest path)
     const l1Hit = this.l1.get(k);
     if (l1Hit !== null) {
-      let isGenerationalStale = false;
-      if (this.opts.tagStrategy === 'generational' && l1Hit.tagVersions) {
-        const tags = Object.keys(l1Hit.tagVersions);
-        const currentVers = await Promise.all(tags.map(tag => this._getTagVersion(tag)));
-        for (let i = 0; i < tags.length; i++) {
-          if (currentVers[i] > l1Hit.tagVersions[tags[i]]) {
-            isGenerationalStale = true;
-            break;
-          }
-        }
-      }
+      const isGenerationalStale = await this._isGenerationalEntryStale(l1Hit.tagVersions);
 
       if (isGenerationalStale) {
         this._deleteIfStale(k, l1Hit.setAt ?? 0);
@@ -2444,17 +2638,7 @@ export class CacheService {
             this.watchdog.onCanaryResult(diskHit !== null, diskElapsed);
 
             if (diskHit !== null) {
-              let isDiskStale = false;
-              if (this.opts.tagStrategy === 'generational' && diskHit.tagVersions) {
-                const tags = Object.keys(diskHit.tagVersions);
-                const currentVers = await Promise.all(tags.map(tag => this._getTagVersion(tag)));
-                for (let i = 0; i < tags.length; i++) {
-                  if (currentVers[i] > diskHit.tagVersions[tags[i]]) {
-                    isDiskStale = true;
-                    break;
-                  }
-                }
-              }
+              const isDiskStale = await this._isGenerationalEntryStale(diskHit.tagVersions);
 
               if (isDiskStale) {
                 this.disk.delete(k);
@@ -2489,64 +2673,35 @@ export class CacheService {
           try {
             const client = await this.getRedis();
             const redisStart = performance.now();
-            if (this.opts.tagStrategy === 'generational') {
-              const hashData = await client.hgetall(k);
-              const redisElapsed = performance.now() - redisStart;
-              this.watchdog.recordRedis(redisElapsed);
-              this.cb.onSuccess();
-              if (hashData && hashData.d) {
-                let isStale = false;
-                let storedTagVersions: Record<string, number> = {};
-                if (hashData.tv) {
-                  try { storedTagVersions = JSON.parse(hashData.tv); } catch { /* ignore */ }
-                }
-                const tags = Object.keys(storedTagVersions);
-                const currentVers = await Promise.all(tags.map(tag => this._getTagVersion(tag)));
-                for (let i = 0; i < tags.length; i++) {
-                  if (currentVers[i] > storedTagVersions[tags[i]]) {
-                    isStale = true;
-                    break;
-                  }
-                }
-                if (isStale) {
-                  const setAtMs = parseInt(hashData.t, 10) || 0;
-                  this._deleteIfStale(k, setAtMs);
-                } else {
-                  const parsed = await this._decryptAndDeserialize<T>(hashData.d);
-                  this.l1.set(k, parsed, ttlMs, priority, undefined, undefined, storedTagVersions);
-                  this.counters.l2Hits++;
-                  this.opts.onHit?.(cacheKey, 'l2');
-                  this.logger.debug('L2 hit (Redis hash)', { cacheKey });
-                  span.setAttribute('cache.hit', true)
-                    .setAttribute('cache.item.tier', 'remote')
-                    .setAttribute('cache.hit_tier', 'l2');
-                  if (this.opts.frozen) deepFreeze(parsed);
-                  return (this.opts.cloneStrategy === 'structuredClone' && parsed != null && typeof parsed === 'object')
-                    ? structuredClone(parsed)
-                    : parsed;
-                }
-              }
-            } else {
-              const raw = (this.opts.autoPipeline && this.pipeliner)
-                ? await this.pipeliner.get(k)
-                : await client.get(k);
-              const redisElapsed = performance.now() - redisStart;
-              this.watchdog.recordRedis(redisElapsed);
-              this.cb.onSuccess();
-              if (raw) {
-                const parsed = await this._decryptAndDeserialize<T>(raw);
-                this.l1.set(k, parsed, ttlMs, priority);
-                this.counters.l2Hits++;
-                this.opts.onHit?.(cacheKey, 'l2');
-                this.logger.debug('L2 hit (Redis)', { cacheKey });
-                span.setAttribute('cache.hit', true)
-                  .setAttribute('cache.item.tier', 'remote')
-                  .setAttribute('cache.hit_tier', 'l2');
-                if (this.opts.frozen) deepFreeze(parsed);
-                return (this.opts.cloneStrategy === 'structuredClone' && parsed != null && typeof parsed === 'object')
-                  ? structuredClone(parsed)
+            const redisHit = await this._readRedisEntry<T>(client, k, true);
+            const redisElapsed = performance.now() - redisStart;
+            this.watchdog.recordRedis(redisElapsed);
+            this.cb.onSuccess();
+            if (redisHit && !redisHit.stale && redisHit.value !== undefined) {
+              const parsed = redisHit.value;
+              if (this._getKeyMutationEpoch(k) !== mutationEpochAtStart) {
+                this.logger.debug('Aborting L2 promotion — key was mutated or deleted during Redis read', { cacheKey });
+                span.setAttribute('cache.aborted_mutation_race', true);
+                const current = this.l1.get(k);
+                const liveVal = (current && !current.isStale && current.value !== undefined)
+                  ? current.value as T
                   : parsed;
+                if (this.opts.frozen) deepFreeze(liveVal);
+                return (this.opts.cloneStrategy === 'structuredClone' && liveVal != null && typeof liveVal === 'object')
+                  ? structuredClone(liveVal) as T
+                  : liveVal;
               }
+              this.l1.set(k, parsed, ttlMs, priority, undefined, undefined, redisHit.tagVersions);
+              this.counters.l2Hits++;
+              this.opts.onHit?.(cacheKey, 'l2');
+              this.logger.debug(redisHit.tagVersions ? 'L2 hit (Redis hash)' : 'L2 hit (Redis)', { cacheKey });
+              span.setAttribute('cache.hit', true)
+                .setAttribute('cache.item.tier', 'remote')
+                .setAttribute('cache.hit_tier', 'l2');
+              if (this.opts.frozen) deepFreeze(parsed);
+              return (this.opts.cloneStrategy === 'structuredClone' && parsed != null && typeof parsed === 'object')
+                ? structuredClone(parsed)
+                : parsed;
             }
           } catch (err) {
             this.cb.onFailure();
@@ -2622,7 +2777,8 @@ export class CacheService {
             : data;
         }
 
-        this.l1.set(k, data, storeTtl, priority, staleAt, delta, activeTagVersions);
+        const writeTs = Date.now();
+        this.l1.set(k, data, storeTtl, priority, staleAt, delta, activeTagVersions, writeTs);
 
         if (!this._redisDisabled) {
           try {
@@ -2630,13 +2786,12 @@ export class CacheService {
             const serialized = JSON.stringify(data);
             const toStore    = await this._serializeAndEncrypt(serialized);
             const ttlSec     = Math.ceil(effectiveTtl / 1_000);
-            if (this.opts.tagStrategy === 'generational' && activeTagVersions) {
-              const now = Date.now();
+            if (this.opts.tagStrategy === 'generational' && (activeTagVersions || (!this.opts.autoPipeline && typeof (client as any).hgetall === 'function'))) {
               const tx = client.multi();
               tx.hset(k, {
                 d: toStore,
-                t: String(now),
-                tv: JSON.stringify(activeTagVersions),
+                t: String(writeTs),
+                tv: JSON.stringify(activeTagVersions ?? {}),
               });
               tx.expire(k, ttlSec);
               await tx.exec();
@@ -2800,7 +2955,8 @@ export class CacheService {
         return;
       }
 
-      this.l1.set(cacheKey, data, ttlMs + swrGraceMs, priority, staleAt, delta, activeTagVersions);
+      const writeTs = Date.now();
+      this.l1.set(cacheKey, data, ttlMs + swrGraceMs, priority, staleAt, delta, activeTagVersions, writeTs);
 
       if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
         try {
@@ -2808,13 +2964,12 @@ export class CacheService {
           const s      = JSON.stringify(data);
           const stored = await this._serializeAndEncrypt(s);
           const ttlSec = Math.ceil(ttlMs / 1_000);
-          if (this.opts.tagStrategy === 'generational' && activeTagVersions) {
-            const now = Date.now();
+          if (this.opts.tagStrategy === 'generational' && (activeTagVersions || (!this.opts.autoPipeline && typeof (client as any).hgetall === 'function'))) {
             const tx = client.multi();
             tx.hset(cacheKey, {
               d: stored,
-              t: String(now),
-              tv: JSON.stringify(activeTagVersions),
+              t: String(writeTs),
+              tv: JSON.stringify(activeTagVersions ?? {}),
             });
             tx.expire(cacheKey, ttlSec);
             await tx.exec();
@@ -2879,16 +3034,23 @@ export class CacheService {
         }
       }
 
-      this.l1.set(k, data, ttlMs, p, undefined, undefined, activeTagVersions);
+      const writeTs = Date.now();
+      this.l1.set(k, data, ttlMs, p, undefined, undefined, activeTagVersions, writeTs);
 
       // Register dependency patterns: when any key matching a pattern is deleted,
       // this key (k) is automatically cascaded.
-      if (opts?.dependsOn?.length) {
-        for (const pattern of opts.dependsOn) {
-          const nsPattern = this.nk(pattern);
-          let deps = this.dependencyIndex.get(nsPattern);
-          if (!deps) { deps = new Set(); this.dependencyIndex.set(nsPattern, deps); }
-          deps.add(k);
+      if (opts?.dependsOn !== undefined) {
+        this._removeKeyDependencies(k);
+        if (opts.dependsOn.length > 0) {
+          const nsPatterns: string[] = [];
+          for (const pattern of opts.dependsOn) {
+            const nsPattern = this.nk(pattern);
+            nsPatterns.push(nsPattern);
+            let deps = this.dependencyIndex.get(nsPattern);
+            if (!deps) { deps = new Set(); this.dependencyIndex.set(nsPattern, deps); }
+            deps.add(k);
+          }
+          this.keyDependencies.set(k, nsPatterns);
         }
       }
 
@@ -2898,13 +3060,12 @@ export class CacheService {
           const s      = JSON.stringify(data);
           const stored = await this._serializeAndEncrypt(s);
           const ttlSec = Math.ceil(ttlMs / 1_000);
-          if (this.opts.tagStrategy === 'generational' && activeTagVersions) {
-            const now = Date.now();
+          if (this.opts.tagStrategy === 'generational' && (activeTagVersions || (!this.opts.autoPipeline && typeof (client as any).hgetall === 'function'))) {
             const tx = client.multi();
             tx.hset(k, {
               d: stored,
-              t: String(now),
-              tv: JSON.stringify(activeTagVersions),
+              t: String(writeTs),
+              tv: JSON.stringify(activeTagVersions ?? {}),
             });
             tx.expire(k, ttlSec);
             await tx.exec();
@@ -2941,20 +3102,32 @@ export class CacheService {
    * the Redis SADD index. Tags are best-effort — a Redis failure does not throw.
    */
   private async _registerTags(k: string, tags: string[], ttlSeconds: number): Promise<void> {
-    for (const tag of tags) {
+    this._removeKeyTags(k);
+    const effectiveTtl = ttlSeconds > 0 ? ttlSeconds : INDEFINITE_TTL_SECONDS;
+    const expiresAt = Date.now() + effectiveTtl * 1_000;
+    if (this.keyTags.size >= 100_000 && !this.keyTags.has(k)) {
+      this._sweepExpiredMetadata();
+      if (this.keyTags.size >= 100_000) {
+        const oldestKey = this.keyTags.keys().next().value;
+        if (oldestKey !== undefined) this._removeKeyTags(oldestKey);
+      }
+    }
+    const uniqueTags = Array.from(new Set(tags));
+    for (const tag of uniqueTags) {
       const tagKey = this.nk(`_tag_:${tag}`);
       let members = this.tagIndex.get(tagKey);
       if (!members) { members = new Set(); this.tagIndex.set(tagKey, members); }
       members.add(k);
     }
+    this.keyTags.set(k, { tags: uniqueTags, expiresAt });
     if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
       try {
         const client = await this.getRedis();
         const pl = client.pipeline();
-        for (const tag of tags) {
+        for (const tag of uniqueTags) {
           const tagKey = this.nk(`_tag_:${tag}`);
           pl.sadd(tagKey, k);
-          pl.expire(tagKey, ttlSeconds + 3_600);
+          pl.expire(tagKey, effectiveTtl + 3_600);
         }
         await pl.exec();
         this.cb.onSuccess();
@@ -2993,6 +3166,13 @@ export class CacheService {
         }
         this._addPatternTombstone(pfx);
         this.l1.deletePattern(k);
+        this._removePrefixFromIndices(pfx);
+        for (const ktKey of Array.from(this.keyTags.keys())) {
+          if (this._matchesGlob(ktKey, k)) this._removeKeyTags(ktKey);
+        }
+        for (const kdKey of Array.from(this.keyDependencies.keys())) {
+          if (this._matchesGlob(kdKey, k)) this._removeKeyDependencies(kdKey);
+        }
       } else {
         this._bumpKeyMutation(k);
         this.inflight.delete(k);
@@ -3005,10 +3185,11 @@ export class CacheService {
             this._pendingDiskDeletes.delete(k);
           }
         });
+        this._removeKeyTags(k);
         // Cascade: invalidate any key that declared it depends on this exact key's pattern
         this._cascadeDependencies(k);
         // Clean up: remove k from all dependency registrations (it is gone)
-        for (const [, dependents] of this.dependencyIndex) dependents.delete(k);
+        this._removeKeyDependencies(k);
       }
 
       if (!this._redisDisabled && this.opts.l2WriteMode === 'read-write') {
@@ -3016,7 +3197,7 @@ export class CacheService {
           const client = await this.getRedis();
           if (isPattern) {
             const keys = await this._scanKeys(client, k);
-            if (keys.length > 0) await client.del(...keys);
+            await this._deleteRedisKeys(client, keys);
           } else {
             if (this.opts.autoPipeline && this.pipeliner) {
               await this.pipeliner.del(k);
@@ -3082,6 +3263,15 @@ export class CacheService {
         entry.value++;
         return entry.value;
       }
+      if (this._l1Counters.size >= 50_000 && !this._l1Counters.has(k)) {
+        for (const [ck, cv] of this._l1Counters) {
+          if (cv.expiresAt <= now) this._l1Counters.delete(ck);
+        }
+        if (this._l1Counters.size >= 50_000) {
+          const oldest = this._l1Counters.keys().next().value;
+          if (oldest !== undefined) this._l1Counters.delete(oldest);
+        }
+      }
       this._l1Counters.set(k, { value: 1, expiresAt: now + ttlMs });
       return 1;
     }
@@ -3134,6 +3324,7 @@ export class CacheService {
         }
         this._addPatternTombstone(pfx);
         this.l1.deletePattern(k);
+        this._removePrefixFromIndices(pfx);
       } else {
         this._globalEpoch++;
         this.inflight.clear();
@@ -3142,7 +3333,10 @@ export class CacheService {
         if (!this._diskDisabled) this.disk.clear();
         this._l1Counters.clear();
         this.tagIndex.clear();
+        this.keyTags.clear();
         this.tagVersions.clear();
+        this.dependencyIndex.clear();
+        this.keyDependencies.clear();
         this._pendingDiskDeletes.clear();
         this._keyMutationEpochs.clear();
       }
@@ -3152,7 +3346,7 @@ export class CacheService {
           const client  = await this.getRedis();
           const pattern = k ?? (this._namespace ? `${this._namespace}:*` : '*');
           const keys    = await this._scanKeys(client, pattern);
-          if (keys.length > 0) await client.del(...keys);
+          await this._deleteRedisKeys(client, keys);
         } catch (err) {
           this.logger.debug('clear: Redis unavailable', { error: (err as Error).message });
         }
@@ -3297,6 +3491,10 @@ export class CacheService {
     this._assertActive('touch');
     const k   = this.nk(cacheKey);
     const hit = this.l1.touch(k, newTtlSeconds * 1_000);
+    if (hit) {
+      const kt = this.keyTags.get(k);
+      if (kt) kt.expiresAt = Date.now() + newTtlSeconds * 1_000;
+    }
     if (hit && !this._redisDisabled) {
       try {
         const client = await this.getRedis();
@@ -3325,6 +3523,13 @@ export class CacheService {
     return (entry.value !== undefined ? entry.value : this.codec.decode(entry.data)) as T;
   }
 
+  private _prepareReadValue<T>(val: T): T {
+    if (this.opts.frozen) deepFreeze(val);
+    return (this.opts.cloneStrategy === 'structuredClone' && val != null && typeof val === 'object')
+      ? structuredClone(val)
+      : val;
+  }
+
   /**
    * Pure read across cache tiers (L1 RAM → L1.5 Disk → L2 Redis) without invoking a fetcher.
    * Returns the cached value if found and valid, or `null` if absent / expired.
@@ -3340,13 +3545,13 @@ export class CacheService {
     // 1. L1 RAM
     const l1Hit = this.l1.get(k);
     if (l1Hit !== null) {
-      this.counters.gets++;
-      this.counters.l1Hits++;
-      const val = l1Hit.value as T;
-      if (this.opts.frozen) deepFreeze(val);
-      return (this.opts.cloneStrategy === 'structuredClone' && val != null && typeof val === 'object')
-        ? structuredClone(val)
-        : val;
+      if (await this._isGenerationalEntryStale(l1Hit.tagVersions)) {
+        this._deleteIfStale(k, l1Hit.setAt ?? 0);
+      } else {
+        this.counters.gets++;
+        this.counters.l1Hits++;
+        return this._prepareReadValue(l1Hit.value as T);
+      }
     }
 
     // 2. L1.5 Disk
@@ -3354,51 +3559,48 @@ export class CacheService {
       if (this._isTombstonedByPattern(k)) {
         try { this.disk.delete(k); } catch { /* ok */ }
       } else if (this.watchdog.isDiskAllowed()) {
-      const diskStart = performance.now();
-      const diskHit = this.disk.load(k);
-      const diskElapsed = performance.now() - diskStart;
-      this.watchdog.recordDisk(diskElapsed);
-      this.watchdog.onCanaryResult(diskHit !== null, diskElapsed);
+        const diskStart = performance.now();
+        const diskHit = this.disk.load(k);
+        const diskElapsed = performance.now() - diskStart;
+        this.watchdog.recordDisk(diskElapsed);
+        this.watchdog.onCanaryResult(diskHit !== null, diskElapsed);
 
-      if (diskHit !== null) {
-        const promoted = this.l1.importEntries(
-          [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
-          this.opts.forbiddenSnapshotPrefixes,
-        );
-        if (promoted > 0) {
-          const l1Check = this.l1.get(k);
-          if (l1Check !== null) {
-            this.counters.gets++;
-            this.counters.diskHits++;
-            const val = l1Check.value as T;
-            if (this.opts.frozen) deepFreeze(val);
-            return (this.opts.cloneStrategy === 'structuredClone' && val != null && typeof val === 'object')
-              ? structuredClone(val)
-              : val;
+        if (diskHit !== null) {
+          if (await this._isGenerationalEntryStale(diskHit.tagVersions)) {
+            this.disk.delete(k);
+          } else {
+            const promoted = this.l1.importEntries(
+              [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
+              this.opts.forbiddenSnapshotPrefixes,
+            );
+            if (promoted > 0) {
+              const l1Check = this.l1.get(k);
+              if (l1Check !== null) {
+                this.counters.gets++;
+                this.counters.diskHits++;
+                return this._prepareReadValue(l1Check.value as T);
+              }
+            }
           }
         }
       }
     }
-  }
 
     // 3. L2 Redis
     if (!this._redisDisabled && !this.cb.isOpen) {
       try {
         const client = await this.getRedis();
         const redisStart = performance.now();
-        const raw = await client.get(k);
+        const redisHit = await this._readRedisEntry<T>(client, k);
         const redisElapsed = performance.now() - redisStart;
         this.watchdog.recordRedis(redisElapsed);
-        if (raw !== null) {
-          const parsed = await this._decryptAndDeserialize<T>(raw);
-          this.l1.set(k, parsed, 60_000, inferPriority(cacheKey));
+        this.cb.onSuccess();
+        if (redisHit && !redisHit.stale && redisHit.value !== undefined) {
+          const parsed = redisHit.value;
+          this.l1.set(k, parsed, 60_000, inferPriority(cacheKey), undefined, undefined, redisHit.tagVersions);
           this.counters.gets++;
           this.counters.l2Hits++;
-          this.cb.onSuccess();
-          if (this.opts.frozen) deepFreeze(parsed);
-          return (this.opts.cloneStrategy === 'structuredClone' && parsed != null && typeof parsed === 'object')
-            ? structuredClone(parsed)
-            : parsed;
+          return this._prepareReadValue(parsed);
         }
       } catch (err) {
         this.cb.onFailure();
@@ -3435,12 +3637,20 @@ export class CacheService {
       const missKeys:   string[]  = [];
 
       // ── Tier 1: L1 (in-memory) ──
+      const now = Date.now();
       for (let i = 0; i < keys.length; i++) {
         const k = this.nk(keys[i]);
         const entry = this.l1.getEntry(k);
-        if (entry && entry.expiresAt > Date.now()) {
-          result[i] = (entry.value !== undefined ? entry.value : this.codec.decode(entry.data)) as T;
-          this.counters.l1Hits++;
+        if (entry && entry.expiresAt > now) {
+          if (await this._isGenerationalEntryStale(entry.tagVersions)) {
+            this._deleteIfStale(k, entry.setAt ?? 0);
+            missIndexes.push(i);
+            missKeys.push(keys[i]);
+          } else {
+            const val = (entry.value !== undefined ? entry.value : this.codec.decode(entry.data)) as T;
+            result[i] = this._prepareReadValue(val);
+            this.counters.l1Hits++;
+          }
         } else {
           missIndexes.push(i);
           missKeys.push(keys[i]);
@@ -3464,23 +3674,61 @@ export class CacheService {
           const client = await this.getRedis();
           const nsKeys = missKeys.map(k => this.nk(k));
           const pipeline = client.multi();
-          for (const nk of nsKeys) pipeline.get(nk);
+          const useHashPipeline = this.opts.tagStrategy === 'generational' && typeof (pipeline as any).hgetall === 'function';
+          for (const nk of nsKeys) {
+            if (useHashPipeline) {
+              (pipeline as any).hgetall(nk);
+            } else {
+              pipeline.get(nk);
+            }
+          }
           const redisStart = performance.now();
-          const raws = await pipeline.exec() as Array<[Error | null, string | null] | null>;
+          const raws = await pipeline.exec() as Array<[Error | null, any] | null>;
           const redisElapsed = (performance.now() - redisStart) / Math.max(1, missKeys.length);
           this.watchdog.recordRedis(redisElapsed);
           this.cb.onSuccess();
+
           for (let j = 0; j < missKeys.length; j++) {
-            const raw = raws[j] ? (raws[j] as [Error | null, string | null])[1] : null;
+            const tuple = raws[j];
+            const err = tuple ? tuple[0] : null;
+            const rawVal = tuple ? tuple[1] : null;
             const idx = missIndexes[j];
-            if (raw) {
-              const parsed = await this._decryptAndDeserialize<T>(raw);
-              const k = nsKeys[j];
+            const k = nsKeys[j];
+
+            let parsed: T | undefined;
+            let tagVersions: Record<string, number> | undefined;
+            let hit = false;
+
+            if (useHashPipeline) {
+              if (err && err.message?.includes('WRONGTYPE')) {
+                const fallbackRaw = await client.get(k);
+                if (fallbackRaw) {
+                  parsed = await this._decryptAndDeserialize<T>(fallbackRaw);
+                  hit = true;
+                }
+              } else if (!err && typeof rawVal === 'string') {
+                parsed = await this._decryptAndDeserialize<T>(rawVal);
+                hit = true;
+              } else if (!err && rawVal && typeof rawVal === 'object' && rawVal.d) {
+                const hashHit = await this._parseGenerationalRedisHash<T>(k, rawVal);
+                if (hashHit && !hashHit.stale && hashHit.value !== undefined) {
+                  parsed = hashHit.value;
+                  tagVersions = hashHit.tagVersions;
+                  hit = true;
+                }
+              }
+            } else if (!err && rawVal) {
+              parsed = await this._decryptAndDeserialize<T>(rawVal);
+              hit = true;
+            }
+
+            if (hit && parsed !== undefined) {
               const p = priority ?? inferPriority(missKeys[j]);
-              this.l1.set(k, parsed, this._jitterTtl((typeof ttl === 'function' ? ttl(missKeys[j]) : ttl) * 1_000), p);
+              const ttlVal = typeof ttl === 'function' ? ttl(missKeys[j]) : ttl;
+              this.l1.set(k, parsed, this._jitterTtl(ttlVal * 1_000), p, undefined, undefined, tagVersions);
               this.counters.l2Hits++;
               l2HitCount++;
-              result[idx] = parsed;
+              result[idx] = this._prepareReadValue(parsed);
               missIndexes[j] = -1;
               missKeys[j] = '';
             }
@@ -3513,6 +3761,10 @@ export class CacheService {
           this.watchdog.recordDisk(diskElapsed);
           this.watchdog.onCanaryResult(diskHit !== null, diskElapsed);
           if (diskHit !== null) {
+            if (await this._isGenerationalEntryStale(diskHit.tagVersions)) {
+              this.disk.delete(k);
+              continue;
+            }
             const promoted = this.l1.importEntries(
               [{ key: k, entry: diskHit as unknown as SmartCacheEntry }],
               this.opts.forbiddenSnapshotPrefixes,
@@ -3521,7 +3773,7 @@ export class CacheService {
               const l1Check = this.l1.get(k);
               if (l1Check !== null) {
                 this.counters.diskHits++;
-                result[missIndexes[j]] = l1Check.value as T;
+                result[missIndexes[j]] = this._prepareReadValue(l1Check.value as T);
                 missIndexes.splice(j, 1);
                 missKeys.splice(j, 1);
               }
@@ -3780,6 +4032,153 @@ export class CacheService {
     return matched;
   }
 
+  private async _publishTagInvalidation(
+    op: 'tag_incr' | 'tag_pattern_incr' | 'tag_pattern_del',
+    key: string,
+    tagVersion?: number,
+  ): Promise<void> {
+    if (this.opts.awaitInvalidationBackplane) {
+      await this.publishInvalidation(op, key, tagVersion, false, true);
+    } else {
+      void this.publishInvalidation(op, key, tagVersion, false, true);
+    }
+  }
+
+  private _removeTagMembersLocal(keys: Iterable<string>): void {
+    const keyList = Array.isArray(keys) ? keys : Array.from(keys);
+    for (const k of keyList) {
+      this.l1.delete(k);
+      this._bumpKeyMutation(k);
+      this._removeKeyTags(k);
+      this._removeKeyDependencies(k);
+      this._pendingDiskDeletes.add(k);
+      setImmediate(() => {
+        try {
+          if (!this._diskDisabled) this.disk.delete(k);
+        } finally {
+          this._pendingDiskDeletes.delete(k);
+        }
+      });
+    }
+  }
+
+  /**
+   * Executes invalidation for a single already-resolved concrete tag without
+   * wildcard/cascade re-resolution, avoiding mutual recursion with invalidateTags().
+   */
+  private async _invalidateConcreteTag(tag: string): Promise<void> {
+    if (this.opts.tagStrategy === 'generational') {
+      let newVer = 1;
+      if (!this._redisDisabled) {
+        try {
+          const client = await this.getRedis();
+          newVer = await client.incr(this.nk(`tag_ver:${tag}`));
+        } catch (err) {
+          this.logger.debug('invalidateTag: Redis unavailable', { tag, error: (err as Error).message });
+          const current = this.tagVersions.get(tag)?.version ?? 0;
+          newVer = current + 1;
+        }
+      } else {
+        const current = this.tagVersions.get(tag)?.version ?? 0;
+        newVer = current + 1;
+      }
+      this._setLocalTagVersion(tag, newVer, performance.now());
+      await this._publishTagInvalidation('tag_incr', tag, newVer);
+      return;
+    }
+
+    const tagKey  = this.nk(`_tag_:${tag}`);
+    const members = Array.from(this.tagIndex.get(tagKey) ?? []);
+
+    this.tagIndex.delete(tagKey);
+    this._removeTagMembersLocal(members);
+
+    if (!this._redisDisabled) {
+      try {
+        const client = await this.getRedis();
+        const redisMembers: string[] = await client.smembers(tagKey);
+        const toDelete = [...new Set([...members, ...redisMembers, tagKey])];
+        await this._deleteRedisKeys(client, toDelete);
+      } catch (err) {
+        this.logger.debug('invalidateTag: Redis unavailable', { tag, error: (err as Error).message });
+      }
+    }
+  }
+
+  /**
+   * Executes invalidation for an array of already-resolved concrete tags
+   * without re-entering wildcard/cascade resolution or invalidateTag().
+   */
+  private async _invalidateConcreteTags(tags: string[]): Promise<void> {
+    if (tags.length === 0) return;
+    if (tags.length === 1) {
+      await this._invalidateConcreteTag(tags[0]);
+      return;
+    }
+
+    if (this.opts.tagStrategy === 'generational') {
+      const now = performance.now();
+      if (!this._redisDisabled) {
+        try {
+          const client = await this.getRedis();
+          const pl = client.pipeline();
+          for (const tag of tags) pl.incr(this.nk(`tag_ver:${tag}`));
+          const results = await pl.exec() as Array<[Error | null, number]>;
+          for (let i = 0; i < tags.length; i++) {
+            const [err, newVer] = results[i] ?? [null, null];
+            const ver = (!err && typeof newVer === 'number') ? newVer : (this.tagVersions.get(tags[i])?.version ?? 0) + 1;
+            this._setLocalTagVersion(tags[i], ver, now);
+            await this._publishTagInvalidation('tag_incr', tags[i], ver);
+          }
+          return;
+        } catch (err) {
+          this.logger.debug('invalidateTags: Redis unavailable', { tags, error: (err as Error).message });
+        }
+      }
+      for (const tag of tags) {
+        const ver = (this.tagVersions.get(tag)?.version ?? 0) + 1;
+        this._setLocalTagVersion(tag, ver, now);
+        await this._publishTagInvalidation('tag_incr', tag, ver);
+      }
+      return;
+    }
+
+    // In-process: collect all member keys across all tags and remove from L1 + disk
+    const tagKeys: string[] = [];
+    const allMembers = new Set<string>();
+    for (const tag of tags) {
+      const tagKey = this.nk(`_tag_:${tag}`);
+      tagKeys.push(tagKey);
+      const members = this.tagIndex.get(tagKey) ?? new Set<string>();
+      for (const k of members) allMembers.add(k);
+      this.tagIndex.delete(tagKey);
+    }
+    this._removeTagMembersLocal(allMembers);
+
+    if (!this._redisDisabled) {
+      try {
+        const client = await this.getRedis();
+        // Single round-trip: pipeline SMEMBERS for all tag keys
+        const pl = client.pipeline();
+        for (const tagKey of tagKeys) pl.smembers(tagKey);
+        const smResults = await pl.exec() as Array<[Error | null, string[] | null]>;
+
+        // Merge Redis members into the master delete set
+        const toDelete: string[] = [...allMembers];
+        for (const [err, redisMembers] of smResults) {
+          if (!err && redisMembers) {
+            for (const k of redisMembers) { if (!allMembers.has(k)) toDelete.push(k); }
+          }
+        }
+        // Chunk/cluster-safe DEL for all member keys + tag keys
+        const keysToRemove = [...toDelete, ...tagKeys];
+        await this._deleteRedisKeys(client, keysToRemove);
+      } catch (err) {
+        this.logger.debug('invalidateTags: Redis unavailable', { tags, error: (err as Error).message });
+      }
+    }
+  }
+
   /**
    * Invalidate all keys associated with a tag, wildcard glob pattern, or hierarchical namespace.
    * Deletes from L1, disk, and Redis (both the keyed values and the tag metadata).
@@ -3817,76 +4216,17 @@ export class CacheService {
         const broadcastPattern = isPattern ? tag : `${tag}${delim}*`;
 
         if (matchedTags.size > 0) {
-          await this.invalidateTags(Array.from(matchedTags));
+          await this._invalidateConcreteTags(Array.from(matchedTags));
         }
 
         // Broadcast wildcard invalidation across backplane and cross-region
         const op = this.opts.tagStrategy === 'generational' ? 'tag_pattern_incr' : 'tag_pattern_del';
-        if (this.opts.awaitInvalidationBackplane) {
-          await this.publishInvalidation(op, broadcastPattern, undefined, false, true);
-        } else {
-          void this.publishInvalidation(op, broadcastPattern, undefined, false, true);
-        }
+        await this._publishTagInvalidation(op, broadcastPattern);
         return;
       }
 
       // Fast-path: single discrete tag
-      if (this.opts.tagStrategy === 'generational') {
-        let newVer = 1;
-        if (!this._redisDisabled) {
-          try {
-            const client = await this.getRedis();
-            newVer = await client.incr(this.nk(`tag_ver:${tag}`));
-          } catch (err) {
-            this.logger.debug('invalidateTag: Redis unavailable', { tag, error: (err as Error).message });
-            const current = this.tagVersions.get(tag)?.version ?? 0;
-            newVer = current + 1;
-          }
-        } else {
-          const current = this.tagVersions.get(tag)?.version ?? 0;
-          newVer = current + 1;
-        }
-        this._setLocalTagVersion(tag, newVer, performance.now());
-        if (this.opts.awaitInvalidationBackplane) {
-          await this.publishInvalidation('tag_incr', tag, newVer, false, true);
-        } else {
-          void this.publishInvalidation('tag_incr', tag, newVer, false, true);
-        }
-        return;
-      }
-
-      const tagKey  = this.nk(`_tag_:${tag}`);
-      const members = this.tagIndex.get(tagKey) ?? new Set<string>();
-
-      // Remove from L1 + disk
-      for (const k of members) {
-        this.l1.delete(k);
-        this._bumpKeyMutation(k);
-        this._pendingDiskDeletes.add(k);
-        setImmediate(() => {
-          try {
-            if (!this._diskDisabled) this.disk.delete(k);
-          } finally {
-            this._pendingDiskDeletes.delete(k);
-          }
-        });
-      }
-      this.tagIndex.delete(tagKey);
-
-      if (!this._redisDisabled) {
-        try {
-          const client = await this.getRedis();
-          const redisMembers: string[] = await client.smembers(tagKey);
-          const toDelete = [...new Set([...members, ...redisMembers])];
-          if (toDelete.length > 0) {
-            await client.del(...toDelete, tagKey);
-          } else {
-            await client.del(tagKey);
-          }
-        } catch (err) {
-          this.logger.debug('invalidateTag: Redis unavailable', { tag, error: (err as Error).message });
-        }
-      }
+      await this._invalidateConcreteTag(tag);
     } catch (err) {
       span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
       span.recordException?.(err);
@@ -3916,100 +4256,32 @@ export class CacheService {
 
     if (hasWildcards || shouldCascade) {
       const allResolvedTags = new Set<string>();
+      const broadcastPatterns = new Set<string>();
+      const delim = this.opts.tagHierarchyDelimiter;
+
       for (const t of tags) {
-        if (isWildcardTag(t) || shouldCascade) {
+        const tIsPattern = isWildcardTag(t);
+        if (tIsPattern || shouldCascade) {
+          broadcastPatterns.add(tIsPattern ? t : `${t}${delim}*`);
           const resolved = await this._resolveMatchingTags(t, shouldCascade);
           for (const rt of resolved) allResolvedTags.add(rt);
         } else {
           allResolvedTags.add(t);
         }
       }
-      if (allResolvedTags.size === 0) return;
-      tags = Array.from(allResolvedTags);
-    }
 
-    if (tags.length === 1) { await this.invalidateTag(tags[0], opts); return; }
-
-    if (this.opts.tagStrategy === 'generational') {
-      const now = performance.now();
-      if (!this._redisDisabled) {
-        try {
-          const client = await this.getRedis();
-          const pl = client.pipeline();
-          for (const tag of tags) pl.incr(this.nk(`tag_ver:${tag}`));
-          const results = await pl.exec() as Array<[Error | null, number]>;
-          for (let i = 0; i < tags.length; i++) {
-            const [err, newVer] = results[i] ?? [null, null];
-            const ver = (!err && typeof newVer === 'number') ? newVer : (this.tagVersions.get(tags[i])?.version ?? 0) + 1;
-            this._setLocalTagVersion(tags[i], ver, now);
-            if (this.opts.awaitInvalidationBackplane) {
-              await this.publishInvalidation('tag_incr', tags[i], ver, false, true);
-            } else {
-              void this.publishInvalidation('tag_incr', tags[i], ver, false, true);
-            }
-          }
-          return;
-        } catch (err) {
-          this.logger.debug('invalidateTags: Redis unavailable', { tags, error: (err as Error).message });
-        }
+      if (allResolvedTags.size > 0) {
+        await this._invalidateConcreteTags(Array.from(allResolvedTags));
       }
-      for (const tag of tags) {
-        const ver = (this.tagVersions.get(tag)?.version ?? 0) + 1;
-        this._setLocalTagVersion(tag, ver, now);
-        if (this.opts.awaitInvalidationBackplane) {
-          await this.publishInvalidation('tag_incr', tag, ver, false, true);
-        } else {
-          void this.publishInvalidation('tag_incr', tag, ver, false, true);
-        }
+
+      const op = this.opts.tagStrategy === 'generational' ? 'tag_pattern_incr' : 'tag_pattern_del';
+      for (const pattern of broadcastPatterns) {
+        await this._publishTagInvalidation(op, pattern);
       }
       return;
     }
 
-    // In-process: collect all member keys across all tags and remove from L1 + disk
-    const tagKeys: string[] = [];
-    const allMembers = new Set<string>();
-    for (const tag of tags) {
-      const tagKey = this.nk(`_tag_:${tag}`);
-      tagKeys.push(tagKey);
-      const members = this.tagIndex.get(tagKey) ?? new Set<string>();
-      for (const k of members) allMembers.add(k);
-      this.tagIndex.delete(tagKey);
-    }
-    for (const k of allMembers) {
-      this.l1.delete(k);
-      this._bumpKeyMutation(k);
-      this._pendingDiskDeletes.add(k);
-      setImmediate(() => {
-        try {
-          if (!this._diskDisabled) this.disk.delete(k);
-        } finally {
-          this._pendingDiskDeletes.delete(k);
-        }
-      });
-    }
-
-    if (!this._redisDisabled) {
-      try {
-        const client = await this.getRedis();
-        // Single round-trip: pipeline SMEMBERS for all tag keys
-        const pl = client.pipeline();
-        for (const tagKey of tagKeys) pl.smembers(tagKey);
-        const smResults = await pl.exec() as Array<[Error | null, string[] | null]>;
-
-        // Merge Redis members into the master delete set
-        const toDelete: string[] = [...allMembers];
-        for (const [err, redisMembers] of smResults) {
-          if (!err && redisMembers) {
-            for (const k of redisMembers) { if (!allMembers.has(k)) toDelete.push(k); }
-          }
-        }
-        // Single DEL for all member keys + tag keys
-        const keysToRemove = [...toDelete, ...tagKeys];
-        if (keysToRemove.length > 0) await client.del(...keysToRemove);
-      } catch (err) {
-        this.logger.debug('invalidateTags: Redis unavailable', { tags, error: (err as Error).message });
-      }
-    }
+    await this._invalidateConcreteTags(Array.from(new Set(tags)));
   }
 
   /**
@@ -4644,6 +4916,13 @@ export class CacheService {
     this._destroyed = true;
     this._pendingDiskDeletes.clear();
     this._keyMutationEpochs.clear();
+    this.inflight.clear();
+    this.revalidating.clear();
+    this._l1Counters.clear();
+    this.tagIndex.clear();
+    this.keyTags.clear();
+    this.dependencyIndex.clear();
+    this.keyDependencies.clear();
     const g = globalThis as Record<string, unknown>;
     const key = CacheService.globalKey(this.opts);
     if (g[key] === this) {

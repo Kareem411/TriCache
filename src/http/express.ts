@@ -84,14 +84,45 @@ export function createExpressMiddleware(options: ExpressCacheOptions = {}) {
 
     const resolvedTags = typeof tags === 'function' ? tags(req) : tags;
 
+    let respondedLocally = false;
+
     try {
       const cached = await activeCache.get<CachedHttpResponse>(
         key,
         async () => {
-          return new Promise<CachedHttpResponse>((resolve) => {
-            const origJson = res.json?.bind(res);
-            const origSend = res.send?.bind(res);
-            const origEnd  = res.end?.bind(res);
+          return new Promise<CachedHttpResponse>((resolve, reject) => {
+            const rawJson = res.json;
+            const rawSend = res.send;
+            const rawEnd  = res.end;
+            const origJson = rawJson?.bind(res);
+            const origSend = rawSend?.bind(res);
+            const origEnd  = rawEnd?.bind(res);
+            let settled = false;
+
+            const cleanup = () => {
+              if (rawJson !== undefined) res.json = rawJson;
+              if (rawSend !== undefined) res.send = rawSend;
+              if (rawEnd !== undefined) res.end = rawEnd;
+              res.removeListener?.('close', onClose);
+            };
+
+            const settle = (response: CachedHttpResponse) => {
+              if (settled) return;
+              settled = true;
+              respondedLocally = true;
+              cleanup();
+              resolve(response);
+            };
+
+            const onClose = () => {
+              if (settled) return;
+              settled = true;
+              respondedLocally = true;
+              cleanup();
+              reject(new Error('Express response closed before completion'));
+            };
+
+            res.once?.('close', onClose);
 
             const getStatusCode = () => (res.statusCode ?? 200);
 
@@ -101,15 +132,15 @@ export function createExpressMiddleware(options: ExpressCacheOptions = {}) {
                 const bodyEtag = etag ? generateETag(body) : undefined;
                 const contentType = res.getHeader?.('content-type') || 'application/json; charset=utf-8';
 
-                resolve({ body, contentType, etag: bodyEtag, status });
+                settle({ body, contentType, etag: bodyEtag, status });
 
-                if (ifNoneMatch && bodyEtag && ifNoneMatch === bodyEtag) {
+                if (status >= 200 && status < 300 && ifNoneMatch && bodyEtag && ifNoneMatch === bodyEtag) {
                   res.status?.(304);
                   origEnd?.();
                   return;
                 }
 
-                if (bodyEtag && res.setHeader) {
+                if (status >= 200 && status < 300 && bodyEtag && res.setHeader) {
                   res.setHeader('ETag', bodyEtag);
                 }
                 return origJson(body);
@@ -122,15 +153,15 @@ export function createExpressMiddleware(options: ExpressCacheOptions = {}) {
                 const bodyEtag = etag ? generateETag(body) : undefined;
                 const contentType = res.getHeader?.('content-type') as string | undefined;
 
-                resolve({ body, contentType, etag: bodyEtag, status });
+                settle({ body, contentType, etag: bodyEtag, status });
 
-                if (ifNoneMatch && bodyEtag && ifNoneMatch === bodyEtag) {
+                if (status >= 200 && status < 300 && ifNoneMatch && bodyEtag && ifNoneMatch === bodyEtag) {
                   res.status?.(304);
                   origEnd?.();
                   return;
                 }
 
-                if (bodyEtag && res.setHeader) {
+                if (status >= 200 && status < 300 && bodyEtag && res.setHeader) {
                   res.setHeader('ETag', bodyEtag);
                 }
                 return origSend(body);
@@ -143,12 +174,20 @@ export function createExpressMiddleware(options: ExpressCacheOptions = {}) {
                 const bodyEtag = etag && body != null ? generateETag(body) : undefined;
                 const contentType = res.getHeader?.('content-type') as string | undefined;
 
-                resolve({ body, contentType, etag: bodyEtag, status });
+                settle({ body, contentType, etag: bodyEtag, status });
                 return origEnd(body as never);
               };
             }
 
-            next();
+            try {
+              next();
+            } catch (err) {
+              if (!settled) {
+                settled = true;
+                cleanup();
+                reject(err);
+              }
+            }
           });
         },
         ttl,
@@ -156,13 +195,13 @@ export function createExpressMiddleware(options: ExpressCacheOptions = {}) {
       );
 
       // Status gate: only cache 2xx successful responses
-      if (typeof cached.status === 'number' && (cached.status < 200 || cached.status >= 300)) {
+      const isNon2xx = typeof cached.status === 'number' && (cached.status < 200 || cached.status >= 300);
+      if (isNon2xx) {
         await activeCache.delete(key).catch(() => {});
-        return;
       }
 
-      if (!res.headersSent) {
-        if (cached.etag) {
+      if (!respondedLocally && !res.headersSent) {
+        if (!isNon2xx && cached.etag) {
           if (res.setHeader) res.setHeader('ETag', cached.etag);
           if (ifNoneMatch === cached.etag) {
             return res.status(304).end();

@@ -1,6 +1,23 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { CacheService } from '../src/cache-service';
 import { EdgeCacheService } from '../src/edge/cache';
+import type { ICacheSpan, ICacheTracer } from '../src/types';
+
+function makeSpanTracer(): { tracer: ICacheTracer; startedSpans: string[] } {
+  const startedSpans: string[] = [];
+  const tracer: ICacheTracer = {
+    startSpan(name: string): ICacheSpan {
+      startedSpans.push(name);
+      const span: ICacheSpan = {
+        setAttribute: () => span,
+        setStatus: () => span,
+        end: () => {},
+      };
+      return span;
+    },
+  };
+  return { tracer, startedSpans };
+}
 import {
   matchesTagPattern,
   isChildTag,
@@ -333,5 +350,173 @@ describe('EdgeCacheService Wildcard & Cascading Tag Invalidation', () => {
     expect(await edge.get('item:1')).toBeNull();
     expect(await edge.get('item:2')).toBeNull();
     expect(await edge.get('item:3')).toBe('data3'); // boundary safe, not matched
+  });
+
+  it('does not recurse infinitely when an indexed tag contains literal wildcard characters', async () => {
+    const edge = new EdgeCacheService();
+    await edge.set('item:1', 'data1', 60, ['foo*']);
+
+    await edge.invalidateTag('foo*');
+    expect(await edge.get('item:1')).toBeNull();
+  });
+
+  it('emits only one span for cascading invalidation instead of recursing into invalidateTag()', async () => {
+    const { tracer, startedSpans } = makeSpanTracer();
+    const edge = new EdgeCacheService({ tracer });
+    await edge.set('item:1', 'data1', 60, ['tenant:acme']);
+    await edge.set('item:2', 'data2', 60, ['tenant:acme:team:eng']);
+    startedSpans.length = 0;
+
+    await edge.invalidateTag('tenant:acme', { cascade: true });
+
+    expect(startedSpans).toEqual(['tricache.invalidate_tag']);
+    expect(await edge.get('item:1')).toBeNull();
+    expect(await edge.get('item:2')).toBeNull();
+  });
+});
+
+describe('Single-Tag & Leaf-Tag Recursion Regression (hierarchicalTags / cascade / wildcards)', () => {
+  it('does not hang on discrete, colon-delimited leaf, uncached, or single-element invalidateTags with hierarchicalTags: true (set)', async () => {
+    const cache = new CacheService({
+      disableDisk: true,
+      disableRedis: true,
+      oomProtection: false,
+      tagStrategy: 'set',
+      hierarchicalTags: true,
+    });
+
+    try {
+      await cache.set('k-discrete', 'v1', 60, undefined, { tags: ['user-profiles'] });
+      await cache.set('k-leaf', 'v2', 60, undefined, { tags: ['user:42'] });
+      await cache.set('k-batch', 'v3', 60, undefined, { tags: ['user-data'] });
+      await cache.set('k-leaf-batch', 'v4', 60, undefined, { tags: ['session:99'] });
+
+      // 1. Discrete tag with no delimiter (1 matched tag)
+      await cache.invalidateTag('user-profiles');
+      expect(await cache.getIfFresh('k-discrete')).toBeNull();
+
+      // 2. Colon-delimited leaf tag with no children (1 matched tag)
+      await cache.invalidateTag('user:42');
+      expect(await cache.getIfFresh('k-leaf')).toBeNull();
+
+      // 3. Uncached leaf tag (still resolves to 1 tag in _resolveMatchingTags)
+      await expect(cache.invalidateTag('never-cached-tag')).resolves.not.toThrow();
+
+      // 4. Single-element invalidateTags() calls
+      await cache.invalidateTags(['user-data']);
+      expect(await cache.getIfFresh('k-batch')).toBeNull();
+
+      await cache.invalidateTags(['session:99']);
+      expect(await cache.getIfFresh('k-leaf-batch')).toBeNull();
+    } finally {
+      await cache.destroy();
+    }
+  });
+
+  it('does not hang on discrete, leaf, or single-element invalidateTags with hierarchicalTags: true (generational)', async () => {
+    const cache = new CacheService({
+      disableDisk: true,
+      disableRedis: true,
+      oomProtection: false,
+      tagStrategy: 'generational',
+      hierarchicalTags: true,
+    });
+
+    try {
+      let f1 = 0;
+      let f2 = 0;
+      let f3 = 0;
+
+      await cache.get('u:profiles', async () => (++f1, 'p1'), 60, { tags: ['user-profiles'] });
+      await cache.get('u:42', async () => (++f2, 'u42'), 60, { tags: ['user:42'] });
+      await cache.get('u:data', async () => (++f3, 'udata'), 60, { tags: ['user-data'] });
+
+      await cache.invalidateTag('user-profiles');
+      await cache.invalidateTag('user:42');
+      await cache.invalidateTags(['user-data']);
+      await expect(cache.invalidateTag('never-cached')).resolves.not.toThrow();
+
+      await cache.get('u:profiles', async () => (++f1, 'p1-fresh'), 60, { tags: ['user-profiles'] });
+      await cache.get('u:42', async () => (++f2, 'u42-fresh'), 60, { tags: ['user:42'] });
+      await cache.get('u:data', async () => (++f3, 'udata-fresh'), 60, { tags: ['user-data'] });
+
+      expect(f1).toBe(2);
+      expect(f2).toBe(2);
+      expect(f3).toBe(2);
+    } finally {
+      await cache.destroy();
+    }
+  });
+
+  it('handles single-match wildcards, literal wildcard tags, and { cascade: true } without recursion', async () => {
+    const { tracer, startedSpans } = makeSpanTracer();
+
+    const cache = new CacheService({
+      disableDisk: true,
+      disableRedis: true,
+      oomProtection: false,
+      tagStrategy: 'set',
+      hierarchicalTags: false,
+      tracer,
+    });
+
+    try {
+      await cache.set('k-wild-1', 'w1', 60, undefined, { tags: ['org:123'] });
+      await cache.set('k-literal-1', 'l1', 60, undefined, { tags: ['foo*'] });
+      await cache.set('k-literal-2', 'l2', 60, undefined, { tags: ['bar*'] });
+      await cache.set('k-cascade-1', 'c1', 60, undefined, { tags: ['leaf:1'] });
+      await cache.set('k-cascade-2', 'c2', 60, undefined, { tags: ['leaf:2'] });
+      startedSpans.length = 0;
+
+      // Single-match wildcard
+      await cache.invalidateTag('org:*');
+      expect(await cache.getIfFresh('k-wild-1')).toBeNull();
+
+      // Literal wildcard character stored as a concrete tag
+      await cache.invalidateTag('foo*');
+      expect(await cache.getIfFresh('k-literal-1')).toBeNull();
+
+      await cache.invalidateTags(['bar*']);
+      expect(await cache.getIfFresh('k-literal-2')).toBeNull();
+
+      // Explicit { cascade: true } on leaf tags with no children
+      await cache.invalidateTag('leaf:1', { cascade: true });
+      expect(await cache.getIfFresh('k-cascade-1')).toBeNull();
+
+      await cache.invalidateTags(['leaf:2'], { cascade: true });
+      expect(await cache.getIfFresh('k-cascade-2')).toBeNull();
+
+      // Only the 3 invalidateTag() calls should have created invalidate_tag spans
+      expect(startedSpans.filter(s => s === 'tricache.invalidate_tag')).toHaveLength(3);
+    } finally {
+      await cache.destroy();
+    }
+  });
+
+  it('resolves matching tags once per invalidateTag() without N+1 re-resolution across matched tags', async () => {
+    const cache = new CacheService({
+      disableDisk: true,
+      disableRedis: true,
+      oomProtection: false,
+      hierarchicalTags: true,
+    });
+
+    try {
+      await cache.set('k1', 'v1', 60, undefined, { tags: ['org:1:team:a'] });
+      await cache.set('k2', 'v2', 60, undefined, { tags: ['org:1:team:b'] });
+
+      const spy = vi.spyOn(
+        cache as unknown as { _resolveMatchingTags: (tag: string, cascade: boolean) => Promise<Set<string>> },
+        '_resolveMatchingTags',
+      );
+
+      await cache.invalidateTag('org:1');
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(await cache.getIfFresh('k1')).toBeNull();
+      expect(await cache.getIfFresh('k2')).toBeNull();
+    } finally {
+      await cache.destroy();
+    }
   });
 });

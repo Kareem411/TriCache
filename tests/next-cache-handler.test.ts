@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import TriCacheHandler, {
   TriCacheISRHandler,
   createNextCacheHandler,
@@ -376,5 +376,46 @@ describe('createNextCacheHandler Factory & Build Phase Guards', () => {
 
     const hitCustom = await handler.get('custom:profile:item');
     expect(hitCustom?.ttl).toBe(120);
+  });
+
+  it('does not cache null in L1 or issue Redis writes on cache misses in TriCacheHandler and TriCacheISRHandler', async () => {
+    const handler = new TriCacheHandler({
+      namespace: `next-miss-nopol-${Date.now()}`,
+      disableRedis: false,
+      disableDisk: true,
+      invalidationBackplane: false,
+    });
+    const innerCache = (handler as any).cache;
+    const setexSpy = vi.fn(async () => 'OK');
+    const hsetSpy = vi.fn(async () => 1);
+    innerCache.redis = {
+      get: vi.fn(async () => null),
+      hgetall: vi.fn(async () => ({})),
+      setex: setexSpy,
+      hset: hsetSpy,
+      multi: () => ({ hset: hsetSpy, expire: () => {}, exec: async () => [] }),
+      disconnect: vi.fn(async () => {}),
+    };
+
+    try {
+      expect(await handler.get('missing:page')).toBeUndefined();
+      expect(innerCache.has('missing:page')).toBe(false);
+      expect(setexSpy).not.toHaveBeenCalled();
+      expect(hsetSpy).not.toHaveBeenCalled();
+    } finally {
+      await innerCache.destroy();
+    }
+
+    const isr = new TriCacheISRHandler({
+      namespace: `isr-miss-nopol-${Date.now()}`,
+      disableRedis: true,
+      disableDisk: true,
+    });
+    try {
+      expect(await isr.get('missing:isr')).toBeNull();
+      expect((isr as any).cache.has('missing:isr')).toBe(false);
+    } finally {
+      await (isr as any).cache.destroy();
+    }
   });
 });

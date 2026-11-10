@@ -84,6 +84,15 @@ export class NodeRedisPipelineAdapter implements IRedisPipeline {
     return this;
   }
 
+  hgetall(key: string): this {
+    if (typeof this.multiInstance.hGetAll === 'function') {
+      this.multiInstance.hGetAll(key);
+    } else {
+      this.multiInstance.hgetall(key);
+    }
+    return this;
+  }
+
   async exec(): Promise<Array<[Error | null, any]> | null> {
     const raw = await this.multiInstance.exec();
     if (!raw) return null;
@@ -250,6 +259,16 @@ export class NodeRedisAdapter implements IRedisDriver {
       return await this.client.hset(key, value);
     }
     return undefined;
+  }
+
+  async hgetall(key: string): Promise<Record<string, string>> {
+    if (typeof this.client.hGetAll === 'function') {
+      return (await this.client.hGetAll(key)) ?? {};
+    }
+    if (typeof this.client.hgetall === 'function') {
+      return (await this.client.hgetall(key)) ?? {};
+    }
+    return {};
   }
 
   async publish(channel: string, message: string): Promise<number> {

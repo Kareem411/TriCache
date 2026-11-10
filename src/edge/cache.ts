@@ -58,6 +58,7 @@ export class EdgeCacheService {
   private readonly tagIndex = new Map<string, Set<string>>();
 
   // Tag version in-isolate cache with 800ms micro-TTL (prevents HTTP fetch amplification on L1 hits)
+  private static readonly MAX_TAG_VERSION_CACHE = 10_000;
   private readonly tagVersionCache = new Map<string, { version: number; expiresAt: number }>();
   private readonly tagVersionTtlMs = 800;
 
@@ -147,6 +148,22 @@ export class EdgeCacheService {
     };
   }
 
+  private _setTagVersionCache(tag: string, version: number, expiresAt: number): void {
+    if (this.tagVersionCache.size >= EdgeCacheService.MAX_TAG_VERSION_CACHE && !this.tagVersionCache.has(tag)) {
+      const now = Date.now();
+      for (const [k, v] of this.tagVersionCache) {
+        if (v.expiresAt <= now) {
+          this.tagVersionCache.delete(k);
+        }
+      }
+      if (this.tagVersionCache.size >= EdgeCacheService.MAX_TAG_VERSION_CACHE) {
+        const oldestKey = this.tagVersionCache.keys().next().value;
+        if (oldestKey !== undefined) this.tagVersionCache.delete(oldestKey);
+      }
+    }
+    this.tagVersionCache.set(tag, { version, expiresAt });
+  }
+
   private async _getTagVersion(tag: string): Promise<number> {
     const cached = this.tagVersionCache.get(tag);
     const now = Date.now();
@@ -168,7 +185,7 @@ export class EdgeCacheService {
     } else {
       version = cached?.version ?? 1;
     }
-    this.tagVersionCache.set(tag, { version, expiresAt: now + this.tagVersionTtlMs });
+    this._setTagVersionCache(tag, version, now + this.tagVersionTtlMs);
     return version;
   }
 
@@ -195,7 +212,7 @@ export class EdgeCacheService {
             const t = missingTags[i];
             const v = remoteVersions[this.nk(t)] ?? remoteVersions[t] ?? 1;
             result[t] = v;
-            this.tagVersionCache.set(t, { version: v, expiresAt: now + this.tagVersionTtlMs });
+            this._setTagVersionCache(t, v, now + this.tagVersionTtlMs);
           }
         } else {
           await Promise.all(missingTags.map(async t => {
@@ -492,6 +509,45 @@ export class EdgeCacheService {
   }
 
   /**
+   * Executes invalidation for a single already-resolved concrete tag without
+   * re-entering wildcard/cascade resolution.
+   */
+  private async _invalidateConcreteTag(tag: string): Promise<void> {
+    let newVer = 1;
+    if (this.remoteStorage) {
+      try {
+        if (typeof this.remoteStorage.incrementTagVersion === 'function') {
+          newVer = await this.remoteStorage.incrementTagVersion(this.nk(tag));
+        } else {
+          const key = this.nk(`tag_ver:${tag}`);
+          const current = await this._getTagVersion(tag);
+          newVer = Math.max(current + 1, Date.now());
+          await this.remoteStorage.set(key, String(newVer));
+        }
+      } catch {
+        const current = this.tagVersionCache.get(tag)?.version ?? 1;
+        newVer = current + 1;
+      }
+    } else {
+      const current = this.tagVersionCache.get(tag)?.version ?? 1;
+      newVer = current + 1;
+    }
+
+    // Update in-isolate version cache immediately (with 60s pin)
+    this._setTagVersionCache(tag, newVer, Date.now() + 60_000);
+
+    // Invalidate local L1 entries
+    const keys = this.tagIndex.get(tag);
+    if (keys) {
+      const keysArr = Array.from(keys);
+      for (const k of keysArr) {
+        this._deleteL1(k);
+      }
+      this.tagIndex.delete(tag);
+    }
+  }
+
+  /**
    * Invalidates all cached entries associated with a tag.
    */
   async invalidateTag(tag: string, opts?: InvalidateTagOptions): Promise<void> {
@@ -518,43 +574,12 @@ export class EdgeCacheService {
         }
         if (shouldCascade && !isPattern) matched.add(tag);
         for (const t of matched) {
-          await this.invalidateTag(t);
+          await this._invalidateConcreteTag(t);
         }
         return;
       }
 
-      let newVer = 1;
-      if (this.remoteStorage) {
-        try {
-          if (typeof this.remoteStorage.incrementTagVersion === 'function') {
-            newVer = await this.remoteStorage.incrementTagVersion(this.nk(tag));
-          } else {
-            const key = this.nk(`tag_ver:${tag}`);
-            const current = await this._getTagVersion(tag);
-            newVer = Math.max(current + 1, Date.now());
-            await this.remoteStorage.set(key, String(newVer));
-          }
-        } catch {
-          const current = this.tagVersionCache.get(tag)?.version ?? 1;
-          newVer = current + 1;
-        }
-      } else {
-        const current = this.tagVersionCache.get(tag)?.version ?? 1;
-        newVer = current + 1;
-      }
-
-      // Update in-isolate version cache immediately (with 60s pin)
-      this.tagVersionCache.set(tag, { version: newVer, expiresAt: Date.now() + 60_000 });
-
-      // Invalidate local L1 entries
-      const keys = this.tagIndex.get(tag);
-      if (keys) {
-        const keysArr = Array.from(keys);
-        for (const k of keysArr) {
-          this._deleteL1(k);
-        }
-        this.tagIndex.delete(tag);
-      }
+      await this._invalidateConcreteTag(tag);
     } catch (err) {
       span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
       span.recordException?.(err);

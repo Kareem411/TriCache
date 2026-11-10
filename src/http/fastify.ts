@@ -71,12 +71,8 @@ export function createFastifyPlugin(options: FastifyCacheOptions = {}) {
         ? (req.headers['if-none-match'] || req.headers['If-None-Match'])
         : undefined;
 
-      // Fast probe in cache
-      const cached = await activeCache!.get<CachedFastifyResponse | null>(
-        key,
-        async () => null,
-        0
-      );
+      // Fast probe in cache without writing null entries on misses
+      const cached = await activeCache!.peek<CachedFastifyResponse>(key);
 
       if (cached && typeof cached === 'object' && cached.body !== null) {
         if (cached.etag) {
@@ -140,7 +136,7 @@ export function createFastifyPlugin(options: FastifyCacheOptions = {}) {
 
         void activeCache!.set(key, entry, mergedOpts.ttl ?? ttl, undefined, {
           tags: req._tricacheTags,
-        });
+        }).catch(() => {});
       }
 
       return payload;

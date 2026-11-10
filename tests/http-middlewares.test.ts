@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { CacheService } from '../src/cache-service';
 import {
   createExpressMiddleware,
@@ -215,6 +215,55 @@ describe('HTTP Middlewares (Express & Fastify) - Phase 2', () => {
       await middleware(ctx2.req, ctx2.res, () => errorHandler(ctx2.req, ctx2.res));
       expect(callCount).toBe(2);
     });
+
+    it('resolves coalesced concurrent callers on non-2xx responses without hanging', async () => {
+      const middleware = createExpressMiddleware({ cache, ttl: 60 });
+      const ctx1 = createMockExpressContext('/api/slow-404');
+      const ctx2 = createMockExpressContext('/api/slow-404');
+
+      let handlerCalls = 0;
+      const slow404 = (_req: any, res: any) => {
+        handlerCalls++;
+        setTimeout(() => {
+          res.status(404).json({ error: 'missing' });
+        }, 20);
+      };
+
+      await Promise.all([
+        middleware(ctx1.req, ctx1.res, () => slow404(ctx1.req, ctx1.res)),
+        middleware(ctx2.req, ctx2.res, () => slow404(ctx2.req, ctx2.res)),
+      ]);
+
+      expect(handlerCalls).toBe(1);
+      expect(ctx1.res.statusCode).toBe(404);
+      expect(ctx1.getBody()).toEqual({ error: 'missing' });
+      expect(ctx2.res.statusCode).toBe(404);
+      expect(ctx2.getBody()).toEqual({ error: 'missing' });
+      expect(ctx2.isEnded()).toBe(true);
+    });
+
+    it('cleans up inflight and forwards error when response closes before finishing', async () => {
+      const middleware = createExpressMiddleware({ cache, ttl: 60 });
+      const ctx = createMockExpressContext('/api/aborted');
+      const listeners: Record<string, Array<() => void>> = {};
+      ctx.res.once = (ev: string, fn: () => void) => {
+        (listeners[ev] ??= []).push(fn);
+      };
+      ctx.res.removeListener = (ev: string, fn: () => void) => {
+        listeners[ev] = (listeners[ev] ?? []).filter(f => f !== fn);
+      };
+
+      const nextSpy = vi.fn((err?: unknown) => {
+        if (!err) {
+          for (const fn of listeners['close'] ?? []) fn();
+        }
+      });
+
+      await middleware(ctx.req, ctx.res, nextSpy);
+
+      expect(nextSpy).toHaveBeenCalledTimes(2);
+      expect((cache as any).inflight.size).toBe(0);
+    });
   });
 
   describe('Fastify Plugin', () => {
@@ -328,6 +377,37 @@ describe('HTTP Middlewares (Express & Fastify) - Phase 2', () => {
 
       expect(reply2.sent).toBe(true);
       expect(reply2.statusCode).toBe(304);
+    });
+
+    it('probing on a miss in Fastify does not call Redis setex with TTL 0 or trip circuit breaker', async () => {
+      const redisCache = new CacheService({
+        namespace: `fastify_probe_${Date.now()}`,
+        disableRedis: false,
+        disableDisk: true,
+        invalidationBackplane: false,
+      });
+      const setexSpy = vi.fn(async () => 'OK');
+      (redisCache as any).redis = {
+        get: vi.fn(async () => null),
+        setex: setexSpy,
+        disconnect: vi.fn(async () => {}),
+      };
+
+      try {
+        const app = createMockFastifyApp();
+        const plugin = createFastifyPlugin({ cache: redisCache, ttl: 60 });
+        await plugin(app);
+
+        const req = { method: 'GET', url: '/fastify/miss-probe', headers: {} };
+        const reply = createMockFastifyReply();
+        await app.runRequest(req, reply);
+
+        expect(reply.sent).toBe(false);
+        expect(setexSpy).not.toHaveBeenCalled();
+        expect(redisCache.health().details?.circuitBreakerState).toBe('closed');
+      } finally {
+        await redisCache.destroy();
+      }
     });
   });
 });

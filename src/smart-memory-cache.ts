@@ -576,6 +576,7 @@ export class SmartMemoryCache {
     staleAt?: number,
     delta?: number,
     tagVersions?: Record<string, number>,
+    setAt?: number,
   ): void {
     // Single serialization pass — always msgpackr. Eliminates the prior JSON.stringify
     // "size probe" that was discarded for large payloads (the double-pass).
@@ -621,7 +622,7 @@ export class SmartMemoryCache {
               priority,
               ttlMs,
               delta,
-              setAt: now,
+              setAt: setAt ?? now,
               tagVersions,
             });
           }
@@ -657,7 +658,7 @@ export class SmartMemoryCache {
     // buffer AND a potentially much-larger deserialized object simultaneously (double-heap).
     // For large entries, get() falls back to the unpack() path transparently.
     const liveValue = size <= LARGE_VALUE_BYTES ? data : undefined;
-    this.cache.set(key, { data: packed, value: liveValue, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority, ttlMs, delta, setAt: now, tagVersions });
+    this.cache.set(key, { data: packed, value: liveValue, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority, ttlMs, delta, setAt: setAt ?? now, tagVersions });
     // Only add new keys to the bloom — overwrites already have their bits set.
     // Re-adding inflates the insertions counter, delaying trigger-2 phantom detection.
     if (!existingEntry) this.bloom.add(key);

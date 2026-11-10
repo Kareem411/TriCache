@@ -1198,6 +1198,7 @@ export interface IRedisPipeline {
   sadd(key: string, ...members: string[]): this;
   smembers(key: string): this;
   hset(key: string, value: Record<string, string>): this;
+  hgetall?(key: string): this;
   exec(): Promise<Array<[Error | null, any]> | null>;
 }
 
@@ -1221,6 +1222,7 @@ export interface IRedisDriver {
   scan?(cursor: string, ...args: (string | number)[]): Promise<[string, string[]]>;
   scanStream?(options?: { match?: string; count?: number }): any;
   hset?(key: string, value: Record<string, string>): Promise<unknown>;
+  hgetall?(key: string): Promise<Record<string, string>>;
   publish?(channel: string, message: string): Promise<number>;
   subscribe?(...channels: string[]): Promise<unknown>;
   disconnect(): Promise<void> | void;

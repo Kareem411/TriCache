@@ -38,10 +38,7 @@ export class TriCacheISRHandler {
       return this.requestCache.get(key) ?? null;
     }
 
-    const stored = await this.cache.get<IncrementalCacheEntry | null>(
-      key,
-      async () => null,
-    );
+    const stored = await this.cache.peek<IncrementalCacheEntry>(key);
 
     if (stored) {
       this.requestCache.set(key, stored);

@@ -228,4 +228,49 @@ describe('Redis Streams Invalidation Backplane (backplaneMode: stream)', () => {
     expect((svc as any)._destroyed).toBe(true);
     svc = null;
   });
+
+  it('accepts and applies tag_pattern_incr and tag_pattern_del entries in _processStreamEntry', async () => {
+    // 1. generational tag_pattern_incr
+    svc = new CacheService({
+      namespace: 'stream-pat-gen',
+      backplaneMode: 'stream',
+      tagStrategy: 'generational',
+      disableRedis: true,
+      disableDisk: true,
+    });
+    let fetches = 0;
+    await svc.get('p:1', async () => (++fetches, 'v1'), 60, { tags: ['org:1:users'] });
+    expect(fetches).toBe(1);
+
+    (svc as any)._processStreamEntry([
+      'op', 'tag_pattern_incr',
+      'key', 'org:1:*',
+      'src', 'peer-2',
+    ]);
+
+    await svc.get('p:1', async () => (++fetches, 'v2'), 60, { tags: ['org:1:users'] });
+    expect(fetches).toBe(2);
+    await svc.destroy();
+
+    // 2. set tag_pattern_del
+    svc = new CacheService({
+      namespace: 'stream-pat-set',
+      backplaneMode: 'stream',
+      tagStrategy: 'set',
+      disableRedis: true,
+      disableDisk: true,
+    });
+    await svc.set('p:2', 'val2', 60, undefined, { tags: ['org:2:items'] });
+    expect(svc.getIfFresh('p:2')).toBe('val2');
+
+    (svc as any)._processStreamEntry([
+      'op', 'tag_pattern_del',
+      'key', 'org:2:*',
+      'src', 'peer-2',
+    ]);
+
+    expect(svc.getIfFresh('p:2')).toBeNull();
+    await svc.destroy();
+    svc = null;
+  });
 });
