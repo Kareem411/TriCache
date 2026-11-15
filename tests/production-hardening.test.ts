@@ -313,7 +313,7 @@ describe('Production hardening: adapters and process ownership', () => {
 
   it('does not terminate the host when IPC receives a shutdown signal', async () => {
     const instance = cache();
-    const server = new IpcTelemetryServer(instance, resolveIpcSocketPath(`hardening-${randomUUID()}`));
+    const server = new IpcTelemetryServer(instance, resolveIpcSocketPath(randomUUID().slice(0, 8)));
     servers.push(server);
     await server.start();
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => { throw new Error('Library attempted to exit'); });
@@ -323,7 +323,7 @@ describe('Production hardening: adapters and process ownership', () => {
 
   it('coalesces IPC startup and closes idle clients without leaking a server', async () => {
     const instance = cache();
-    const server = new IpcTelemetryServer(instance, resolveIpcSocketPath(`hardening-${randomUUID()}`));
+    const server = new IpcTelemetryServer(instance, resolveIpcSocketPath(randomUUID().slice(0, 8)));
     servers.push(server);
     await Promise.all([server.start(), server.start()]);
     const socket = net.createConnection(server.socketPath);
@@ -334,7 +334,7 @@ describe('Production hardening: adapters and process ownership', () => {
     expect(server.isListening).toBe(false);
     await server.start();
     expect(server.isListening).toBe(false);
-    const cancelled = new IpcTelemetryServer(instance, resolveIpcSocketPath(`cancelled-${randomUUID()}`));
+    const cancelled = new IpcTelemetryServer(instance, resolveIpcSocketPath(randomUUID().slice(0, 8)));
     servers.push(cancelled);
     const starting = cancelled.start();
     await cancelled.close();
