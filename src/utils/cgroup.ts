@@ -53,6 +53,18 @@ export function readCgroupMemoryLimit(): number {
   return Infinity;
 }
 
+/** Current cgroup usage includes tmpfs/page-cache charges that are absent from process RSS. */
+export function readCgroupMemoryUsage(): number | null {
+  if (process.platform !== 'linux') return null;
+  for (const file of ['/sys/fs/cgroup/memory.current', '/sys/fs/cgroup/memory/memory.usage_in_bytes']) {
+    try {
+      const value = Number(fs.readFileSync(file, 'utf8').trim());
+      if (Number.isFinite(value) && value >= 0) return value;
+    } catch { /* unavailable or unreadable */ }
+  }
+  return null;
+}
+
 /**
  * Returns the V8 JavaScript heap size limit in bytes.
  * Safely guards against missing or mock environments.

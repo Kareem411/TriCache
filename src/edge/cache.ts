@@ -25,6 +25,8 @@ interface EdgeL1Entry<T = unknown> {
   tagVersions?: Record<string, number>;
 }
 
+const NAMESPACE_TAG = '_tricache_namespace_';
+
 /**
  * Enterprise-grade cache service designed specifically for pure V8 Edge Isolates
  * (Cloudflare Workers, Fastly Compute, Vercel Edge, Next.js Edge Runtime, Deno).
@@ -46,6 +48,10 @@ export class EdgeCacheService {
   private readonly enc: WebCryptoEncryption;
   private readonly tracer: ICacheTracer | null;
   private readonly bloomFilter: IEdgeBloomFilter | null;
+  private readonly bloomAuthoritative: boolean;
+  private globalEpoch = 0;
+  private lastGlobalMutationAt = 0;
+  private readonly keyEpochs = new Map<string, number>();
 
   // L1 Dual-bounded LRU
   private readonly l1 = new Map<string, EdgeL1Entry>();
@@ -70,6 +76,9 @@ export class EdgeCacheService {
     this.remoteStorage = options?.remoteStorage ?? null;
     this.tracer = options?.tracer ?? null;
     this.enc = new WebCryptoEncryption(options?.encryption);
+    this.bloomAuthoritative = options?.bloomFilterAuthoritative ?? false;
+    if (!Number.isInteger(this.maxKeys) || this.maxKeys < 0 || !Number.isFinite(this.maxBytes) || this.maxBytes < 0 ||
+        !Number.isFinite(this.defaultTtl) || this.defaultTtl < 0) throw new Error('Edge cache limits and TTL must be finite non-negative values');
 
     if (options?.bloomFilter === true) {
       try {
@@ -98,6 +107,53 @@ export class EdgeCacheService {
   private _estimateBytes(key: string, serialized: string): number {
     // Approximate UTF-16 / UTF-8 memory footprint
     return (key.length + serialized.length) * 2 + 64;
+  }
+
+  private fence(key: string): string { return `${this.globalEpoch}:${this.keyEpochs.get(key) ?? 0}`; }
+  private mutate(key: string): void {
+    this.keyEpochs.set(key, (this.keyEpochs.get(key) ?? 0) + 1);
+    this.inflight.delete(key);
+    if (this.keyEpochs.size > 50000) { this.globalEpoch++; this.keyEpochs.clear(); }
+  }
+  private invalidateWork(): void {
+    this.globalEpoch++;
+    this.lastGlobalMutationAt = Date.now();
+    this.inflight.clear();
+  }
+
+  private storeL1(key: string, entry: EdgeL1Entry): boolean {
+    this._deleteL1(key);
+    if (entry.bytes > this.maxBytes || this.maxKeys === 0 || entry.staleUntil <= Date.now()) return false;
+    this._evictIfNeeded(entry.bytes);
+    this.l1.set(key, entry);
+    this.currentBytes += entry.bytes;
+    for (const tag of entry.tags ?? []) {
+      const members = this.tagIndex.get(tag) ?? new Set<string>();
+      members.add(key);
+      this.tagIndex.set(tag, members);
+    }
+    this.bloomFilter?.add(key);
+    return true;
+  }
+
+  private async commit<T>(key: string, value: T, ttl: number, options: EdgeGetOptions | undefined,
+    versions: Record<string, number>, epoch: string): Promise<void> {
+    const namespaced = this.nk(key);
+    if (this.fence(namespaced) !== epoch) return;
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) return; // Undefined is not a JSON cache value.
+    const now = Date.now();
+    const entry: EdgeL1Entry<T> = { value, serialized, bytes: this._estimateBytes(namespaced, serialized),
+      expiresAt: now + ttl * 1000, staleUntil: now + (ttl + (options?.swr ?? 0)) * 1000,
+      tags: options?.tags ? [...new Set(options.tags)] : undefined, tagVersions: versions };
+    this.storeL1(namespaced, entry);
+    if (this.remoteStorage) {
+      const envelope = JSON.stringify({ __t_edge: 2, __t_val: value, __t_tv: versions, __t_exp: entry.expiresAt,
+        __t_stale: entry.staleUntil, __t_tags: entry.tags });
+      const payload = this.enc.isEnabled ? await this.enc.encrypt(envelope) : envelope;
+      if (this.fence(namespaced) !== epoch) return;
+      await this.remoteStorage.set(namespaced, payload, ttl + (options?.swr ?? 0));
+    }
   }
 
   private _evictIfNeeded(newBytes: number): void {
@@ -161,7 +217,8 @@ export class EdgeCacheService {
         if (oldestKey !== undefined) this.tagVersionCache.delete(oldestKey);
       }
     }
-    this.tagVersionCache.set(tag, { version, expiresAt });
+    const known = this.tagVersionCache.get(tag)?.version ?? 0;
+    this.tagVersionCache.set(tag, { version: Math.max(known, version), expiresAt });
   }
 
   private async _getTagVersion(tag: string): Promise<number> {
@@ -186,12 +243,12 @@ export class EdgeCacheService {
       version = cached?.version ?? 1;
     }
     this._setTagVersionCache(tag, version, now + this.tagVersionTtlMs);
-    return version;
+    return this.tagVersionCache.get(tag)?.version ?? version;
   }
 
   private async _batchGetTagVersions(tags: string[]): Promise<Record<string, number>> {
     const now = Date.now();
-    const result: Record<string, number> = {};
+    const result: Record<string, number> = Object.create(null);
     const missingTags: string[] = [];
 
     for (const t of tags) {
@@ -211,7 +268,7 @@ export class EdgeCacheService {
           for (let i = 0; i < missingTags.length; i++) {
             const t = missingTags[i];
             const v = remoteVersions[this.nk(t)] ?? remoteVersions[t] ?? 1;
-            result[t] = v;
+            result[t] = Math.max(this.tagVersionCache.get(t)?.version ?? 0, v);
             this._setTagVersionCache(t, v, now + this.tagVersionTtlMs);
           }
         } else {
@@ -246,7 +303,7 @@ export class EdgeCacheService {
     const span = this._startSpan('tricache.get');
     span.setAttribute('cache.key', key);
     const nsKey = this.nk(key);
-    const now = Date.now();
+    let now = Date.now();
     const resolvedTtl = ttlSeconds ?? this.defaultTtl;
 
     try {
@@ -265,6 +322,7 @@ export class EdgeCacheService {
             }
           }
         }
+        now = Date.now();
 
         if (isTagStale) {
           this._deleteL1(nsKey);
@@ -281,14 +339,14 @@ export class EdgeCacheService {
             return l1Entry.value as T;
           }
 
-          if (l1Entry.staleUntil > now && fetchFn) {
+          if (l1Entry.staleUntil > now && fetchFn && (options?.swr ?? 0) > 0) {
             // Stale hit — trigger background revalidation
             span.setAttribute('cache.hit', true);
             span.setAttribute('cache.item.tier', 'memory');
             span.setAttribute('cache.hit_tier', 'l1');
             span.setAttribute('cache.stale', true);
 
-            const revalPromise = this._revalidate(key, fetchFn, resolvedTtl, options);
+            const revalPromise = this._revalidate(key, fetchFn, resolvedTtl, { ...options, tags: options?.tags ?? l1Entry.tags });
             if (options?.ctx?.waitUntil) {
               options.ctx.waitUntil(revalPromise);
             }
@@ -296,13 +354,21 @@ export class EdgeCacheService {
           }
 
           // Hard expired in L1
-          this._deleteL1(nsKey);
+          if (l1Entry.staleUntil <= now) this._deleteL1(nsKey);
         }
       }
 
-      // 2. Check L2 Remote Storage (defended by Bloom filter against cold-miss penetration)
+      const existing = this.inflight.get(nsKey);
+      if (existing) {
+        span.setAttribute('cache.stampede_coalesced', true);
+        return await existing as T;
+      }
+      const epoch = this.fence(nsKey);
+      const execution: Promise<T | null> = Promise.resolve().then(async () => {
+      try {
+      // A local Bloom filter cannot prove that another isolate's remote key is absent.
       if (this.remoteStorage) {
-        if (this.bloomFilter && !this.bloomFilter.mightContain(nsKey)) {
+        if (this.bloomAuthoritative && this.bloomFilter && !this.bloomFilter.mightContain(nsKey)) {
           span.setAttribute('cache.bloom.filtered', true);
         } else {
           try {
@@ -317,6 +383,8 @@ export class EdgeCacheService {
               if (parsedJson && typeof parsedJson === 'object' && '__t_val' in parsedJson && '__t_tv' in parsedJson) {
                 parsed = parsedJson.__t_val as T;
                 activeTagVersions = parsedJson.__t_tv as Record<string, number>;
+                if (!activeTagVersions || typeof activeTagVersions !== 'object' || Array.isArray(activeTagVersions) ||
+                    Object.values(activeTagVersions).some(version => !Number.isSafeInteger(version) || version < 0)) throw new Error('Invalid remote tag versions');
                 const tagNames = Object.keys(activeTagVersions);
                 const currentVers = await this._batchGetTagVersions(tagNames);
                 for (const tag of tagNames) {
@@ -330,13 +398,30 @@ export class EdgeCacheService {
               }
 
               if (!isStaleRemote) {
-                // Warm L1
-                await this.set(key, parsed, resolvedTtl, options);
+                const freshUntil = Number(parsedJson?.__t_exp);
+                const staleUntil = Number(parsedJson?.__t_stale);
+                const versioned = parsedJson?.__t_edge === 2 && Number.isFinite(freshUntil) && Number.isFinite(staleUntil) && staleUntil >= freshUntil;
+                if (versioned && (staleUntil <= Date.now() || freshUntil <= Date.now() && (!(options?.swr ?? 0) || !fetchFn))) {
+                  isStaleRemote = true;
+                } else {
+                // Promote without rewriting Redis/KV, resetting expiry, or discarding tags.
+                if (versioned && this.fence(nsKey) === epoch) {
+                  const serialized = JSON.stringify(parsed);
+                  const tags = Array.isArray(parsedJson.__t_tags) ? parsedJson.__t_tags : Object.keys(activeTagVersions ?? {}).filter(tag => tag !== NAMESPACE_TAG);
+                  this.storeL1(nsKey, { value: parsed, serialized, bytes: this._estimateBytes(nsKey, serialized),
+                    expiresAt: freshUntil, staleUntil, tags, tagVersions: activeTagVersions });
+                  if (freshUntil <= Date.now() && fetchFn) {
+                    const refresh = execution.then(() => this._revalidate(key, fetchFn, resolvedTtl, { ...options, tags }));
+                    options?.ctx?.waitUntil(refresh);
+                  }
+                }
+                // Legacy raw JSON has no trustworthy remaining TTL: read it but do not promote it.
 
                 span.setAttribute('cache.hit', true);
                 span.setAttribute('cache.item.tier', 'remote');
                 span.setAttribute('cache.hit_tier', 'l2');
                 return parsed;
+                }
               }
             }
           } catch (remoteErr) {
@@ -352,30 +437,22 @@ export class EdgeCacheService {
         return null;
       }
 
-      let inflightPromise = this.inflight.get(nsKey) as Promise<T> | undefined;
-      let coalesced = false;
-
-      if (inflightPromise) {
-        coalesced = true;
-      } else {
-        inflightPromise = (async () => {
-          try {
-            const fresh = await fetchFn();
-            await this.set(key, fresh, resolvedTtl, options);
-            return fresh;
-          } finally {
-            this.inflight.delete(nsKey);
-          }
-        })();
-        this.inflight.set(nsKey, inflightPromise);
+      const tags = [...new Set([NAMESPACE_TAG, ...options?.tags ?? []])];
+      const versions = await this._batchGetTagVersions(tags);
+      const fresh = await fetchFn();
+      const current = await this._batchGetTagVersions(tags);
+      if (this.fence(nsKey) === epoch && tags.every(tag => current[tag] === versions[tag])) {
+        try { await this.commit(key, fresh, resolvedTtl, options, versions, epoch); }
+        catch (error) { span.recordException?.(error); } // Origin reads remain available during cache outages.
       }
-
-      span.setAttribute('cache.hit', coalesced);
-      span.setAttribute('cache.hit_tier', coalesced ? 'l1' : 'miss');
-      span.setAttribute('cache.stampede_coalesced', coalesced);
-
-      const result = await inflightPromise;
-      return result;
+      span.setAttribute('cache.hit', false).setAttribute('cache.hit_tier', 'miss');
+      return fresh;
+      } finally {
+        if (this.inflight.get(nsKey) === execution) this.inflight.delete(nsKey);
+      }
+      });
+      this.inflight.set(nsKey, execution);
+      return await execution;
     } catch (err) {
       span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
       span.recordException?.(err);
@@ -394,16 +471,20 @@ export class EdgeCacheService {
     const nsKey = this.nk(key);
     if (this.inflight.has(nsKey)) return;
 
-    const task = (async () => {
+    const epoch = this.fence(nsKey);
+    const task = Promise.resolve().then(async () => {
       try {
+        const tags = [...new Set([NAMESPACE_TAG, ...options?.tags ?? []])];
+        const versions = await this._batchGetTagVersions(tags);
         const fresh = await fetchFn();
-        await this.set(key, fresh, ttl, options);
+        const current = await this._batchGetTagVersions(tags);
+        if (this.fence(nsKey) === epoch && tags.every(tag => current[tag] === versions[tag])) await this.commit(key, fresh, ttl, options, versions, epoch);
       } catch {
         // Suppress background revalidation error to prevent unhandled rejection
       } finally {
-        this.inflight.delete(nsKey);
+        if (this.inflight.get(nsKey) === task) this.inflight.delete(nsKey);
       }
-    })();
+    });
 
     this.inflight.set(nsKey, task);
     await task;
@@ -421,62 +502,16 @@ export class EdgeCacheService {
     const span = this._startSpan('tricache.set');
     span.setAttribute('cache.key', key);
     const nsKey = this.nk(key);
+    this.mutate(nsKey);
+    const epoch = this.fence(nsKey);
     const resolvedTtl = ttlSeconds ?? this.defaultTtl;
-    const now = Date.now();
     const optObj = Array.isArray(options) ? { tags: options } : options;
     const swrSeconds = optObj?.swr ?? 0;
 
     try {
-      let activeTagVersions: Record<string, number> | undefined;
-      if (optObj?.tags?.length) {
-        activeTagVersions = await this._batchGetTagVersions(optObj.tags);
-      }
-
-      const serialized = JSON.stringify(value);
-      const bytes = this._estimateBytes(nsKey, serialized);
-
-      // Clean old entry if updating
-      this._deleteL1(nsKey);
-      this._evictIfNeeded(bytes);
-
-      const entry: EdgeL1Entry<T> = {
-        value,
-        serialized,
-        bytes,
-        expiresAt: now + resolvedTtl * 1000,
-        staleUntil: now + (resolvedTtl + swrSeconds) * 1000,
-        tags: optObj?.tags,
-        tagVersions: activeTagVersions,
-      };
-
-      this.l1.set(nsKey, entry);
-      this.currentBytes += bytes;
-
-      // Index tags
-      if (optObj?.tags) {
-        for (const tag of optObj.tags) {
-          let s = this.tagIndex.get(tag);
-          if (!s) {
-            s = new Set<string>();
-            this.tagIndex.set(tag, s);
-          }
-          s.add(nsKey);
-        }
-      }
-
-      // Write to L2 Remote Storage if configured
-      if (this.remoteStorage) {
-        const toStoreRaw = activeTagVersions
-          ? JSON.stringify({ __t_val: value, __t_tv: activeTagVersions })
-          : serialized;
-        const payloadToStore = this.enc.isEnabled ? await this.enc.encrypt(toStoreRaw) : toStoreRaw;
-        await this.remoteStorage.set(nsKey, payloadToStore, resolvedTtl + swrSeconds);
-      }
-
-      // Register in Bloom filter
-      if (this.bloomFilter) {
-        this.bloomFilter.add(nsKey);
-      }
+      if (!Number.isFinite(resolvedTtl) || resolvedTtl < 0 || !Number.isFinite(swrSeconds) || swrSeconds < 0) throw new Error('Edge TTL and SWR must be finite non-negative values');
+      const versions = await this._batchGetTagVersions([...new Set([NAMESPACE_TAG, ...optObj?.tags ?? []])]);
+      await this.commit(key, value, resolvedTtl, optObj, versions, epoch);
     } catch (err) {
       span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
       span.recordException?.(err);
@@ -495,6 +530,7 @@ export class EdgeCacheService {
     const nsKey = this.nk(key);
 
     try {
+      this.mutate(nsKey);
       this._deleteL1(nsKey);
       if (this.remoteStorage) {
         await this.remoteStorage.delete(nsKey);
@@ -513,11 +549,15 @@ export class EdgeCacheService {
    * re-entering wildcard/cascade resolution.
    */
   private async _invalidateConcreteTag(tag: string): Promise<void> {
+    this.invalidateWork();
+    const previous = this.tagVersionCache.get(tag)?.version ?? 1;
     let newVer = 1;
     if (this.remoteStorage) {
       try {
         if (typeof this.remoteStorage.incrementTagVersion === 'function') {
           newVer = await this.remoteStorage.incrementTagVersion(this.nk(tag));
+          if (newVer <= previous) newVer = await this.remoteStorage.incrementTagVersion(this.nk(tag));
+          newVer = Math.max(previous + 1, newVer);
         } else {
           const key = this.nk(`tag_ver:${tag}`);
           const current = await this._getTagVersion(tag);
@@ -533,8 +573,7 @@ export class EdgeCacheService {
       newVer = current + 1;
     }
 
-    // Update in-isolate version cache immediately (with 60s pin)
-    this._setTagVersionCache(tag, newVer, Date.now() + 60_000);
+    this._setTagVersionCache(tag, newVer, Date.now() + this.tagVersionTtlMs);
 
     // Invalidate local L1 entries
     const keys = this.tagIndex.get(tag);
@@ -595,6 +634,8 @@ export class EdgeCacheService {
   async clear(): Promise<void> {
     const span = this._startSpan('tricache.clear');
     try {
+      const previousNamespace = await this._getTagVersion(NAMESPACE_TAG);
+      this.invalidateWork();
       this.l1.clear();
       this.currentBytes = 0;
       this.tagIndex.clear();
@@ -603,8 +644,10 @@ export class EdgeCacheService {
         this.bloomFilter.reset();
       }
       if (this.remoteStorage) {
-        await this.remoteStorage.clear?.(this.namespace || undefined);
+        await this.remoteStorage.clear?.(this.namespace ? this.namespace + ':' : undefined);
       }
+      this._setTagVersionCache(NAMESPACE_TAG, previousNamespace, Date.now() + this.tagVersionTtlMs);
+      await this._invalidateConcreteTag(NAMESPACE_TAG);
     } catch (err) {
       span.setStatus({ code: 2, message: err instanceof Error ? err.message : String(err) });
       span.recordException?.(err);
@@ -623,6 +666,7 @@ export class EdgeCacheService {
     ttlSeconds?: number,
   ): Promise<(T | null)[]> {
     const span = this._startSpan('tricache.mget');
+    const epochs = new Map(keys.map(key => [key, this.fence(this.nk(key))]));
     span.setAttribute('cache.batch.size', keys.length);
 
     try {
@@ -648,10 +692,10 @@ export class EdgeCacheService {
         const isMap = fetchedMap instanceof Map;
         for (let j = 0; j < missKeys.length; j++) {
           const k = missKeys[j];
-          const fetchedVal = isMap ? (fetchedMap as Map<string, T>).get(k) : (fetchedMap as Record<string, T>)[k];
+          const fetchedVal = isMap ? (fetchedMap as Map<string, T>).get(k) : Object.hasOwn(fetchedMap, k) ? (fetchedMap as Record<string, T>)[k] : undefined;
           if (fetchedVal !== undefined) {
             results[missIndices[j]] = fetchedVal;
-            await this.set(k, fetchedVal, ttlSeconds);
+            if (this.fence(this.nk(k)) === epochs.get(k)) await this.set(k, fetchedVal, ttlSeconds);
           }
         }
       }
@@ -722,6 +766,7 @@ export class EdgeCacheService {
    * }
    */
   async hydrate(source: EdgeSnapshotSource, options?: EdgeHydrateOptions): Promise<number> {
+    const epoch = this.globalEpoch;
     let rawStr: string | null = null;
 
     if (source && typeof source === 'object') {
@@ -767,7 +812,7 @@ export class EdgeCacheService {
       return 0; // Malformed JSON -> fallback cold
     }
 
-    if (!payload || !Array.isArray(payload.entries)) {
+    if (!payload || payload.version !== 1 || !Array.isArray(payload.entries) || this.globalEpoch !== epoch) {
       return 0;
     }
 
@@ -775,6 +820,7 @@ export class EdgeCacheService {
     const maxAgeMs = options?.maxAgeMs ?? 7_200_000;
     const tolerance = options?.clockSkewToleranceMs ?? 250;
     const writtenAt = payload.writtenAt ?? 0;
+    if (!Number.isFinite(writtenAt) || writtenAt < this.lastGlobalMutationAt) return 0;
 
     // Reject future timestamp exceeding clock skew tolerance
     if (writtenAt - now > tolerance) {
@@ -794,8 +840,10 @@ export class EdgeCacheService {
       if (item.expiresAt <= now && item.staleUntil <= now) continue;
 
       const nsKey = this.nk(item.key);
+      if (this.l1.has(nsKey) || this.keyEpochs.has(nsKey) || !Number.isFinite(item.expiresAt) || !Number.isFinite(item.staleUntil)) continue;
       const serialized = JSON.stringify(item.value);
       const bytes = this._estimateBytes(nsKey, serialized);
+      if (bytes > this.maxBytes || this.maxKeys === 0) continue;
 
       this._deleteL1(nsKey);
       this._evictIfNeeded(bytes);
@@ -825,7 +873,7 @@ export class EdgeCacheService {
       }
 
       if (this.bloomFilter) {
-        this.bloomFilter.add(item.key);
+        this.bloomFilter.add(nsKey);
       }
 
       imported++;

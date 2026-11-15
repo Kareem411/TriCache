@@ -150,6 +150,7 @@ describe('EdgeCacheService — Bloom Filter Penetration Defense', () => {
     const cache = new EdgeCacheService({
       remoteStorage: storage,
       bloomFilter: bloom,
+      bloomFilterAuthoritative: true,
     });
 
     // Key has never been set -> Bloom filter returns false
@@ -182,6 +183,7 @@ describe('EdgeCacheService — Bloom Filter Penetration Defense', () => {
     const cache = new EdgeCacheService({
       remoteStorage: storage,
       bloomFilter: true, // auto-instantiates WasmBloomFilter
+      bloomFilterAuthoritative: true,
     });
 
     expect(cache.bloom).toBeDefined();
@@ -193,6 +195,7 @@ describe('EdgeCacheService — Bloom Filter Penetration Defense', () => {
     // Write key
     await cache.set('new_article:101', { title: 'Edge Computing' }, 300);
     expect(cache.bloom?.mightContain('new_article:101')).toBe(true);
+    const readsBeforePromotion = calls.get; // Namespace generation lookup is a separate remote read.
 
     // Evict from L1 memory to simulate cold edge isolate reboot
     (cache as any).l1.clear();
@@ -200,7 +203,7 @@ describe('EdgeCacheService — Bloom Filter Penetration Defense', () => {
     // Now reading it will pass Bloom and fetch from remote storage
     const fetched = await cache.get<{ title: string }>('new_article:101');
     expect(fetched).toEqual({ title: 'Edge Computing' });
-    expect(calls.get).toBe(1);
+    expect(calls.get).toBe(readsBeforePromotion + 1);
   });
 
   it('resets Bloom filter on cache.clear()', async () => {

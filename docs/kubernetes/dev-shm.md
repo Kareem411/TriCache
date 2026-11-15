@@ -18,7 +18,7 @@ TriCache automatically detects Linux container runtimes and targets `/dev/shm` w
 ```
                       ┌─────────────────────────────────────────┐
                       │            Node.js Process              │
-                      │  [L1 V8 Heap: 512MB] (Zero GC Pauses)   │
+                      │  [L1 packed-data budget: 512MB]          │
                       └────────────────────┬────────────────────┘
                                            │ Spill on Eviction
                                            ▼
@@ -26,8 +26,8 @@ TriCache automatically detects Linux container runtimes and targets `/dev/shm` w
 │   Linux /dev/shm (POSIX Shared Memory / tmpfs)                                         │
 │   • Path: /dev/shm/tricache-disk                                                       │
 │   • Speed: 0.02ms latency (Pure RAM bus, bypasses storage controllers entirely)        │
-│   • GC Impact: Zero V8 GC pressure (stored as raw binary buffers/msgpackr)             │
-│   • Security: 100% compliant with readOnlyRootFilesystem: true                         │
+│   • GC Impact: encoding, buffers, and decoded values still use Node memory             │
+│   • Security: writable mount required with readOnlyRootFilesystem: true                │
 │   • Cloud IOPS: 0 IOPS burned (Zero AWS EBS volume cost)                              │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -37,7 +37,7 @@ TriCache automatically detects Linux container runtimes and targets `/dev/shm` w
 
 ## Why SREs Approve This Pattern
 
-* **Zero V8 GC Overhead**: Large JavaScript objects are serialized into flat `msgpackr` binary buffers in off-heap memory. Even with 4 GB of cached data, Node.js event-loop GC pauses stay under 5ms.
-* **Pure Memory Bus Speed**: Reads and writes complete in **~20 microseconds (0.02ms)**, 100× faster than network Redis (1–2ms).
+* **Memory Accounting**: Persisted tmpfs files are outside V8's managed heap but still count against cgroup memory. Encoding, I/O buffers, and decoded objects still allocate; there is no zero-GC or OOM guarantee.
+* **Local Storage Latency**: Benchmark actual read/write latency on the target runtime and filesystem rather than assuming a fixed 20µs bound.
 * **Zero Cloud IOPS**: Does not touch cloud storage volumes, eliminating EBS burst credit exhaustion.
-* **CIS / SOC2 Compliant**: Functions cleanly within `readOnlyRootFilesystem: true` containers when `/dev/shm` is mounted as an `emptyDir`.
+* **Read-Only Root Compatibility**: Requires a separate writable mount. This setting alone does not establish CIS/SOC2 compliance.

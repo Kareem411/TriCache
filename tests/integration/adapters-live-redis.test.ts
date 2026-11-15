@@ -9,57 +9,24 @@
  * or CI legs without the service container). Run explicitly via:
  *   pnpm test:integration
  */
-import { describe, it, expect, afterAll } from 'vitest';
-import { createClient } from 'redis';
+import { describe, it, expect } from 'vitest';
 import { CacheService } from '../../src/cache-service.js';
 import { withTriCache } from '../../src/prisma/index.js';
 import { withCache } from '../../src/drizzle/index.js';
-import type { RedisClientType } from 'redis';
-
-const REDIS_URL = process.env.TEST_REDIS_URL ?? 'redis://127.0.0.1:6379';
-const NS = `it-${Date.now()}`;
-
-let probe: RedisClientType | null = null;
-let redisUp = false;
-try {
-  probe = createClient({ url: REDIS_URL });
-  await probe.connect();
-  redisUp = true;
-} catch {
-  // no live redis — every test below is skipped
-}
-afterAll(async () => {
-  if (probe?.isOpen) await probe.disconnect().catch(() => {});
-});
+import { NS, makeSvc, probe, redisUp, waitFor } from './redis-fixture.js';
 
 const d = redisUp ? describe : describe.skip;
-const silentLogger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
-
-function makeSvc(extra: Record<string, unknown> = {}) {
-  return new CacheService({
-    namespace: NS,
-    redisHost: '127.0.0.1',
-    disableRedis: false,
-    invalidationBackplane: false,
-    oomProtection: false,
-    logger: silentLogger,
-    ...extra,
-  });
-}
 
 d('LIVE Redis — core three-tier behavior', () => {
   let cache: CacheService | null = null;
-
-  afterAll(async () => {
-    if (cache) await cache.destroy();
-  });
 
   it('set() writes the generational hash envelope and get() reads it back through real RESP', async () => {
     cache = makeSvc({ tagStrategy: 'generational' });
     await cache.set('live:user:1', { name: 'Layla', roles: ['admin'] }, 120, undefined, { tags: ['users'] });
 
     const raw = await probe!.hGetAll(`${NS}:live:user:1`);
-    expect(Object.keys(raw).sort()).toEqual(['d', 't', 'tv']);
+    expect(Object.keys(raw).sort()).toEqual(['d', 'e', 't', 'tags', 'tv']);
+    expect(Number(raw.e)).toBeGreaterThan(Date.now());
     expect(JSON.parse(raw.d)).toEqual({ name: 'Layla', roles: ['admin'] });
     expect(Number.isInteger(Number(raw.t))).toBe(true);
     expect(JSON.parse(raw.tv)).toHaveProperty('users');
@@ -126,7 +93,7 @@ d('LIVE Redis — core three-tier behavior', () => {
   it('pub/sub backplane delivers invalidations between two instances over a real socket', async () => {
     cache = makeSvc({ invalidationBackplane: true });
     const peer = makeSvc({ invalidationBackplane: true });
-    await new Promise(r => setTimeout(r, 400)); // let subscribers settle
+    await Promise.all([cache.ready(), peer.ready()]);
 
     await peer.set('live:pubsub:1', { v: 'original' }, 60); // seeds both L1s via read? no — seed locally:
     await cache.get('live:pubsub:1', async () => ({ v: 'original' }), 60);
@@ -135,7 +102,7 @@ d('LIVE Redis — core three-tier behavior', () => {
     await peer.delete('live:pubsub:1'); // publishes del on the backplane
 
     // Allow pubsub propagation + local application
-    await new Promise(r => setTimeout(r, 600));
+    await waitFor(() => cache!.getIfFresh('live:pubsub:1') === null);
     expect(cache.getIfFresh('live:pubsub:1')).toBeNull(); // evicted by the broadcast
 
     await peer.destroy();
@@ -144,10 +111,6 @@ d('LIVE Redis — core three-tier behavior', () => {
 
 d('LIVE Redis — ORM & HTTP adapters', () => {
   let cache: CacheService | null = null;
-
-  afterAll(async () => {
-    if (cache) await cache.destroy();
-  });
 
   it('prisma extension: mutation invalidates the model tag cluster-wide (cross-instance)', async () => {
     cache = makeSvc({ tagStrategy: 'generational' });
@@ -161,7 +124,7 @@ d('LIVE Redis — ORM & HTTP adapters', () => {
       query: async () => [{ id: 1 }],
     });
 
-    const peer = makeSvc({ tagStrategy: 'generational' });
+    const peer = makeSvc({ tagStrategy: 'generational', tagVersionTtlMs: 0 });
     try {
       // Peer caches under its own L1 but shares Redis tag counters
       const peerQh = withTriCache({ cache: peer, defaultTtl: 60 }).query.$allModels.$allOperations!;

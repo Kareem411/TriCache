@@ -7,6 +7,7 @@ import {
   type Provider,
   type TriCacheAsyncOptions,
   type TriCacheOptionsFactory,
+  type TriCacheModuleOptions,
 } from './types.js';
 
 /**
@@ -23,18 +24,18 @@ export class TriCacheModule {
   /**
    * Register TriCache module synchronously with static configuration options.
    */
-  static register(options: CacheOptions = {}): DynamicModule {
+  static register(options: CacheOptions = {}, moduleOptions: TriCacheModuleOptions = {}): DynamicModule {
     const cache = CacheService.create(options);
-    const store = new TriCacheStore(cache);
+    const provideCacheManager = moduleOptions.provideCacheManager ?? true;
 
     return {
       module: TriCacheModule,
       global: true,
       providers: [
         { provide: TRICACHE_SERVICE, useValue: cache },
-        { provide: CACHE_MANAGER, useValue: store },
+        ...(provideCacheManager ? [{ provide: CACHE_MANAGER, useValue: new TriCacheStore(cache) }] : []),
       ],
-      exports: [TRICACHE_SERVICE, CACHE_MANAGER],
+      exports: [TRICACHE_SERVICE, ...(provideCacheManager ? [CACHE_MANAGER] : [])],
     };
   }
 
@@ -43,6 +44,7 @@ export class TriCacheModule {
    */
   static registerAsync(asyncOptions: TriCacheAsyncOptions): DynamicModule {
     const asyncProviders = this.createAsyncProviders(asyncOptions);
+    const provideCacheManager = asyncOptions.provideCacheManager ?? true;
 
     return {
       module: TriCacheModule,
@@ -50,14 +52,14 @@ export class TriCacheModule {
       imports: asyncOptions.imports || [],
       providers: [
         ...asyncProviders,
-        {
+        ...(provideCacheManager ? [{
           provide: CACHE_MANAGER,
-          useFactory: (cache: any) => new TriCacheStore(cache as CacheService),
+          useFactory: (cache: CacheService) => new TriCacheStore(cache),
           inject: [TRICACHE_SERVICE],
-        },
+        }] : []),
         ...(asyncOptions.extraProviders || []),
       ],
-      exports: [TRICACHE_SERVICE, CACHE_MANAGER],
+      exports: [TRICACHE_SERVICE, ...(provideCacheManager ? [CACHE_MANAGER] : [])],
     };
   }
 
@@ -83,7 +85,7 @@ export class TriCacheModule {
     if (options.useFactory) {
       return {
         provide: TRICACHE_SERVICE,
-        useFactory: async (...args: any[]) => {
+        useFactory: async (...args: unknown[]) => {
           const cacheOptions = await options.useFactory!(...args);
           return CacheService.create(cacheOptions);
         },
@@ -94,8 +96,8 @@ export class TriCacheModule {
     const injectToken = options.useExisting || options.useClass!;
     return {
       provide: TRICACHE_SERVICE,
-      useFactory: async (optionsFactory: any) => {
-        const cacheOptions = await (optionsFactory as TriCacheOptionsFactory).createTriCacheOptions();
+      useFactory: async (optionsFactory: TriCacheOptionsFactory) => {
+        const cacheOptions = await optionsFactory.createTriCacheOptions();
         return CacheService.create(cacheOptions);
       },
       inject: [injectToken],

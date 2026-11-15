@@ -1,6 +1,6 @@
 {
   "name": "tricache",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Three-tier Node.js cache: L1 smart RAM (adaptive LFU/LRU + Count-Min Sketch) → L1.5 NVMe disk spill → L2 Redis/Valkey. Includes AES-256-GCM at-rest encryption, WASM Bloom filter, Stale-While-Revalidate, and thundering-herd prevention.",
   "keywords": [
     "cache",
@@ -41,51 +41,42 @@
   },
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+      "require": { "types": "./dist/index.d.cts", "default": "./dist/index.cjs" }
     },
     "./next": {
-      "types": "./dist/next/index.d.ts",
-      "import": "./dist/next/index.js",
-      "require": "./dist/next/index.cjs"
+      "import": { "types": "./dist/next/index.d.ts", "default": "./dist/next/index.js" },
+      "require": { "types": "./dist/next/index.d.cts", "default": "./dist/next/index.cjs" }
     },
     "./nestjs": {
-      "types": "./dist/nestjs/index.d.ts",
-      "import": "./dist/nestjs/index.js",
-      "require": "./dist/nestjs/index.cjs"
+      "import": { "types": "./dist/nestjs/index.d.ts", "default": "./dist/nestjs/index.js" },
+      "require": { "types": "./dist/nestjs/index.d.cts", "default": "./dist/nestjs/index.cjs" }
     },
     "./prisma": {
-      "types": "./dist/prisma/index.d.ts",
-      "import": "./dist/prisma/index.js",
-      "require": "./dist/prisma/index.cjs"
+      "import": { "types": "./dist/prisma/index.d.ts", "default": "./dist/prisma/index.js" },
+      "require": { "types": "./dist/prisma/index.d.cts", "default": "./dist/prisma/index.cjs" }
     },
     "./drizzle": {
-      "types": "./dist/drizzle/index.d.ts",
-      "import": "./dist/drizzle/index.js",
-      "require": "./dist/drizzle/index.cjs"
+      "import": { "types": "./dist/drizzle/index.d.ts", "default": "./dist/drizzle/index.js" },
+      "require": { "types": "./dist/drizzle/index.d.cts", "default": "./dist/drizzle/index.cjs" }
     },
     "./http": {
-      "types": "./dist/http/index.d.ts",
-      "import": "./dist/http/index.js",
-      "require": "./dist/http/index.cjs"
+      "import": { "types": "./dist/http/index.d.ts", "default": "./dist/http/index.js" },
+      "require": { "types": "./dist/http/index.d.cts", "default": "./dist/http/index.cjs" }
     },
     "./hono": {
-      "types": "./dist/hono/index.d.ts",
-      "import": "./dist/hono/index.js",
-      "require": "./dist/hono/index.cjs"
+      "import": { "types": "./dist/hono/index.d.ts", "default": "./dist/hono/index.js" },
+      "require": { "types": "./dist/hono/index.d.cts", "default": "./dist/hono/index.cjs" }
     },
     "./dashboard": {
-      "types": "./dist/dashboard/index.d.ts",
-      "import": "./dist/dashboard/index.js",
-      "require": "./dist/dashboard/index.cjs"
+      "import": { "types": "./dist/dashboard/index.d.ts", "default": "./dist/dashboard/index.js" },
+      "require": { "types": "./dist/dashboard/index.d.cts", "default": "./dist/dashboard/index.cjs" }
     },
     "./edge": {
-      "types": "./dist/edge/index.d.ts",
-      "edge-light": "./dist/edge/index.js",
-      "workerd": "./dist/edge/index.js",
-      "import": "./dist/edge/index.js",
-      "require": "./dist/edge/index.cjs",
+      "edge-light": { "types": "./dist/edge/index.d.ts", "default": "./dist/edge/index.js" },
+      "workerd": { "types": "./dist/edge/index.d.ts", "default": "./dist/edge/index.js" },
+      "import": { "types": "./dist/edge/index.d.ts", "default": "./dist/edge/index.js" },
+      "require": { "types": "./dist/edge/index.d.cts", "default": "./dist/edge/index.cjs" },
       "default": "./dist/edge/index.js"
     }
   },
@@ -99,7 +90,6 @@
   ],
   "scripts": {
     "build": "tsup src/index.ts src/cli.ts src/serialize-worker.ts src/next/index.ts src/nestjs/index.ts src/prisma/index.ts src/drizzle/index.ts src/http/index.ts src/hono/index.ts src/dashboard/index.ts src/edge/index.ts --format esm,cjs --dts --clean",
-    "postbuild": "node --input-type=module -e \"import{readdirSync,rmSync,statSync}from'fs';import{join}from'path';function clean(d){for(const f of readdirSync(d)){const p=join(d,f);if(statSync(p).isDirectory())clean(p);else if(p.endsWith('.d.cts'))rmSync(p,{force:true});}}clean('dist');\"",
     "dev": "tsup src/index.ts src/serialize-worker.ts --format esm,cjs --dts --watch",
     "typecheck": "tsc --noEmit",
     "typecheck:tests": "tsc --noEmit -p tsconfig.test.json",
@@ -108,6 +98,8 @@
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:watch": "vitest",
+    "check:package": "node scripts/check-package.mjs",
+    "check:release-version": "node scripts/check-release-version.mjs",
     "bench": "node --expose-gc --max-old-space-size=8192 --import tsx/esm bench/benchmark.ts",
     "bench:roi": "tsx bench/cloud-roi-simulation.ts",
     "bench:compression": "tsx bench/compression.bench.ts",
@@ -117,8 +109,8 @@
     "docs:start": "vitepress preview docs"
   },
   "peerDependencies": {
-    "@nestjs/common": "^10.0.0 || ^11.0.0",
-    "@nestjs/core": "^10.0.0 || ^11.0.0",
+    "@nestjs/common": "^10.0.0 || ^11.0.0 || ^12.0.0",
+    "@nestjs/core": "^10.0.0 || ^11.0.0 || ^12.0.0",
     "hono": ">=3.0.0 <5.0.0"
   },
   "peerDependenciesMeta": {
@@ -139,13 +131,21 @@
     "zstd-codec": "^0.1.5"
   },
   "devDependencies": {
-    "@nestjs/common": "^11.0.0",
-    "@nestjs/core": "^11.0.0",
+    "@nestjs/cache-manager": "12.0.5",
+    "@nestjs/common": "^12.5.0",
+    "@nestjs/core": "^12.5.0",
+    "@nestjs/platform-express": "^12.5.0",
     "@types/node": "^26.6.2",
-    "hono": "^4.0.0",
+    "@opentelemetry/api": "^1.10.0",
+    "cache-manager": "7.2.9",
+    "hono": "^4.13.16",
+    "keyv": "5.6.0",
     "markdown-it-mathjax3": "^4.3.2",
+    "next": "16.4.6",
     "oxlint": "^1.85.0",
     "redis": "^6.2.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
     "tsup": "^8.5.1",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",

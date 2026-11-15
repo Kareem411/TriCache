@@ -140,7 +140,7 @@ describe('Hono Node middleware (tricache/hono)', () => {
     );
   });
 
-  it('uses CacheService.get with ttl, swr, and tags (Node path, not EdgeCacheService)', async () => {
+  it('uses CacheService.get with ttl and tags but never background-runs request middleware', async () => {
     cache = new CacheService({
       namespace: `hono-opts-${Date.now()}`,
       disableRedis: true,
@@ -159,7 +159,7 @@ describe('Hono Node middleware (tricache/hono)', () => {
     expect(getSpy).toHaveBeenCalled();
     const [, , ttl, opts] = getSpy.mock.calls[0];
     expect(ttl).toBe(42);
-    expect(opts).toEqual(expect.objectContaining({ swr: 7, tags: ['posts'] }));
+    expect(opts).toEqual(expect.objectContaining({ swr: 0, tags: ['posts'] }));
     getSpy.mockRestore();
   });
 
@@ -195,7 +195,7 @@ describe('Hono Node middleware (tricache/hono)', () => {
     expect(c2.body).not.toHaveBeenCalled();
   });
 
-  it('does not overwrite stale valid cache with 500 response during SWR revalidation', async () => {
+  it('refreshes on a live request and never stores a failed response', async () => {
     cache = new CacheService({
       namespace: `hono-swr-err-${Date.now()}`,
       disableRedis: true,
@@ -242,12 +242,9 @@ describe('Hono Node middleware (tricache/hono)', () => {
       c2.res.status = 500;
     });
 
-    // Request 2 should have served the stale healthy data
-    expect(c2.body).toHaveBeenCalledWith(
-      JSON.stringify({ data: 'healthy' }),
-      200,
-      expect.anything(),
-    );
+    // Request-bound next() must finish before replying; no stale reply followed by a second send.
+    expect(c2.res.status).toBe(500);
+    expect(c2.body).not.toHaveBeenCalled();
 
     // Request 3: verify the cache was NOT poisoned with 500
     returnStatus = 200;
@@ -263,6 +260,7 @@ describe('Hono Node middleware (tricache/hono)', () => {
       200,
       expect.anything(),
     );
+    expect(controllerCalls).toBe(3);
   });
 
   it('does not cache responses with response-level Cache-Control: no-store or private', async () => {

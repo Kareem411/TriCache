@@ -77,18 +77,24 @@ For zero-trust snapshot transfers to object storage (S3, R2, GCS) or cross-regio
 ```typescript
 import { EnvelopeEncryption } from 'tricache';
 
-const envelope = new EnvelopeEncryption({
-  publicKey: process.env.RSA_PUBLIC_KEY,   // Encrypts ephemeral data keys (DEKs)
-  privateKey: process.env.RSA_PRIVATE_KEY, // Decrypts DEKs during cold hydration
+const encryptedBuffer = await EnvelopeEncryption.encrypt(serializedSnapshot, {
+  publicKey: process.env.RSA_PUBLIC_KEY,
 });
-
-const encryptedBuffer = envelope.encrypt(serializedSnapshot);
-const decryptedBuffer = envelope.decrypt(encryptedBuffer);
+const decryptedBuffer = await EnvelopeEncryption.decrypt(encryptedBuffer, {
+  privateKey: process.env.RSA_PRIVATE_KEY,
+});
 ```
 
 ### Security Properties:
 * **Ephemeral DEKs**: Each snapshot payload generates a cryptographically random 256-bit AES-GCM data key (`crypto.randomBytes(32)`).
 * **Asymmetric Protection**: The ephemeral DEK is wrapped using RSA-OAEP with SHA-256 digest padding.
 * **Tamper Proofing (`TRICENV1`)**: Encapsulated within a binary envelope containing authentication tags and big-endian key length bounds, preventing truncation attacks and bit-flipping.
-* **Hardware Security Module (HSM) / KMS**: Use `kmsWrapKey` and `kmsUnwrapKey` callbacks to delegate key wrapping directly to AWS KMS, GCP KMS, or Azure Key Vault without storing private keys in application memory.
+* **Hardware Security Module (HSM) / KMS**: Use `kmsEncrypt` and `kmsDecrypt` callbacks to delegate key wrapping directly to AWS KMS, GCP KMS, or Azure Key Vault without storing private keys in application memory.
 
+## Cache privacy and diagnostics
+
+HTTP response caching is shared unless an identity-aware key explicitly partitions it. Credentials bypass caching by default; `Set-Cookie`, private directives, partial responses, and unkeyed `Vary` fields prohibit storage. Do not place plaintext secrets in custom keys, tags, or log fields.
+
+`cache.options` is a sanitized diagnostic view, not reusable live configuration. Credential fields and opaque adapters are not exposed. Retain original configuration when constructing another instance.
+
+Dashboard mode defaults to read-only. Bind management endpoints privately and require authentication; URL tokens can leak into history/access logs. A cache library does not itself certify HIPAA, SOC2, PCI-DSS, or CIS compliance.

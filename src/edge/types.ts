@@ -96,6 +96,8 @@ export interface EdgeCacheOptions {
    * - `IEdgeBloomFilter`: a custom or configured `WasmBloomFilter` or `Murmur3BloomFilter` instance.
    */
   bloomFilter?: boolean | IEdgeBloomFilter;
+  /** Only enable when the filter is an externally maintained, complete remote key set. Default: false. */
+  bloomFilterAuthoritative?: boolean;
 }
 
 /**

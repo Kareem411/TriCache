@@ -212,6 +212,7 @@ describe('Memory Leak, OOM, and Connection Hardening', () => {
     const pipeDeleted: string[] = [];
     let execCalls = 0;
     const clusterClient = Object.create(RedisCluster.prototype);
+    clusterClient.slots = Array.from({ length: 16384 }, () => ['fake-master:6379']);
     clusterClient.pipeline = () => ({
       del(k: string) { pipeDeleted.push(k); return this; },
       async exec() { execCalls++; return []; },
@@ -247,4 +248,3 @@ describe('Memory Leak, OOM, and Connection Hardening', () => {
     expect((cache as unknown as { redisConnecting: unknown }).redisConnecting).toBeNull();
   });
 });
-

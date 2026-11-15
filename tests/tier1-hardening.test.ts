@@ -109,7 +109,7 @@ describe('Next.js TriCacheHandler — real expiration & refresh contracts', () =
     return handler!;
   }
 
-  it('getExpiration() returns the stored entry expiration (> now) instead of 0', async () => {
+  it('getExpiration() uses Next.js soft-tag delegation, not an entry expiry timestamp', async () => {
     const h = makeHandler();
     await h.set(
       'page:about',
@@ -118,7 +118,7 @@ describe('Next.js TriCacheHandler — real expiration & refresh contracts', () =
     );
 
     const exp = await h.getExpiration(['about']);
-    expect(exp).toBeGreaterThan(Date.now());
+    expect(exp).toBe(Infinity);
   });
 
   it('refreshTags() forces subsequent generational reads to re-sync tag versions', async () => {
@@ -127,11 +127,12 @@ describe('Next.js TriCacheHandler — real expiration & refresh contracts', () =
 
     // Warm the local tag cache with a stale snapshot
     (cache as unknown as { _setLocalTagVersion(t: string, v: number, now?: number): void })
-      ._setLocalTagVersion('layout', 7, Date.now() - 60_000);
+      ._setLocalTagVersion('layout', 7, performance.now() - 60_000);
     const before = (cache as unknown as { tagVersions: Map<string, { lastSyncedAt: number }> })
       .tagVersions.get('layout')!;
 
     await h.refreshTags();
+    await cache.getTagVersion('layout');
 
     const after = (cache as unknown as { tagVersions: Map<string, { lastSyncedAt: number }> })
       .tagVersions.get('layout');

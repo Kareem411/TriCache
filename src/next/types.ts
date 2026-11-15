@@ -20,6 +20,20 @@ export interface CacheHandlerValue {
    * Remaining / configured TTL (seconds).
    */
   ttl?: number;
+  /** Native Next.js CacheEntry timing fields, in seconds. */
+  stale?: number;
+  revalidate?: number;
+  expire?: number;
+}
+
+/** Complete native Next.js CacheEntry output, structurally checked against Next in tests. */
+export interface NextCacheEntry {
+  value: ReadableStream<Uint8Array>;
+  tags: string[];
+  timestamp: number;
+  stale: number;
+  revalidate: number;
+  expire: number;
 }
 
 /**
@@ -38,6 +52,11 @@ export interface StoredNextCacheEntry {
   ttl: number;
   /** Captured soft tag versions at write time */
   softTagVersions?: Record<string, number>;
+  generations?: Record<string, number>;
+  stale?: number;
+  revalidate?: number;
+  expire?: number;
+  streamEncoding?: 'base64';
 }
 
 export type CacheLifePreset =
@@ -79,6 +98,8 @@ export interface NextCacheHandlerOptions extends CacheOptions {
    * or `process.env.NEXT_PHASE === 'phase-export'`.
    */
   isBuildPhase?: boolean;
+  /** Maximum buffered RSC stream size. Default: 16 MiB. */
+  maxStreamBytes?: number;
 }
 
 /**

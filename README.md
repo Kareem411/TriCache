@@ -4,7 +4,7 @@
 [![Docs](https://img.shields.io/badge/docs-VitePress-blue.svg)](https://kareem411.github.io/TriCache/)
 [![npm version](https://img.shields.io/npm/v/tricache.svg)](https://www.npmjs.com/package/tricache)
 [![npm downloads](https://img.shields.io/npm/dm/tricache.svg)](https://www.npmjs.com/package/tricache)
-[![Tests](https://img.shields.io/badge/tests-926%20passing-brightgreen)](tests)
+[![Tests](https://img.shields.io/badge/tests-980%20passing-brightgreen)](tests)
 [![Code Quality](https://img.shields.io/badge/oxlint-0%20warnings-brightgreen)](src)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js ≥ 20](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](https://nodejs.org)
@@ -12,7 +12,7 @@
 > 🌐 **Documentation Site**: **[https://kareem411.github.io/TriCache/](https://kareem411.github.io/TriCache/)**  
 > 📦 **npm Package**: **[`npm install tricache`](https://www.npmjs.com/package/tricache)**
 
-**TriCache** is an enterprise three-tier caching engine for Node.js: **L1 RAM** $\rightarrow$ **L1.5 Off-Heap `/dev/shm`** $\rightarrow$ **L2 Redis/Valkey**. Warm in-memory reads run at **2.81 million ops/sec (356 ns/op)**. By absorbing 95%+ of queries locally in zero-GC POSIX shared memory with Singleflight stampede coalescing, TriCache slashes cloud Redis bills and latency without risking stale data.
+**TriCache** is a three-tier caching engine for Node.js: **L1 RAM** $\rightarrow$ **L1.5 disk or `/dev/shm` spill** $\rightarrow$ **L2 Redis/Valkey**. It combines bounded local storage, per-process singleflight, configurable stale-while-revalidate, and distributed invalidation. Performance and savings depend on your workload; [benchmark your deployment](BENCHMARKS.md).
 
 ---
 
@@ -27,16 +27,17 @@ import { CacheService } from 'tricache';
 
 // 1. One-line preset: W-TinyLFU, Redis Streams, /dev/shm off-heap spill, & SWR
 const cache = CacheService.preset('nextjs', { redisHost: process.env.REDIS_HOST });
+await cache.ready();
 
 // 2. Get-or-fetch with thundering-herd coalescing & 60s background SWR
 const user = await cache.get(
   `user:${userId}`,
   () => db.users.findById(userId),
   300,        // 5-minute TTL
-  { swr: 60 } // Serve stale for 60s while refreshing in the background
+  { swr: 60, tags: ['users'] } // Serve stale for 60s while refreshing in the background
 );
 
-// 3. Invalidate group entries in O(1) time across your entire cluster
+// 3. Bump a concrete tag generation and publish invalidation to peers
 await cache.invalidateTag('users');
 ```
 
@@ -49,26 +50,26 @@ await cache.invalidateTag('users');
                                       │
                                       ▼
              ┌──────────────────────────────────────────────────┐
-             │       L1: Smart Memory (W-TinyLFU + CMS)         │  ~350 ns (2.81M ops/s)
-             │   Window LRU (1%) + Segmented Main SLRU (99%)    │  Zero V8 allocation
+             │       L1: Smart Memory (W-TinyLFU + CMS)         │  Bounded RAM
+             │   Window LRU (1%) + Segmented Main SLRU (99%)    │  Packed values
              └────────────────────────┬─────────────────────────┘
                                       │ Miss / Eviction Spill
                                       ▼
              ┌──────────────────────────────────────────────────┐
-             │    L1.5: Off-Heap /dev/shm & NVMe Spill Tier     │  ~20 µs (RAM speed)
-             │   POSIX tmpfs bypasses V8 GC & cloud EBS IOPS    │  readOnlyRootFilesystem
+             │    L1.5: Off-Heap /dev/shm & NVMe Spill Tier     │  Bounded I/O
+             │   tmpfs counts toward container memory usage   │  Writable mount needed
              └────────────────────────┬─────────────────────────┘
                                       │ Miss
                                       ▼
              ┌──────────────────────────────────────────────────┐
              │       L2: Redis / Valkey Distributed Tier        │  ~1.2 ms (Network)
-             │   AES-256-GCM AEAD at-rest + msgpackr records    │  Pipelined MGET/MSET
+             │   Optional AES-GCM + expiry/tag metadata        │  Pipelined commands
              └────────────────────────┬─────────────────────────┘
                                       │ Complete Cache Miss
                                       ▼
              ┌──────────────────────────────────────────────────┐
-             │   Upstream Database / API (Singleflight Lock)    │  Exactly 1 execution
-             │   Inflight Promise Map coalesces 10,000 callers  │  Zero stampedes
+             │   Upstream Database / API (Singleflight)         │  Per process/key
+             │   Inflight Promise Map coalesces concurrent work│  Not a fleet-wide lock
              └──────────────────────────────────────────────────┘
 ```
 
@@ -77,32 +78,31 @@ await cache.invalidateTag('users');
 * **Off-Heap `/dev/shm` RAM Spill**: Targets Linux POSIX shared memory tmpfs ($\ge 256\text{MB}$ total, $\ge 128\text{MB}$ free), burning 0 cloud IOPS. [[SRE Guide $\rightarrow$](https://kareem411.github.io/TriCache/kubernetes-production-guide)]
 * **Dynamic Latency Watchdog**: Graduated shedding (0% $\rightarrow$ 25% $\rightarrow$ 75% $\rightarrow$ 100%) with asymmetric Redis hysteresis (15ms cutoff, 10ms recovery floor).
 * **Ephemeral Quotas & K8s Eviction Defense**: Chunked watermark pruning (80% $\rightarrow$ 60% in 500-entry batches) and proactive $<10\%$ space spill pauses.
-* **Wildcard & Hierarchical Tag Invalidation**: Glob matching (`user:*`) and parent-child tree cascading (`{ cascade: true }`) over $O(1)$ generational version counters.
+* **Wildcard & Hierarchical Tag Invalidation**: Concrete generation bumps are $O(1)$; wildcard and hierarchy resolution scan matching tag metadata.
 * **Differential Multi-Tier Waterfall Batching**: Cascading `cache.mget` resolves L1 $\rightarrow$ L2 $\rightarrow$ Disk $\rightarrow$ DB miss fetch with zero $N+1$ queries.
 * **Zero-Dependency Cloud Hydration (SigV4)**: Hydrates cold pods from S3/R2 in milliseconds via native Web Crypto. [[Cloud Guide $\rightarrow$](https://kareem411.github.io/TriCache/cold-start-cloud-hydration)]
 
 ---
 
-## 🏆 Feature Comparison
+## 🏆 Feature Overview
 
-| Dimension | `lru-cache` | `keyv` / `cache-manager` | `@neshca/cache-handler` | **TriCache** |
-|:---|:---|:---|:---|:---|
-| **Storage Hierarchy** | In-Memory only | Single Remote (Redis) | Memory + Redis | **Three-Tier (RAM $\rightarrow$ `/dev/shm` $\rightarrow$ Redis)** |
-| **Warm Hit Latency** | ~300 ns | 1,200,000 ns (1.2 ms) | ~400 ns | **356 ns (2.81M ops/sec)** |
-| **Thundering-Herd Defense**| ❌ No | ❌ External plugin | ❌ No | **✅ Native Singleflight Coalescing** |
-| **Tag Invalidation** | ❌ None | $O(N)$ blocking scan | $O(N)$ Redis Set | **✅ $O(1)$ Generational + Wildcards & Cascades** |
-| **Cluster Sync Backplane**| ❌ None | At-most-once Pub/Sub | Pub/Sub | **✅ Durable Redis Streams (`XADD`/`XREAD`)** |
-| **Compression** | ❌ None | ❌ Manual | ❌ None | **✅ WebAssembly Zstandard (Default) & LZ4** |
-| **Waterfall Batching (`mget`)**| ❌ None | ❌ Manual loops | ❌ None | **✅ Multi-Tier Cascading ($0$ $N+1$ Queries)** |
-| **Container Memory Safety**| Unbounded GC | N/A (Remote only) | Heap-bound | **✅ Off-heap tmpfs + 80% OOM Guard** |
-| **Encryption at Rest** | ❌ None | ❌ None | ❌ None | **✅ AES-256-GCM / Web Crypto AEAD** |
+| Feature | Behavior |
+|:---|:---|
+| **Storage hierarchy** | RAM → eligible disk/tmpfs spill → Redis/Valkey |
+| **Singleflight** | Coalesces concurrent work per process and key |
+| **Tag invalidation** | Concrete generation bumps; metadata scans for patterns/cascades |
+| **Backplane** | Pub/Sub or retained-event Redis Streams replay |
+| **Compression** | Zstandard with fallback; optional Brotli, gzip, LZ4, or custom compressor |
+| **Batch reads** | Resolves cached keys and fetches only remaining misses |
+| **Resource controls** | Packed-data limits, bounded disk I/O, and cgroup pressure guards |
+| **Encryption** | Optional AES-GCM for Node and Web Crypto edge storage |
 
 ---
 
 ## 🎯 Production Presets (`CacheService.preset`)
 
 ```typescript
-// 1. Next.js 16 / 15 App Router (Optimized for React 19 RSC streams & generational tags)
+// 1. Next.js 16 App Router (React 19 RSC streams & generational tags)
 const cache = CacheService.preset('nextjs', { redisHost: 'redis.internal' });
 
 // 2. High-Throughput Microservice (Streams backplane, TTL jitter, circuit breakers)
@@ -121,15 +121,23 @@ const cache = CacheService.preset('enterprise-hardened', { redisHost: 'redis.int
 
 | Integration | Import Path | Description |
 |:---|:---|:---|
-| **Next.js 16 & 15** | `tricache/next` | Drop-in `cacheHandler` with RSC stream re-hydration and dynamic `softTags`. |
-| **NestJS Module** | `tricache/nestjs` | Official `TriCacheModule.register()`, `@nestjs/cache-manager` store adapter, and `@Cacheable`. |
+| **Next.js 16** | `tricache/next` | Native Cache Components `cacheHandlers` with bounded RSC streams, timing preservation, and soft-tag expiry. |
+| **NestJS 10–12** | `tricache/nestjs` | `TriCacheModule`, millisecond TTL facade, Keyv 5/cache-manager 7 adapter, and `@Cacheable`. |
 | **Prisma ORM** | `tricache/prisma` | `$extends` client extension with query hashing and auto-mutation tag eviction. |
 | **Drizzle ORM** | `tricache/drizzle` | `withCache(query, opts)` query wrapper with SQL+parameters hashing and background SWR. |
 | **Express & Fastify** | `tricache/http` | Route caching middleware with deterministic query sorting, weak ETag, and `304 Not Modified`. |
-| **Node Hono** | `tricache/hono` | First-class `cacheMiddleware` on `CacheService` with ttl/tags/SWR and `304 Not Modified`. |
+| **Node Hono** | `tricache/hono` | Response caching with TTL/tags, privacy guards, and `304 Not Modified`. |
 | **Edge Isolates & Hono** | `tricache/edge` | Zero-Node-dependency implementation for Cloudflare Workers, Fastly Compute, Hono, and Vercel Edge. |
 | **SSE Dashboard** | `tricache/dashboard` | Zero-dependency Server-Sent Events real-time admin dashboard. |
 | **Live CLI Top** | `npx tricache top` | Real-time terminal ASCII monitor over Unix sockets and Windows named pipes. |
+
+### Safety and consistency
+
+- HTTP middleware bypasses credentialed requests by default and excludes private, cookie-setting, partial, and unkeyed `Vary` responses. Response refreshes run on live requests; use `cache.get()`/`wrap()` for data-level SWR.
+- Dashboard access should be authenticated and private. It defaults to `readOnly: true`; administrative writes require explicit opt-in.
+- Redis Streams provide replay only while events are retained. A detected gap flushes local state. `awaitInvalidationBackplane: true` confirms publication, not peer acknowledgments or exactly-once delivery.
+- Redis promotions preserve remaining TTL where supported. Custom drivers without atomic expiry reads use fallback TTLs; edge legacy JSON without expiry metadata is read without local promotion.
+- `/dev/shm` reduces disk I/O but still consumes container memory. Encryption and cache configuration do not by themselves establish regulatory compliance.
 
 ---
 

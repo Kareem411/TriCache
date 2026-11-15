@@ -196,7 +196,7 @@ describe('P1a — mget() three-tier fallback (ordering + counters)', () => {
           get(_k: string) { return this; },
           async exec() {
             // missKeys after L1 = ['miss2','miss3']; return a hit for miss2, null for miss3
-            return [['', fakeRaw], [null, null]] as Array<[string, string | null]>;
+            return [[null, fakeRaw], [null, null]] as Array<[Error | null, string | null]>;
           },
         };
         return c;

@@ -119,8 +119,9 @@ type AnyBloomFilter = JsBloomFilter | WasmBloomFilter;
 function createBloomFilter(logger: ILogger, maxEntries: number): AnyBloomFilter {
   // Compute optimal bit-count for p = 1 % and the requested entry ceiling.
   const LN2_SQ       = Math.LN2 * Math.LN2;               // (ln 2)²  ≈ 0.4804
-  const optimalBits  = Math.ceil(-maxEntries * Math.log(0.01) / LN2_SQ);
-  const optimalK     = Math.max(4, Math.min(10, Math.round(Math.LN2 * optimalBits / maxEntries)));
+  const capacity = Math.max(1, maxEntries);
+  const optimalBits  = Math.ceil(-capacity * Math.log(0.01) / LN2_SQ);
+  const optimalK     = Math.max(4, Math.min(10, Math.round(Math.LN2 * optimalBits / capacity)));
 
   try {
     const wasm = new WasmBloomFilter();
@@ -310,7 +311,10 @@ export class SmartMemoryCache {
     this.bloom            = createBloomFilter(opts.logger, opts.maxEntries);
     this.categoryPrefixes = Object.keys(opts.categories).filter(k => k !== 'default');
     if (opts.admissionPolicy === 'wtinylfu') {
-      this.wtinyPolicy = new WTinyLfuPolicy(opts.maxEntries, this.sketch);
+      this.wtinyPolicy = new WTinyLfuPolicy(opts.maxEntries, this.sketch, 0.01, 0.80, key => {
+        const entry = this.cache.get(key);
+        return !entry || entry.priority !== 4 || entry.expiresAt <= Date.now();
+      });
     }
 
     if (existing) {
@@ -403,6 +407,7 @@ export class SmartMemoryCache {
     const MAX_EVICT_PASSES = 64;
     let passes = 0;
     do {
+      const before = this.cache.size;
       this.smartEvict(category, catOvf);
       const lim2    = this.getCategoryLimit(category);
       const catCnt2 = this.categoryCount.get(category) ?? 0;
@@ -410,6 +415,7 @@ export class SmartMemoryCache {
       catOvf = catCnt2 >= lim2.maxEntries || catSz2 + neededSize > lim2.maxSizeBytes;
       glbOvf = this.cache.size >= this.opts.maxEntries || this.totalSize + neededSize > this.opts.maxBytes;
       passes++;
+      if (this.cache.size === before) break; // Only protected entries remain.
     } while ((catOvf || glbOvf) && passes < MAX_EVICT_PASSES);
   }
 
@@ -564,6 +570,8 @@ export class SmartMemoryCache {
       fetchedAt: now,
       tagVersions: entry.tagVersions,
       setAt:     entry.setAt,
+      tags:      entry.tags,
+      dependsOn: entry.dependsOn,
     };
     return hit;
   }
@@ -577,10 +585,20 @@ export class SmartMemoryCache {
     delta?: number,
     tagVersions?: Record<string, number>,
     setAt?: number,
-  ): void {
+    tags?: string[],
+    dependsOn?: string[],
+  ): boolean {
     // Single serialization pass — always msgpackr. Eliminates the prior JSON.stringify
     // "size probe" that was discarded for large payloads (the double-pass).
     const packed = this.codec.encode(data);
+    return this.storePacked(key, packed, data, ttlMs, priority, staleAt, delta, tagVersions, setAt, tags, dependsOn);
+  }
+
+  private storePacked(
+    key: string, packed: Buffer, data: unknown, ttlMs: number, priority: CachePriority,
+    staleAt?: number, delta?: number, tagVersions?: Record<string, number>, setAt?: number,
+    tags?: string[], dependsOn?: string[],
+  ): boolean {
     const size   = packed.byteLength;
     this.compressions++;
     this.sketch.increment(key);
@@ -588,9 +606,11 @@ export class SmartMemoryCache {
     const cat = this.getCategory(key);
     const lim = this.getCategoryLimit(cat);
 
-    if (size > lim.maxSizeBytes * 0.5) {
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0 || this.opts.maxEntries <= 0 || lim.maxEntries <= 0 ||
+        size > this.opts.maxBytes || size > lim.maxSizeBytes * 0.5) {
+      this.delete(key); // An oversized replacement must not leave the old value readable.
       this.opts.logger.debug('SmartMemoryCache: entry too large, skipping', { key, sizeBytes: size });
-      return;
+      return false;
     }
 
     // Single Map.get replaces Map.has + _delete's Map.get (saves one lookup on overwrite).
@@ -624,9 +644,11 @@ export class SmartMemoryCache {
               delta,
               setAt: setAt ?? now,
               tagVersions,
+              tags,
+              dependsOn,
             });
           }
-          return;
+          return false;
         } else if (decision.candidateKey) {
           // An older window candidate was rejected to make room for key
           const candEntry = this.cache.get(decision.candidateKey);
@@ -644,13 +666,20 @@ export class SmartMemoryCache {
         this._delete(decision.evictKey, 'capacity');
       }
 
-      // Check category byte limit or total byte limit
+      // Count and byte limits apply to TinyLFU too, including category quotas.
       const catSz = this.categorySize.get(cat) ?? 0;
-      if (catSz + size > lim.maxSizeBytes || this.totalSize + size > this.opts.maxBytes) {
+      if ((this.categoryCount.get(cat) ?? 0) >= lim.maxEntries || this.cache.size >= this.opts.maxEntries ||
+          catSz + size > lim.maxSizeBytes || this.totalSize + size > this.opts.maxBytes) {
         this.ensureCapacity(cat, size);
       }
     } else {
       this.ensureCapacity(cat, size);
+    }
+
+    if (this.cache.size >= this.opts.maxEntries || (this.categoryCount.get(cat) ?? 0) >= lim.maxEntries ||
+        this.totalSize + size > this.opts.maxBytes || (this.categorySize.get(cat) ?? 0) + size > lim.maxSizeBytes) {
+      this.wtinyPolicy?.onDelete(key);
+      return false;
     }
 
     const now = Date.now();
@@ -658,7 +687,7 @@ export class SmartMemoryCache {
     // buffer AND a potentially much-larger deserialized object simultaneously (double-heap).
     // For large entries, get() falls back to the unpack() path transparently.
     const liveValue = size <= LARGE_VALUE_BYTES ? data : undefined;
-    this.cache.set(key, { data: packed, value: liveValue, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority, ttlMs, delta, setAt: setAt ?? now, tagVersions });
+    this.cache.set(key, { data: packed, value: liveValue, isCompressed: true, expiresAt: now + ttlMs, staleAt, size, hits: 1, lastAccess: now, priority, ttlMs, delta, setAt: setAt ?? now, tagVersions, tags, dependsOn });
     // Only add new keys to the bloom — overwrites already have their bits set.
     // Re-adding inflates the insertions counter, delaying trigger-2 phantom detection.
     if (!existingEntry) this.bloom.add(key);
@@ -669,6 +698,7 @@ export class SmartMemoryCache {
     let ks = this.categoryKeys.get(cat);
     if (!ks) { ks = new Set(); this.categoryKeys.set(cat, ks); }
     ks.add(key);
+    return true;
   }
 
   delete(key: string): boolean {
@@ -901,7 +931,8 @@ export class SmartMemoryCache {
       if (entry.expiresAt <= now) continue;
       if (entry.priority === 4 /* CRITICAL */) continue;
       if (forbiddenPrefixes.some(p => key.startsWith(p))) continue;
-      out.push({ key, entry: { ...entry } });
+      const { value: _value, ...stored } = entry;
+      out.push({ key, entry: { ...stored } });
     }
     return out;
   }
@@ -909,24 +940,30 @@ export class SmartMemoryCache {
   importEntries(entries: Array<{ key: string; entry: SmartCacheEntry }>, forbiddenPrefixes: readonly string[]): number {
     const now = Date.now();
     let loaded = 0;
-    for (const { key, entry } of entries) {
-      if (entry.expiresAt <= now) continue;
+    for (const item of entries) {
+      if (!item || typeof item.key !== 'string' || !item.entry) continue;
+      const { key, entry } = item;
+      if (!Number.isFinite(entry.expiresAt) || entry.expiresAt <= now) continue;
       if (forbiddenPrefixes.some(p => key.startsWith(p))) continue;
       if (this.cache.has(key)) continue;
-      const rawData = entry.data;
-      // Handle both legacy (isCompressed=false, data=JSON string) and current (data=Buffer) formats.
-      const data: Buffer = !entry.isCompressed
-        ? this.codec.encode(JSON.parse(rawData as unknown as string))  // legacy: re-encode JSON → msgpackr
-        : rawData instanceof Uint8Array
-          ? Buffer.from(rawData)                          // msgpackr Uint8Array → Buffer
-          : rawData as Buffer;                            // already a Buffer
-      // Cache the live object for small entries only — large entries skip double-heap storage.
-      const value = entry.size <= LARGE_VALUE_BYTES ? this.codec.decode(data) : undefined;
-      this.cache.set(key, { ...entry, data, value, isCompressed: true });
-      this.bloom.add(key);
-      loaded++;
+      try {
+        const rawData = entry.data;
+        const data = !entry.isCompressed
+          ? this.codec.encode(JSON.parse(rawData as unknown as string))
+          : rawData instanceof Uint8Array ? Buffer.from(rawData) : null;
+        if (!data) continue;
+        const value = data.length <= LARGE_VALUE_BYTES ? this.codec.decode(data) : undefined;
+        if (this.storePacked(key, data, value, entry.expiresAt - now, entry.priority, entry.staleAt,
+          entry.delta, entry.tagVersions, entry.setAt, entry.tags, entry.dependsOn)) {
+          const restored = this.cache.get(key)!;
+          restored.expiresAt = entry.expiresAt;
+          restored.ttlMs = entry.ttlMs ?? entry.expiresAt - now;
+          restored.hits = Number.isFinite(entry.hits) ? Math.max(1, entry.hits) : 1;
+          restored.lastAccess = Number.isFinite(entry.lastAccess) ? entry.lastAccess : now;
+          loaded++;
+        }
+      } catch { /* One corrupt snapshot entry must not discard the healthy entries. */ }
     }
-    this.recalculateStats();
     return loaded;
   }
 

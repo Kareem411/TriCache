@@ -35,7 +35,7 @@ import { CacheEncryption }              from '../src/encryption';
 import { CachePriority, consoleLogger } from '../src/types';
 import os   from 'os';
 import path from 'path';
-import { rmSync, mkdtempSync } from 'fs';
+import { existsSync, rmSync, mkdtempSync } from 'fs';
 import { performance as nodePerf } from 'node:perf_hooks';
 import crypto from 'crypto';
 
@@ -124,10 +124,15 @@ async function bench(
   warmup    = Math.min(Math.ceil(iters / 10), 2_000),
   annotation = '',
 ): Promise<BenchResult> {
-  for (let i = 0; i < warmup; i++) await fn(i);
+  const first = fn(0);
+  const asynchronous = first instanceof Promise;
+  if (asynchronous) await first;
+  if (asynchronous) for (let i = 0; i < warmup; i++) await fn(i);
+  else for (let i = 0; i < warmup; i++) fn(i);
 
   const start = performance.now();
-  for (let i = 0; i < iters; i++) await fn(i);
+  if (asynchronous) for (let i = 0; i < iters; i++) await fn(i);
+  else for (let i = 0; i < iters; i++) fn(i);
   const totalMs = performance.now() - start;
 
   const opsPerSec = Math.round((iters / totalMs) * 1000);
@@ -286,7 +291,9 @@ const SOAK_DURATION_MS = Number(process.env['SOAK_MS'] ?? 10_000);
 const SOAK_WINDOW_MS   = Number(process.env['SOAK_WINDOW_MS'] ?? 1_000);
 
 function makeTempDir(): string {
-  return mkdtempSync(path.join(os.tmpdir(), 'tricache-bench-'));
+  const approved = process.platform === 'win32' && process.env.LOCALAPPDATA
+    ? path.join(process.env.LOCALAPPDATA, 'Temp', 'opencode') : os.tmpdir();
+  return mkdtempSync(path.join(existsSync(approved) ? approved : os.tmpdir(), 'tricache-bench-'));
 }
 
 function cleanup(...dirs: string[]): void {
@@ -307,7 +314,7 @@ const l1 = new SmartMemoryCache({
 const benchDir = makeTempDir();
 
 // CacheService instance (Redis disabled — local tiers only)
-const svc = CacheService.reset({
+const svc = new CacheService({
   disableRedis:       true,
   oomProtection:      false,  // disable OOM timer to avoid interference
   metricsIntervalMs:  0,      // no background metrics tick
@@ -444,12 +451,17 @@ await bench('get — L1 miss → fetchFn (TTL=0)', async i => {
 }, 10_000, 100, 'Promise microtask + l1.set on fill');
 
 // SWR: serve stale immediately + revalidate in background
-await svc.set('swr:key', { stale: true }, 300);
-await new Promise(r => setTimeout(r, 5));
+await svc.get('swr:key', async () => ({ stale: true }), 0.01, { swr: 3600 });
+await new Promise(r => setTimeout(r, 20));
 let swrFetches = 0;
+let completeRefresh!: (value: { fresh: number }) => void;
+const refresh = new Promise<{ fresh: number }>(resolve => { completeRefresh = resolve; });
 await bench('get — SWR stale serve + bg revalidate', async () => {
-  await svc.get('swr:key', async () => ({ fresh: ++swrFetches }), 300);
+  await svc.get('swr:key', () => { swrFetches++; return refresh; }, 300, { swr: 3600 });
 }, 20_000, 200, 'serves stale instantly; revalidate is non-blocking');
+if (swrFetches !== 1) throw new Error(`SWR benchmark expected one background fetch, got ${swrFetches}`);
+completeRefresh({ fresh: swrFetches });
+await new Promise<void>(resolve => setImmediate(resolve));
 
 await bench('set — CacheService.set()', async i => {
   await svc.set(`set:e2e:${i % 2_000}`, { n: i }, 60);
@@ -615,7 +627,7 @@ note('At small n the dominant cost is synchronous msgpackr pack() per spill (bef
 note('Evicted entries spill to disk asynchronously (fire-and-forget, non-blocking).');
 
 const evictDir = makeTempDir();
-const tightSvc = CacheService.reset({
+const tightSvc = new CacheService({
   disableRedis:  true,
   oomProtection: false,
   l1MaxEntries:  200,
@@ -686,7 +698,7 @@ note('Scenario C: CacheService set, full L1 — reservoir eviction shows up as p
   );
 
   // ── B. CacheService set with headroom ───────────────────────────────────
-  const pdSvcHead = CacheService.reset({
+  const pdSvcHead = new CacheService({
     disableRedis: true, oomProtection: false,
     l1MaxEntries: 50_000, l1MaxBytes: 400 * 1024 * 1024,
     diskCacheDir: pdDir1,
@@ -703,7 +715,7 @@ note('Scenario C: CacheService set, full L1 — reservoir eviction shows up as p
   // ── C. CacheService set under full L1 ───────────────────────────────────
   // L1 is deliberately sized to 200 entries so eviction fires on every set.
   // Eviction = O(catSize) scan + reservoir sort — p99/max spikes reveal cost.
-  const pdSvcFull = CacheService.reset({
+  const pdSvcFull = new CacheService({
     disableRedis: true, oomProtection: false,
     l1MaxEntries: 200, l1MaxBytes: 2 * 1024 * 1024,
     diskCacheDir: pdDir2,
@@ -736,7 +748,7 @@ note('When ratio > oomHeapThreshold it calls evictPercentage(oomEvictPercent).')
 note('Threshold=0.001 forces every check to trigger. Timer interval=10ms for fast testing.');
 
 const oomDir = makeTempDir();
-const oomSvc = CacheService.reset({
+const oomSvc = new CacheService({
   disableRedis:       true,
   oomProtection:      true,
   oomHeapThreshold:   0.001,   // always exceeded
@@ -1070,8 +1082,8 @@ await bench(
 const nsADir = makeTempDir();
 const nsBDir = makeTempDir();
 
-const nsA = CacheService.reset({ namespace: 'org_a', disableRedis: true, oomProtection: false, metricsIntervalMs: 0, diskCacheDir: nsADir });
-const nsB = CacheService.reset({ namespace: 'org_b', disableRedis: true, oomProtection: false, metricsIntervalMs: 0, diskCacheDir: nsBDir });
+const nsA = new CacheService({ namespace: 'org_a', disableRedis: true, oomProtection: false, metricsIntervalMs: 0, diskCacheDir: nsADir });
+const nsB = new CacheService({ namespace: 'org_b', disableRedis: true, oomProtection: false, metricsIntervalMs: 0, diskCacheDir: nsBDir });
 
 await nsA.set('user:1', { tenant: 'A' }, 300);
 await nsB.set('user:1', { tenant: 'B' }, 300);
@@ -1300,7 +1312,8 @@ note('  Production impact at 1 call/30 s: 70 µs / 30 000 ms = 0.0002% CPU — b
     console.log(`  ${C.dim}  Same total work spread across 256 ticks (128-min full cycle).${C.reset}`);
   }
 
-  try { rmSync(janitorDir, { recursive: true, force: true }); } catch { /* ok */ }
+  jDisk.close();
+  cleanup(janitorDir);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1481,7 +1494,7 @@ note('L1 populated with 500 entries. Measures full-scan generator throughput vs 
   });
   for (let i = 0; i < 500; i++) iterL1.set(`iter:${i}`, { n: i }, 120_000);
 
-  const iterSvc = CacheService.reset({
+  const iterSvc = new CacheService({
     disableRedis: true,
     namespace:    'bmark',
     l1MaxEntries: 500,
@@ -1668,16 +1681,16 @@ note('metrics() snapshot: O(trackedKeys × log trackedKeys) sort — call at low
   const atDir3 = makeTempDir();
 
   // Use distinct namespaces so all three instances co-exist simultaneously.
-  const atOff = CacheService.reset({
+  const atOff = new CacheService({
     namespace: 'at-off', disableRedis: true, oomProtection: false, metricsIntervalMs: 0,
     diskCacheDir: atDir1, adaptiveTtl: false,
   });
-  const atOn = CacheService.reset({
+  const atOn = new CacheService({
     namespace: 'at-on', disableRedis: true, oomProtection: false, metricsIntervalMs: 0,
     diskCacheDir: atDir2, adaptiveTtl: true, adaptiveTtlSamples: 32,
     adaptiveTtlMin: 1, adaptiveTtlMax: 86400, adaptiveTtlMultiplier: 20,
   });
-  const atFetch3 = CacheService.reset({
+  const atFetch3 = new CacheService({
     namespace: 'at-fetch', disableRedis: true, oomProtection: false, metricsIntervalMs: 0,
     diskCacheDir: atDir3, adaptiveTtl: false,
   });
@@ -1861,7 +1874,7 @@ note('Reports event-loop utilisation (ELU) and GC pause events. Event-loop delay
   });
   gcObs.observe({ entryTypes: ['gc'] });
 
-  const soakSvc = CacheService.reset({
+  const soakSvc = new CacheService({
     disableRedis: true, oomProtection: false, metricsIntervalMs: 0,
     l1MaxEntries: 50_000, l1MaxBytes: 400 * 1024 * 1024,
     diskCacheDir: soakDir1,
@@ -1889,7 +1902,7 @@ note('Reports event-loop utilisation (ELU) and GC pause events. Event-loop delay
   // Force GC before the eviction soak: fire-and-forget disk.save() calls from sections A/B
   // accumulate garbage; clearing it here prevents concurrent GC from inflating CV.
   gc?.();
-  const soakSvcEvict = CacheService.reset({
+  const soakSvcEvict = new CacheService({
     disableRedis: true, oomProtection: false, metricsIntervalMs: 0,
     l1MaxEntries: 200, l1MaxBytes: 2 * 1024 * 1024,
     diskCacheDir: soakDir2,
@@ -2025,14 +2038,14 @@ note('Overhead is only visible under L1 eviction pressure (spill path). Hot hits
   const ddDiskDir   = makeTempDir();
   const ddNoDiskDir = makeTempDir();
 
-  const ddWithDisk = CacheService.reset({
+  const ddWithDisk = new CacheService({
     namespace: 'dd-disk', disableRedis: true, oomProtection: false, metricsIntervalMs: 0,
     l1MaxEntries: 300, l1MaxBytes: 10 * 1024 * 1024,
     diskCacheDir: ddDiskDir,
     disableDisk:  false,
   });
 
-  const ddNoDisk = CacheService.reset({
+  const ddNoDisk = new CacheService({
     namespace: 'dd-nodisk', disableRedis: true, oomProtection: false, metricsIntervalMs: 0,
     l1MaxEntries: 300, l1MaxBytes: 10 * 1024 * 1024,
     diskCacheDir: ddNoDiskDir,
@@ -2182,14 +2195,14 @@ note('"structuredClone" creates deep-cloned copy on read, preventing caller muta
 {
   const testObj = { id: 101, name: 'Alice Enterprise', roles: ['admin', 'billing'], metadata: { active: true, loginCount: 42 } };
 
-  const cacheNone = CacheService.reset({
+  const cacheNone = new CacheService({
     namespace: 'bench_clone_none',
     cloneStrategy: 'none',
     disableRedis: true,
     disableDisk: true,
   });
 
-  const cacheClone = CacheService.reset({
+  const cacheClone = new CacheService({
     namespace: 'bench_clone_deep',
     cloneStrategy: 'structuredClone',
     disableRedis: true,
@@ -2222,7 +2235,7 @@ note('Measures uncontended vs contended critical-section execution.');
 note('In-process promise-chain mutex fallback handles concurrency when Redis is disabled.');
 
 {
-  const lockCache = CacheService.reset({
+  const lockCache = new CacheService({
     namespace: 'bench_lock',
     disableRedis: true,
     disableDisk: true,
@@ -2256,7 +2269,7 @@ header('§22. Generational Tag Invalidation — O(1) Atomic Version Bumps');
 note('Replaces O(N) bulk key scans / Redis SMEMBERS set deletions with O(1) version counters.');
 
 {
-  const tagCache = CacheService.reset({
+  const tagCache = new CacheService({
     namespace: 'bench_gen_tags',
     tagStrategy: 'generational',
     disableRedis: true,
@@ -2297,7 +2310,7 @@ header('§23. Ergonomic Primitives & Ecosystem Wrappers (wrap, ORMs, HTTP)');
 note('Measures options-object wrapper overhead and deterministic query hashing.');
 
 {
-  const wrapCache = CacheService.reset({
+  const wrapCache = new CacheService({
     namespace: 'bench_wrap',
     disableRedis: true,
     disableDisk: true,
@@ -2335,6 +2348,6 @@ note('Measures options-object wrapper overhead and deterministic query hashing.'
 }
 
 console.log(`\n  ${C.bold}${C.green}✓ All 24 benchmark suites completed successfully.${C.reset}\n`);
-process.exit(0);
+process.exitCode = 0;
 
 

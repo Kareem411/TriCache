@@ -21,7 +21,7 @@ const SECURITY_HEADERS: Record<string, string> = {
   'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'",
   'X-Frame-Options': 'DENY',
   'X-Content-Type-Options': 'nosniff',
-  'Referrer-Policy': 'same-origin',
+  'Referrer-Policy': 'no-referrer',
   'Cache-Control': 'no-store, no-cache, must-revalidate',
 };
 
@@ -48,7 +48,7 @@ export function buildMetricsPayload(options: DashboardOptions): Record<string, u
     title: options.title || 'TriCache Observability',
     instanceId: resolveInstanceId(options.instanceId),
     nodeVersion: process.version,
-    readOnly: !!options.readOnly,
+    readOnly: options.readOnly ?? true,
     peerInstances: options.peerInstances || [],
     metrics: {
       ...metrics,
@@ -192,6 +192,7 @@ export async function handleDashboardRequest(req: Request, options: DashboardOpt
         // Start periodic broadcast ticker
         ticker = setInterval(() => {
           try {
+            if ((controller.desiredSize ?? 0) <= 0) return; // Drop snapshots instead of buffering for slow readers.
             const data = buildMetricsPayload(options);
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
           } catch {
@@ -208,7 +209,7 @@ export async function handleDashboardRequest(req: Request, options: DashboardOpt
               ticker = null;
             }
             try { controller.close(); } catch { /* ignore */ }
-          });
+          }, { once: true });
         }
       },
       cancel() {
@@ -247,7 +248,7 @@ export async function handleDashboardRequest(req: Request, options: DashboardOpt
     const clientIp = req.headers.get('x-forwarded-for') || undefined;
 
     // Check Read-Only Mode
-    if (options.readOnly) {
+    if (options.readOnly ?? true) {
       return new Response(JSON.stringify({ ok: false, error: 'Dashboard is in read-only mode' }), {
         status: 403,
         headers: { 'Content-Type': 'application/json' },
@@ -263,7 +264,26 @@ export async function handleDashboardRequest(req: Request, options: DashboardOpt
     }
 
     try {
-      const body = await req.json() as { tag?: string };
+      const maxBytes = options.maxRequestBytes ?? 65536;
+      if (Number(req.headers.get('content-length')) > maxBytes) return new Response(JSON.stringify({ error: 'Request body too large' }), { status: 413 });
+      const reader = req.body?.getReader();
+      const chunks: Uint8Array[] = [];
+      let bytes = 0;
+      if (reader) {
+        try {
+          while (true) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            bytes += chunk.value.length;
+            if (bytes > maxBytes) {
+              await reader.cancel();
+              return new Response(JSON.stringify({ error: 'Request body too large' }), { status: 413 });
+            }
+            chunks.push(chunk.value);
+          }
+        } finally { reader.releaseLock(); }
+      }
+      const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { tag?: string };
       const tag = body?.tag?.trim();
       if (!tag) {
         return new Response(JSON.stringify({ ok: false, error: 'Tag parameter is required' }), {
@@ -310,7 +330,7 @@ export async function handleDashboardRequest(req: Request, options: DashboardOpt
     const clientIp = req.headers.get('x-forwarded-for') || undefined;
 
     // Check Read-Only Mode
-    if (options.readOnly) {
+    if (options.readOnly ?? true) {
       return new Response(JSON.stringify({ ok: false, error: 'Dashboard is in read-only mode' }), {
         status: 403,
         headers: { 'Content-Type': 'application/json' },

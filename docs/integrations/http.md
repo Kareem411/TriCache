@@ -2,7 +2,15 @@
 
 > Package entry: `tricache/http`
 
-TriCache provides enterprise-grade HTTP route caching middleware with weak ETag calculation, deterministic query sorting, and RFC 7232 `304 Not Modified` short-circuiting for Express, Fastify, Connect, and Node.js HTTP servers.
+TriCache provides HTTP response caching with weak ETags, deterministic query sorting, and conditional `304 Not Modified` responses for Express, Fastify, and Connect.
+
+## Privacy and refresh policy
+
+Requests carrying `Authorization`, cookies, API credentials, or `Range` bypass caching by default. `cacheAuthenticated: true` additionally requires an identity-aware custom key or every credential header in `headerWhitelist`; built-in sensitive header components are hashed rather than stored verbatim.
+
+Only full successful responses are cached. `Set-Cookie`, `private`/`no-store`/`no-cache`, SSE, `206`, `Vary: *`, and unkeyed `Vary` fields prevent storage. Include every representation-changing header in the key, even when your handler forgets to send `Vary`.
+
+Response middleware never invokes a completed request's handler in background work. Its legacy `swr` option is deprecated and ignored. For SWR, wrap independent data fetches in `cache.get()` or `cache.wrap()` inside the route.
 
 ### Ready-to-run Express demo
 
@@ -50,7 +58,6 @@ app.get(
   createExpressMiddleware({
     cache,
     ttl: 300,
-    swr: 60,
     headerWhitelist: ['accept-language'],
     tags: ['products'],
   }),

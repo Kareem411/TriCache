@@ -25,7 +25,7 @@ export interface ICacheSpanLink {
 export interface ICacheSpan {
   setAttribute(key: string, value: string | number | boolean): this;
   setStatus(status: { code: 0 | 1 | 2; message?: string }): this;
-  recordException?(err: Error | unknown): this;
+  recordException?(err: unknown): void;
   end(): void;
 }
 
@@ -127,6 +127,9 @@ export interface SmartCacheEntry {
   setAt?: number;
   /** Active tag versions at write time (used when tagStrategy === 'generational') */
   tagVersions?: Record<string, number>;
+  /** Set-based tags and dependency patterns preserved through disk/snapshot promotion. */
+  tags?: string[];
+  dependsOn?: string[];
 }
 
 /** Returned by SmartMemoryCache.get() — distinguishes "cached null" from a real miss */
@@ -148,6 +151,8 @@ export interface CacheHit {
   tagVersions?: Record<string, number>;
   /** Timestamp (ms) when this entry was written into memory */
   setAt?: number;
+  tags?: string[];
+  dependsOn?: string[];
 }
 
 // ─── Disk tier ───────────────────────────────────────────────────────────────
@@ -165,6 +170,12 @@ export interface DiskCacheEntry {
   priority: number;
   /** Active tag versions at write time (used when tagStrategy === 'generational') */
   tagVersions?: Record<string, number>;
+  /** Original write time and TTL, preserved on spill and promotion. */
+  setAt?: number;
+  ttlMs?: number;
+  delta?: number;
+  tags?: string[];
+  dependsOn?: string[];
 }
 
 // ─── Metrics snapshot ────────────────────────────────────────────────────────
@@ -1169,8 +1180,13 @@ export interface ICacheCounter {
   add(value: number, attributes?: Record<string, string | number | boolean>): void;
 }
 
+export type ICacheObservableCallback = (result: {
+  observe(value: number, attributes?: Record<string, string | number | boolean>): void;
+}) => void | Promise<void>;
+
 export interface ICacheObservableGauge {
-  readonly _isGauge?: true;
+  addCallback(callback: ICacheObservableCallback): void;
+  removeCallback(callback: ICacheObservableCallback): void;
 }
 
 export interface ICacheBatchObservableCallback {
@@ -1183,6 +1199,7 @@ export interface ICacheMeter {
   createCounter(name: string, options?: { description?: string; unit?: string }): ICacheCounter;
   createObservableGauge(name: string, options?: { description?: string; unit?: string }): ICacheObservableGauge;
   addBatchObservableCallback(callback: ICacheBatchObservableCallback, observables: ICacheObservableGauge[]): void;
+  removeBatchObservableCallback?(callback: ICacheBatchObservableCallback, observables: ICacheObservableGauge[]): void;
 }
 
 /**
@@ -1199,6 +1216,9 @@ export interface IRedisPipeline {
   smembers(key: string): this;
   hset(key: string, value: Record<string, string>): this;
   hgetall?(key: string): this;
+  /** Remaining TTL in milliseconds; enables atomic value + expiry reads. */
+  pttl?(key: string): this;
+  eval?(script: string, numkeys: number, ...args: (string | number)[]): this;
   exec(): Promise<Array<[Error | null, any]> | null>;
 }
 
@@ -1212,6 +1232,7 @@ export interface IRedisDriver {
   setex?(key: string, seconds: number, value: string): Promise<unknown>;
   del(...keys: string[]): Promise<number>;
   ping(): Promise<string>;
+  pttl?(key: string): Promise<number>;
   expire(key: string, seconds: number): Promise<number | boolean>;
   incr(key: string): Promise<number>;
   eval(script: string, numkeys: number, ...args: (string | number)[]): Promise<unknown>;
@@ -1225,6 +1246,8 @@ export interface IRedisDriver {
   hgetall?(key: string): Promise<Record<string, string>>;
   publish?(channel: string, message: string): Promise<number>;
   subscribe?(...channels: string[]): Promise<unknown>;
+  unsubscribe?(...channels: string[]): Promise<unknown>;
+  removeListener?(event: string, listener: (...args: any[]) => void): this | unknown;
   disconnect(): Promise<void> | void;
   quit?(): Promise<void> | void;
   duplicate?(): IRedisDriver;

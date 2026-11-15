@@ -27,7 +27,7 @@ describe('OpenTelemetry Native Metrics (ICacheMeter)', () => {
         };
       },
       createObservableGauge(name: string): ICacheObservableGauge {
-        return { _isGauge: true, name } as unknown as ICacheObservableGauge;
+        return { addCallback() {}, removeCallback() {}, name } as ICacheObservableGauge;
       },
       addBatchObservableCallback(cb: ICacheBatchObservableCallback) {
         batchCallback = cb;

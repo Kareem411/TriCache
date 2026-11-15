@@ -31,13 +31,11 @@ Then follow the `curl -i` walkthrough in that README (`pnpm verify` automates th
 ```typescript
 import { EdgeCacheService } from 'tricache/edge';
 
+// Reuse within the isolate; constructing per request discards the local cache.
+const cache = new EdgeCacheService({ maxKeys: 5_000, bloomFilter: true });
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const cache = new EdgeCacheService({
-      maxKeys: 5_000,
-      bloomFilter: true, // WasmBloomFilter, or pass `new Murmur3BloomFilter()`
-    });
-
     const url = new URL(request.url);
     const data = await cache.get(
       `route:${url.pathname}`,
@@ -86,7 +84,7 @@ app.get(
 * **RFC 7232 304 Not Modified**: Intercepts matching `If-None-Match` headers for instant 304 responses, omitting representation headers per RFC 7232.
 * **Deterministic Query Sorting**: Groups identical query permutations into a single cache entry.
 * **Non-2xx & 206 Status Gating**: Never caches error responses or `206 Partial Content` slices.
-* **SWR Revalidation Safety**: Rejects upstream error responses during background revalidations, preserving healthy stale cache entries.
+* **Request-Bound Response Refresh**: Never reruns a completed Hono `next()` chain in background work. Use independent `EdgeCacheService.get()` data fetchers for SWR and pass `ctx.waitUntil` on edge platforms.
 * **Response Cache-Control Protection**: Honors downstream `Cache-Control: no-store`, `no-cache`, and `private` headers.
 * **Streaming Response Passthrough**: Automatically bypasses Server-Sent Events (`text/event-stream`), avoiding isolate buffer hangs.
 * **Header Preservation**: Restores downstream custom headers (e.g. CORS and regional routing headers) on cache hits.
@@ -125,9 +123,7 @@ const cache = new EdgeCacheService({
 
 Edge subrequests to remote HTTP key-value stores incur metered API costs and 20–50ms latencies. 
 
-TriCache includes an in-memory **MurmurHash3 Bloom Filter** running directly inside the V8 isolate:
-* Definite misses for unknown keys abort in **~300 nanoseconds**.
-* Eliminates up to **99% of wasted remote subrequests** caused by automated vulnerability scanners and 404 route penetration.
+TriCache includes in-isolate WASM and TypeScript Bloom filters. An isolate-local filter cannot know about keys another isolate wrote remotely, so remote negative gating is **disabled by default**, even with `bloomFilter: true`.
 
 Pass `bloomFilter: true` for the WASM filter (Murmur3 TypeScript fallback), or pass an explicit instance:
 
@@ -136,9 +132,14 @@ import { EdgeCacheService, Murmur3BloomFilter } from 'tricache/edge';
 
 const cache = new EdgeCacheService({
   bloomFilter: new Murmur3BloomFilter(),
-  remoteStorage, // Bloom only gates remote L2 lookups
+  remoteStorage,
+  // Leave bloomFilterAuthoritative false unless this filter represents every remote key.
 });
 ```
+
+`bloomFilterAuthoritative: true` trusts negative results only when you maintain a complete, current remote key set. An empty/new isolate filter is not authoritative. WASM compilation is lazy and falls back to TypeScript where dynamic compilation is restricted.
+
+New remote entries contain values, tags, generations, and absolute expiry/SWR times. Cold reads promote locally without rewriting storage or restarting TTLs. Legacy plain JSON remains readable but is not promoted without trustworthy expiry metadata.
 
 ---
 
@@ -166,7 +167,7 @@ const configs = await cache.mget<TenantConfig>(
 
 ## 6. Wildcard & Cascading Tag Invalidation in Edge Isolates
 
-`EdgeCacheService` supports both wildcard pattern matching (`*`, `?`) and parent-child namespace cascading across isolate memory and remote storage:
+`EdgeCacheService` supports wildcard matching (`*`, `?`) and parent-child cascading for tags known to this isolate. Concrete version changes use remote storage when available. Wildcards cannot discover every tag on other isolates, and eventually consistent KV storage does not provide immediate fleet-wide invalidation; use explicit tags and an atomic counter backend when stronger coordination is needed.
 
 ```typescript
 // Tag items during set
@@ -179,6 +180,5 @@ await cache.invalidateTag('org:123:*');
 // Parent-child cascading invalidation
 await cache.invalidateTag('org:123', { cascade: true });
 ```
-
 
 

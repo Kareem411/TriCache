@@ -60,7 +60,8 @@ try {
   }
 } catch {
   // CJS fallback — __dirname is available natively in CJS (and shimmed by tsup for ESM).
-  _workerFile = join(__dirname, 'serialize-worker.js');
+  const sibling = join(__dirname, 'serialize-worker.js');
+  _workerFile = existsSync(sibling) ? sibling : join(dirname(__dirname), 'serialize-worker.js');
 }
 
 export interface WorkerPoolOptions {
@@ -125,6 +126,7 @@ export class WorkerPool {
 
   private _spawnWorkers(opts: WorkerPoolOptions): { workers: Worker[]; pending: Map<number, PendingEntry>[] } {
     const size = Math.max(1, opts.size ?? Math.min(4, availableCpus()));
+    if (!Number.isInteger(size) || size > 32 || !existsSync(_workerFile)) throw new Error('Worker pool unavailable or invalid worker count');
     const workerData = {
       keyBase64:     opts.keyBase64,
       mode:          opts.mode,
@@ -140,7 +142,7 @@ export class WorkerPool {
     const createWorker = (index: number): Worker => {
       const worker = new Worker(_workerFile, {
         workerData,
-        execArgv: _workerExecArgv.length > 0 ? _workerExecArgv : undefined,
+        execArgv: _workerExecArgv, // Do not inherit --input-type/eval or application loader flags.
       });
       const pending = pendingList[index] ?? new Map<number, PendingEntry>();
       if (!pendingList[index]) pendingList[index] = pending;
@@ -175,7 +177,7 @@ export class WorkerPool {
         worker.unref();
 
         // If pool is still active and worker exited with non-zero code, auto-replace
-        if (this._available && exitCode !== 0 && workers[index] === worker) {
+        if (this._available && this.workers === workers && workers[index] === worker) {
           try {
             workers[index] = createWorker(index);
           } catch { /* ok */ }
@@ -186,9 +188,11 @@ export class WorkerPool {
       return worker;
     };
 
-    for (let i = 0; i < size; i++) {
-      const worker = createWorker(i);
-      workers.push(worker);
+    try {
+      for (let i = 0; i < size; i++) workers.push(createWorker(i));
+    } catch (error) {
+      for (const worker of workers) void worker.terminate().catch(() => {});
+      throw error;
     }
 
     return { workers, pending: pendingList };
@@ -223,7 +227,7 @@ export class WorkerPool {
         entry.reject(new Error('WorkerPool replaced during key rotation'));
       }
       oldPending[i]?.clear();
-      oldWorkers[i]?.terminate().catch(() => {});
+      await oldWorkers[i]?.terminate().catch(() => {});
     }
   }
 
@@ -272,7 +276,12 @@ export class WorkerPool {
       // Re-ref the worker while this request is in flight so the event loop
       // stays alive even in short-lived scripts (benchmarks, CLI tools).
       worker.ref();
-      worker.postMessage({ id, type, payload: dataToSend }, transferList);
+      try { worker.postMessage({ id, type, payload: dataToSend }, transferList); }
+      catch (error) {
+        pending.delete(id);
+        if (pending.size === 0) worker.unref();
+        reject(error);
+      }
     });
   }
 

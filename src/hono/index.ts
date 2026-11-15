@@ -20,6 +20,8 @@ import {
   buildDeterministicKey,
   generateETag,
   shouldSkipCache,
+  isShareableHttpResponse,
+  matchesETag,
   type KeyDerivationOptions,
 } from '../http/utils.js';
 
@@ -40,12 +42,12 @@ export interface HonoCacheContext {
     clone?: () => { text: () => Promise<string> };
     body?: unknown;
   };
-  body: (data: unknown, status?: number, headers?: Record<string, string>) => unknown;
+  body: (...args: any[]) => any;
   executionCtx?: unknown;
 }
 
 export type HonoNext = () => Promise<void>;
-export type HonoMiddleware = (c: HonoCacheContext, next: HonoNext) => Promise<unknown>;
+export type HonoMiddleware = (c: HonoCacheContext, next: HonoNext) => Promise<Response | void>;
 
 export interface HonoCacheOptions extends Omit<WrapOptions, 'tags'>, Omit<KeyDerivationOptions, 'keyGenerator'> {
   /** TriCache instance. If omitted, lazily resolves the default singleton via CacheService.create(). */
@@ -58,6 +60,8 @@ export interface HonoCacheOptions extends Omit<WrapOptions, 'tags'>, Omit<KeyDer
   skipCache?: (c: HonoCacheContext) => boolean;
   /** Dynamic tags derivation from the Hono context. */
   tags?: string[] | ((c: HonoCacheContext) => string[]);
+  /** @deprecated Response refreshes run on live requests. Use data-level cache.get()/wrap() for SWR. */
+  swr?: number;
 }
 
 export interface CachedHonoResponse {
@@ -71,7 +75,7 @@ export interface CachedHonoResponse {
 function readRequestHeader(c: HonoCacheContext, name: string): string | undefined {
   const headerFn = c.req.header;
   if (typeof headerFn === 'function') {
-    const viaFn = headerFn(name) ?? headerFn(name.toLowerCase());
+    const viaFn = headerFn.call(c.req, name) ?? headerFn.call(c.req, name.toLowerCase());
     if (viaFn !== undefined && viaFn !== null && viaFn !== '') {
       return viaFn;
     }
@@ -95,6 +99,10 @@ function toRequestLike(c: HonoCacheContext, headerWhitelist?: string[]) {
   const headers: Record<string, string | undefined> = {};
   const cacheControl = readRequestHeader(c, 'cache-control');
   const ifNoneMatch = readRequestHeader(c, 'if-none-match');
+  for (const name of ['authorization', 'cookie', 'range', 'x-api-key', 'x-auth-token']) {
+    const value = readRequestHeader(c, name);
+    if (value) headers[name] = value;
+  }
 
   if (cacheControl) {
     headers['cache-control'] = cacheControl;
@@ -133,8 +141,8 @@ function applyHonoCachedResponse(
   c: HonoCacheContext,
   cached: CachedHonoResponse,
   ifNoneMatch: string | undefined,
-): unknown {
-  if (cached.etag && ifNoneMatch === cached.etag) {
+): Response | void {
+  if (cached.etag && matchesETag(ifNoneMatch, cached.etag)) {
     const notModifiedHeaders: Record<string, string> = { ETag: cached.etag };
     if (cached.headers?.['cache-control']) notModifiedHeaders['Cache-Control'] = cached.headers['cache-control'];
     if (cached.headers?.['vary']) notModifiedHeaders['Vary'] = cached.headers['vary'];
@@ -159,6 +167,7 @@ function applyHonoCachedResponse(
 async function snapshotHonoResponse(
   c: HonoCacheContext,
   etag: boolean,
+  options: KeyDerivationOptions,
 ): Promise<CachedHonoResponse> {
   const res = c.res;
   if (!res) {
@@ -178,6 +187,7 @@ async function snapshotHonoResponse(
   }
 
   const status = res.status ?? 200;
+  if (!isShareableHttpResponse(status, name => res.headers?.get?.(name), options)) return { body: '', contentType, status: 0 };
   if (!isCacheableStatus(status)) {
     return { body: '', contentType, status };
   }
@@ -249,7 +259,6 @@ export function cacheMiddleware(options: HonoCacheOptions = {}): HonoMiddleware 
     cache,
     etag = true,
     ttl = 300,
-    swr,
     tags,
     skipCache,
     keyGenerator,
@@ -265,7 +274,7 @@ export function cacheMiddleware(options: HonoCacheOptions = {}): HonoMiddleware 
     }
 
     const reqLike = toRequestLike(c, headerWhitelist);
-    if (shouldSkipCache(reqLike, skipCache ? () => skipCache(c) : undefined)) {
+    if (shouldSkipCache(reqLike, skipCache ? () => skipCache(c) : undefined, { ...options, keyGenerator: keyGenerator ? () => keyGenerator(c) : undefined })) {
       return await next();
     }
 
@@ -289,14 +298,15 @@ export function cacheMiddleware(options: HonoCacheOptions = {}): HonoMiddleware 
         async () => {
           ranNext = true;
           await next();
-          const snapshot = await snapshotHonoResponse(c, etag);
+          const snapshot = await snapshotHonoResponse(c, etag, { headerWhitelist, keyGenerator: keyGenerator ? () => keyGenerator(c) : undefined });
           if (!isCacheableStatus(snapshot.status)) {
             throw new NonCacheableHonoResponseError(snapshot);
           }
           return snapshot;
         },
         ttl,
-        { swr, tags: resolvedTags },
+        // Never invoke a completed Hono next() chain from background work.
+        { swr: 0, tags: resolvedTags },
       );
 
       return applyHonoCachedResponse(c, cached, ifNoneMatch);

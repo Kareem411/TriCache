@@ -108,11 +108,12 @@ describe('msgpackr 2.1.0 & CacheCodec Improvements', () => {
       });
 
       await svc.set('user:default', user, 60);
-      await svc.set('user:evictor', { pad: 'x'.repeat(200) }, 60);
+      await svc.set('user:evictor', { pad: 'x'.repeat(10) }, 60);
       for (let i = 0; i < 40; i++) {
         if ((svc as any).disk.stats.files > 0) break;
         await new Promise(r => setTimeout(r, 25));
       }
+      expect((svc as any).disk.stats.files).toBeGreaterThan(0);
       const cached = await svc.get<Record<string, unknown>>('user:default', async () => ({}));
       expect(cached).toEqual({
         id: 101,
@@ -145,13 +146,14 @@ describe('msgpackr 2.1.0 & CacheCodec Improvements', () => {
       });
 
       await svc.set('user:raw', user, 60);
-      await svc.set('user:evictor', { pad: 'x'.repeat(200) }, 60);
+      await svc.set('user:evictor', { pad: 'x'.repeat(10) }, 60);
 
       for (let i = 0; i < 40; i++) {
         if ((svc as any).disk.stats.files > 0) break;
         await new Promise(r => setTimeout(r, 25));
       }
 
+      expect((svc as any).disk.stats.files).toBeGreaterThan(0);
       const rawCached = await svc.get<Record<string, unknown>>('user:raw', async () => ({}));
 
       expect(rawCached).toEqual({

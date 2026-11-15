@@ -1,8 +1,8 @@
 # Kubernetes Production & SRE Architecture
 
-> **Enterprise SRE Reference**: Zero-IOPS Off-Heap Storage, CIS/SOC2 `readOnlyRootFilesystem: true`, and Cgroup Memory Budgeting.
+> **SRE Reference**: Bounded local storage, read-only root compatibility, and cgroup-aware memory budgeting. Deployment controls still require independent validation.
 
-TriCache is engineered specifically to eliminate the standard failure modes of stateful in-memory caching inside Kubernetes clusters: V8 garbage collection stalls, container OOMKills, EBS burst-credit exhaustion, and node eviction triggered by ephemeral storage exhaustion.
+TriCache provides admission bounds, pressure guards, and storage quotas to reduce common cache failure risks. These do not eliminate GC pauses, OOMKills, storage pressure, or network partitions.
 
 ---
 
@@ -12,7 +12,7 @@ Explore the dedicated Kubernetes guides:
 
 | Topic | Focus Area | Key Architectural Advantage |
 |:---|:---|:---|
-| **[/dev/shm Off-Heap tmpfs](/kubernetes/dev-shm)** | Container Memory Bus | 0.02ms latency off-heap RAM, zero V8 GC pauses, zero cloud EBS IOPS, compliant with `readOnlyRootFilesystem: true`. |
+| **[/dev/shm Off-Heap tmpfs](/kubernetes/dev-shm)** | Container Memory | Writable local storage that counts against cgroup memory; measure latency and pressure. |
 | **[Cgroup Memory Budgeting](/kubernetes/cgroups)** | Container Sizing | Cgroup v1/v2 enforcement, 40/40/20 heap-to-spill ratios, GC-aware OOM emergency purges. |
 | **[Liveness vs. Readiness Probes](/kubernetes/probes)** | Traffic Routing | Hard separation between `/healthz` (process survival) and `/ready` (traffic admission & degradation). |
 | **[Dynamic Latency Watchdog](/kubernetes/watchdog)** | Blast-Radius Shielding | Asymmetric Redis hysteresis and 4-stage graduated disk shedding under noisy-neighbor load. |
@@ -22,7 +22,7 @@ Explore the dedicated Kubernetes guides:
 
 ## The Golden Path Manifest
 
-A hardened Kubernetes `Deployment` manifest passing CIS Benchmarks and SOC2 compliance:
+A sample Kubernetes `Deployment` manifest to adapt and validate for your own resource and security requirements:
 
 ```yaml
 apiVersion: apps/v1

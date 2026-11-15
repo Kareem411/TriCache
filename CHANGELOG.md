@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] — 2026-11-15
+
+### Fixed
+- HTTP cache privacy: credential bypass, identity-aware opt-in, sensitive-header hashing, private/cookie/Vary/partial-response exclusion, binary Fastify replies, and request-bound response refresh instead of unsafe background `next()` calls.
+- Core and batch consistency: mutation/generation fences, conditional singleflight cleanup, negative-cache handling, dependency propagation, remaining-TTL promotion, and accurate batch hit-rate accounting.
+- Distributed invalidation: set-tag peer broadcasts, regional L2 deletion, monotonic regional generations, visible relay failures, concrete stream cursors, trimmed-gap flushing, initial reconnect recovery, and snapshot cursor replay.
+- Resource limits: bounded snapshot/TinyLFU admission, critical-entry protection, rejected oversized replacements, physical disk-write reservations after timeout, late-spill fencing, and cgroup-aware spill suppression.
+- Native Next.js contract: complete entry timings, bounded/base64 RSC storage, pending-write barriers, soft-tag delegation, and delayed tag expiry. Framework validity is distinct from raw backing-entry presence.
+- Edge safety: expiry/tag envelopes, local-only promotion, mutation fences, namespace-clear isolation, oversized-entry rejection, lazy WASM fallback, and explicit authoritative Bloom-filter opt-in.
+- Adapter/lifecycle safety: precise NestJS millisecond TTLs, Prisma rich-filter hashing and `cache:false`, diagnostic redaction, IPC startup/shutdown ownership, worker lifecycle/path handling, and actual OpenTelemetry callback teardown.
+- Packaging/dashboard/CLI: conditional ESM/CJS declarations, external consumer/worker checks, read-only dashboard defaults, token/base-path propagation, bounded streaming/request bodies, accessible dialogs, and Redis URL/port parsing.
+
+### Changed
+- Upgraded NestJS validation/examples to 12.5.0, added a Keyv 5 / cache-manager 7 bridge for Nest's current `CacheModule`, made `CACHE_MANAGER` binding configurable to avoid collisions, expanded the direct facade, and kept optional Nest peers compatible with 10–12.
+- Confirmed Next.js 16.4.6 is the latest stable release (16.5 is canary); retained the native cache-handler contract and upgraded the example integration checks.
+- Pinned the Vitest major range.
+- Corrected documentation/examples and benchmark instance/SWR setup. Historical benchmark values are not current guarantees.
+- Expanded CI with required live Redis, package-consumer validation, and pull-request documentation builds.
+
+### Validation
+- 980 unit tests across 93 files and 17 live Redis integration tests across 2 files.
+- Source/test type checks, lint, package builds, ESM/CJS consumer and worker checks, documentation build, and the 24-suite benchmark runner.
+- Production and development dependency audits report no advisories.
+
 ## [1.0.1] — 2026-11-10
 
 ### Fixed

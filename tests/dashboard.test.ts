@@ -137,7 +137,7 @@ describe('Turnkey Visual Observability & Dashboard (Gap 1)', () => {
       const data = await res.json() as Record<string, any>;
       expect(data.title).toBe('Fleet Observability');
       expect(data.instanceId).toBe('worker-pod-42');
-      expect(data.readOnly).toBe(false);
+      expect(data.readOnly).toBe(true);
       expect(data.peerInstances).toEqual([{ name: 'Pod 2', url: 'http://pod-2:9090' }]);
       expect(data.metrics.gets.total).toBe(1);
       expect(data.metrics.gets.l1Hits).toBe(1);
@@ -249,7 +249,7 @@ describe('Turnkey Visual Observability & Dashboard (Gap 1)', () => {
         body: JSON.stringify({ tag: 'products' }),
       });
 
-      const res = await handleDashboardRequest(req, { cache });
+      const res = await handleDashboardRequest(req, { cache, readOnly: false });
       expect(res.status).toBe(403);
       const body = await res.json() as { error: string };
       expect(body.error).toContain('CSRF');
@@ -267,7 +267,7 @@ describe('Turnkey Visual Observability & Dashboard (Gap 1)', () => {
         body: JSON.stringify({ tag: 'products' }),
       });
 
-      const res = await handleDashboardRequest(req, { cache });
+      const res = await handleDashboardRequest(req, { cache, readOnly: false });
       expect(res.status).toBe(403);
     });
 
@@ -311,6 +311,7 @@ describe('Turnkey Visual Observability & Dashboard (Gap 1)', () => {
       const res = await handleDashboardRequest(req, {
         cache: tagCache,
         authSecret: 'my-token',
+        readOnly: false,
         onAction: evt => { auditEvent = evt; },
       });
 
@@ -348,7 +349,7 @@ describe('Turnkey Visual Observability & Dashboard (Gap 1)', () => {
         },
       });
 
-      const res = await handleDashboardRequest(req, { cache });
+      const res = await handleDashboardRequest(req, { cache, readOnly: false });
       expect(res.status).toBe(200);
       const body = await res.json() as { ok: boolean };
       expect(body.ok).toBe(true);

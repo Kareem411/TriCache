@@ -63,7 +63,7 @@ export interface DashboardOptions {
   /**
    * Enforces read-only mode: disables and blocks all mutating operations
    * (e.g. invalidate tag, clear cache tier). Mutating endpoints return 403 Forbidden.
-   * @default false
+   * @default true
    */
   readOnly?: boolean;
 
@@ -72,6 +72,8 @@ export interface DashboardOptions {
    * @default 2000
    */
   streamIntervalMs?: number;
+  /** Maximum administrative request body size. Default: 64 KiB. */
+  maxRequestBytes?: number;
 
   /**
    * Enterprise audit logging hook invoked when an administrative action is attempted.

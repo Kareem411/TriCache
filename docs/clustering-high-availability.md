@@ -27,7 +27,7 @@ const cache = CacheService.create({
 ### Topology Discovery & Slot Routing
 * **Auto-Discovery**: You only need to supply an initial subset of cluster nodes. TriCache queries `CLUSTER SLOTS` on startup and dynamically maps the complete cluster topology.
 * **Automatic Redirect Handling**: Handles `MOVED` and `ASK` redirects transparently during live slot migrations and cluster rebalancing with zero dropped commands.
-* **Hash Tag Scoping**: All internal backplane channels and keys use hash tags (e.g. `{<namespace>}`) to guarantee that related metadata hashes to the identical slot shard.
+* **Hash Tag Scoping**: The default stream key uses `{<namespace>}`. Ordinary data/tag keys can span slots; batch operations group commands by owning master and avoid cross-slot transactions.
 
 ---
 
@@ -117,8 +117,16 @@ const cache = CacheService.create({
 
 ### Adapter Architecture & Features
 * **Zero Runtime Dependencies**: Implemented via structural duck-typing; zero external runtime dependencies added to TriCache.
-* **Tuple-Normalized Pipelines**: Converts `node-redis` chained `.multi()` executions into standard error-first tuple arrays (`Array<[Error | null, T]>`), guaranteeing 100% compatibility with TriCache's pipelined batch operations (`mget`, `warmFromL2`).
+* **Tuple-Normalized Replies**: Atomic `.multi()` transactions and non-transactional, same-tick command batches preserve per-command `[error, result]` replies. A failed command does not hide successful replies or trigger unsafe replay of writes.
 * **Safe Teardown**: `cache.destroy()` gracefully disconnects internal listeners while leaving your external shared connection pool open.
+
+### Delivery and expiry boundaries
+
+- Call `await cache.ready()` before serving traffic. Readiness finishes the initial backplane attempt; inspect `cache.health()` for degraded transport state.
+- Streams replay retained events from concrete cursors, including cursors saved in snapshots. If retention has removed the cursor or events are missing, local state is conservatively flushed. Redis persistence, replication, and retention policy determine durability.
+- `awaitInvalidationBackplane: true` awaits publication and reports failures. It does not wait for every peer to apply an event, and is not exactly-once delivery. Cross-region callers should implement durable retry where required.
+- Regional relay receivers invalidate their regional L2 as well as local tiers. Regional generation counters advance monotonically even when an incoming region's counter is smaller.
+- Cold Redis reads preserve remaining TTL through atomic value/PTTL reads where supported. Custom drivers without those capabilities use bounded fallback TTLs.
 
 ---
 

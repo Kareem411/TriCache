@@ -37,6 +37,9 @@ jobs:
       - name: Strict TypeScript verification (src + tests)
         run: pnpm typecheck:all
 
+      - name: Build documentation (including pull requests)
+        run: pnpm docs:build
+
   test-linux:
     name: Test (Ubuntu - Node ${{ matrix.node }})
     needs: validate
@@ -83,14 +86,29 @@ jobs:
         shell: bash
         run: pnpm run test:integration
         env:
-          REDIS_HOST: '127.0.0.1'
-          REDIS_PORT: 6379
+          TEST_REDIS_URL: 'redis://127.0.0.1:6379'
+          TEST_REDIS_REQUIRED: '1'
 
       - name: Build
         run: pnpm build
 
+      - name: Outside-workspace ESM/CJS consumers and compiled worker
+        run: pnpm check:package
+
       - name: Package tarball dry-run verification
-        run: pnpm pack --dry-run
+        run: pnpm pack --dry-run --json
+
+      - name: NestJS 12 runtime example (module + cache-manager 7)
+        run: |
+          pnpm --dir examples/nestjs-microservice install --frozen-lockfile
+          pnpm --dir examples/nestjs-microservice exec tsc --noEmit
+          pnpm --dir examples/nestjs-microservice verify
+
+      - name: Next.js 16 Cache Components production build
+        run: |
+          pnpm --dir examples/nextjs install --frozen-lockfile
+          pnpm --dir examples/nextjs exec tsc --noEmit
+          pnpm --dir examples/nextjs build
 
   test-matrix:
     name: Test (${{ matrix.os }} - Node ${{ matrix.node }})
@@ -124,8 +142,11 @@ jobs:
       - name: Build
         run: pnpm build
 
+      - name: Outside-workspace ESM/CJS consumers and compiled worker
+        run: pnpm check:package
+
       - name: Package tarball dry-run verification
-        run: pnpm pack --dry-run
+        run: pnpm pack --dry-run --json
 
   publish:
     name: Publish to npm & GitHub Release
@@ -151,6 +172,9 @@ jobs:
 
       - name: Strict TypeScript verification
         run: pnpm typecheck:all
+
+      - name: Verify release tag matches package version
+        run: pnpm check:release-version "${GITHUB_REF_NAME}"
 
       - name: Build
         run: pnpm build

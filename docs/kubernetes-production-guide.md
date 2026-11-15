@@ -1,6 +1,6 @@
 # TriCache — Kubernetes Production & SRE Deployment Guide
 
-> **Enterprise Hardening**: Zero-IOPS Off-Heap Storage, CIS/SOC2 `readOnlyRootFilesystem: true`, and Cgroup Memory Budgeting.
+> **Deployment Guidance**: Writable tmpfs/disk mounts, read-only root compatibility, and cgroup-aware memory budgeting. Validate resource limits and security controls on your deployment.
 
 ---
 
@@ -24,7 +24,7 @@ TriCache automatically detects Linux container runtimes and targets `/dev/shm` w
 ```
                       ┌─────────────────────────────────────────┐
                       │            Node.js Process              │
-                      │  [L1 V8 Heap: 512MB] (Zero GC Pauses)   │
+                      │  [L1 packed-data budget: 512MB]          │
                       └────────────────────┬────────────────────┘
                                            │ Spill on Eviction
                                            ▼
@@ -32,18 +32,18 @@ TriCache automatically detects Linux container runtimes and targets `/dev/shm` w
 │   Linux /dev/shm (POSIX Shared Memory / tmpfs)                                         │
 │   • Path: /dev/shm/tricache-disk                                                       │
 │   • Speed: 0.02ms latency (Pure RAM bus, bypasses storage controllers entirely)        │
-│   • GC Impact: Zero V8 GC pressure (stored as raw binary buffers/SQLite)               │
-│   • Security: 100% compliant with readOnlyRootFilesystem: true                         │
+│   • GC Impact: encoding, buffers, and decoded values still use Node memory             │
+│   • Security: writable mount required with readOnlyRootFilesystem: true                │
 │   • Cloud IOPS: 0 IOPS burned (Zero AWS EBS volume cost)                              │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 :::
 
 ### Why SREs Approve This Pattern:
-* **Zero V8 GC Overhead**: Large JavaScript objects are serialized into flat `msgpackr` binary buffers or SQLite WAL pages in off-heap memory. Even with 4 GB of cached data, Node.js event-loop GC pauses stay under 5ms.
-* **Pure Memory Bus Speed**: Reads and writes complete in **~20 microseconds (0.02ms)**, 100× faster than network Redis (1–2ms).
+* **Memory Accounting**: tmpfs and page-cache usage count toward cgroup limits. Encoding and I/O still allocate buffers; GC pauses and OOM avoidance are not guaranteed. The pressure guard uses current cgroup usage where available and suppresses additional spills during cgroup pressure.
+* **Measured Latency**: Local storage can reduce network latency, but benchmark your filesystem and workload rather than assuming a fixed bound.
 * **Zero Cloud IOPS**: Does not touch cloud storage volumes, eliminating EBS burst credit exhaustion.
-* **CIS / SOC2 Compliant**: Functions cleanly within `readOnlyRootFilesystem: true` containers when `/dev/shm` is mounted as an `emptyDir`.
+* **Read-Only Root Compatibility**: Requires a separate writable mount. Configuration is not a CIS/SOC2 certification.
 
 ---
 

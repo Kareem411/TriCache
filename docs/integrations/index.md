@@ -12,7 +12,7 @@ Explore the dedicated guides for your application stack:
 
 | Package | Entrypoint | Key Capabilities |
 |:---|:---|:---|
-| **[Next.js 16 & 15](/integrations/nextjs)** | `tricache/next` | Drop-in `cacheHandler`, React 19 RSC binary streaming, soft tags, zero V8 GC pauses. |
+| **[Next.js 16](/integrations/nextjs)** | `tricache/next` | Native `cacheHandlers` instance, bounded React Server Component streams, timing preservation, and soft-tag expiry. |
 | **[NestJS Module](/integrations/nestjs)** | `tricache/nestjs` | Dynamic `TriCacheModule` (`register`/`registerAsync`), `@Cacheable` and `@CacheEvict` decorators. |
 | **[Prisma ORM Extension](/integrations/prisma)** | `tricache/prisma` | `$extends(withTriCache())`, automatic mutation invalidation, deterministic query key hashing. |
 | **[Drizzle ORM Wrapper](/integrations/drizzle)** | `tricache/drizzle` | `withCache(query)`, SQL + parameterized argument hashing, custom TTL and tag assignment. |

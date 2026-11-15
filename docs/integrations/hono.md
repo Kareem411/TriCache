@@ -28,7 +28,6 @@ app.get(
   cacheMiddleware({
     cache,
     ttl: 300,
-    swr: 60,
     tags: ['posts'],
     headerWhitelist: ['accept-language'],
   }),
@@ -57,12 +56,13 @@ app.get(
 * **Weak ETags**: SHA-1 weak validators (`ETag: W/"…"`) via the Node cryptographic helper.
 * **RFC 7232 304 Not Modified**: matching `If-None-Match` short-circuits with a `304` status, omitting representation headers per RFC 7232.
 * **Status gate**: non-2xx responses and `206 Partial Content` are never cached (prevents error or truncated range poisoning).
-* **SWR error resilience**: if upstream fails with 5xx/4xx during background Stale-While-Revalidate, healthy stale data is retained instead of overwriting cache with errors.
+* **Request-bound refresh**: expired responses are regenerated inside a live request. A completed `next()` chain is never rerun in background work. Use `cache.get()`/`wrap()` around independent data fetches for SWR.
 * **Response Cache-Control protection**: downstream responses with `Cache-Control: no-store`, `no-cache`, or `private` are strictly excluded from shared multi-user cache tiers.
 * **Streaming response passthrough**: Server-Sent Events (`Content-Type: text/event-stream`) bypass clone buffering automatically, preventing event-loop hangs.
 * **Response header preservation**: custom headers (CORS `Access-Control-Allow-Origin`, custom trace IDs) are captured on miss and restored on cache hits.
 * **Bypass**: request `Cache-Control: no-cache` / `no-store` and custom `skipCache` predicates bypass the cache.
-* **SWR & tags**: `ttl`, `swr`, and `tags` are forwarded to `CacheService.get` with multi-tier Redis/in-memory generational tag invalidation.
+* **Privacy**: credentialed requests bypass caching by default. Responses with `Set-Cookie`, `Vary: *`, or unkeyed `Vary` fields are excluded.
+* **TTL & tags**: forwarded to `CacheService.get` with distributed tag invalidation.
 
 ---
 
@@ -72,9 +72,10 @@ app.get(
 |---|---|---|---|
 | `cache` | `CacheService` | singleton | TriCache instance. If omitted, lazily resolves `CacheService.create()` |
 | `ttl` | `number` | `300` | Time-to-live in seconds |
-| `swr` | `number` | `undefined` | Stale-While-Revalidate window in seconds |
+| `swr` | `number` | ignored | Deprecated for response middleware; use data-level SWR |
 | `etag` | `boolean` | `true` | Generate and evaluate weak ETags (`W/"…"`) |
 | `keyGenerator` | `(c) => string` | method + URL + sorted query | Custom cache key from the Hono context |
 | `headerWhitelist` | `string[]` | `[]` | Request headers incorporated into the cache key |
 | `skipCache` | `(c) => boolean` | `undefined` | Predicate returning true to bypass cache |
+| `cacheAuthenticated` | `boolean` | `false` | Opt-in requires an identity-aware custom key or all credential headers in `headerWhitelist` |
 | `tags` | `string[] \| ((c) => string[])` | `[]` | Semantic tags for targeted `cache.invalidateTag()` |

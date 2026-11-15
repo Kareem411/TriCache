@@ -473,7 +473,7 @@ describe('Invalidation backplane (_handleBackplaneMessage)', () => {
 
     // after yielding to the event loop it fires
     await new Promise<void>(resolve => setImmediate(resolve));
-    expect(diskSpy).toHaveBeenCalledWith('k');
+    expect(diskSpy).toHaveBeenCalledWith('k', true);
   });
 });
 

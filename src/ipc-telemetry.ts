@@ -56,6 +56,8 @@ export class IpcTelemetryServer {
   private server: net.Server | null = null;
   public readonly socketPath: string;
   private _closed = false;
+  private _starting: Promise<void> | null = null;
+  private readonly sockets = new Set<net.Socket>();
   private _exitHandler: (() => void) | null = null;
   private _sigintHandler: (() => void) | null = null;
   private _sigtermHandler: (() => void) | null = null;
@@ -71,12 +73,20 @@ export class IpcTelemetryServer {
    * Start listening on the IPC socket / pipe.
    */
   async start(): Promise<void> {
-    if (this.server && this.server.listening) return;
+    if (this._closed || this.server?.listening) return;
+    if (this._starting) return this._starting;
+    this._starting = this.startInternal();
+    try { await this._starting; }
+    finally { this._starting = null; }
+  }
+
+  private async startInternal(): Promise<void> {
 
     // Hygiene on POSIX: check if an orphaned socket file exists from a crashed run
     if (process.platform !== 'win32' && fs.existsSync(this.socketPath)) {
       await new Promise<void>((resolve) => {
         const testSocket = net.createConnection(this.socketPath);
+        testSocket.setTimeout(1000, () => { testSocket.destroy(); resolve(); });
         testSocket.once('connect', () => {
           testSocket.destroy();
           // Active server already listening on this socket
@@ -94,22 +104,30 @@ export class IpcTelemetryServer {
         });
       });
     }
+    if (this._closed) return;
 
     this.server = net.createServer((socket) => {
+      if (this._closed) { socket.destroy(); return; }
+      this.sockets.add(socket);
+      socket.once('close', () => this.sockets.delete(socket));
+      socket.setTimeout(5000, () => socket.destroy());
       let buffer = '';
+      let pending = 0;
 
       socket.on('data', (chunk) => {
+        if (Buffer.byteLength(buffer) + chunk.length > 4096 || socket.writableLength > 65536) { socket.destroy(); return; }
         buffer += chunk.toString('utf8');
         let newlineIndex: number;
         while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
           const line = buffer.slice(0, newlineIndex).trim();
           buffer = buffer.slice(newlineIndex + 1);
           if (!line) continue;
+          if (++pending > 8) { socket.destroy(); return; }
 
           // Non-blocking telemetry pull: pull stats snapshot on tick boundaries
           // using setImmediate so serialization never introduces event loop stalls.
           setImmediate(() => {
-            if (socket.destroyed) return;
+            if (socket.destroyed) { pending--; return; }
             try {
               let cmd = line;
               try {
@@ -138,6 +156,8 @@ export class IpcTelemetryServer {
               if (!socket.destroyed) {
                 socket.write(JSON.stringify({ error: (err as Error).message }) + '\n');
               }
+            } finally {
+              pending--;
             }
           });
         }
@@ -147,24 +167,29 @@ export class IpcTelemetryServer {
         // Suppress client disconnection errors on IPC socket
       });
     });
+    this.server.maxConnections = 128;
 
     await new Promise<void>((resolve, reject) => {
-      this.server!.once('error', reject);
-      this.server!.listen(this.socketPath, () => {
-        this.server!.removeListener('error', reject);
+      const server = this.server!;
+      const cleanup = () => { server.off('error', failed); server.off('close', closed); };
+      const failed = (error: Error) => { cleanup(); reject(error); };
+      const closed = () => { cleanup(); resolve(); }; // close() can cancel listen before its callback fires.
+      server.once('error', failed);
+      server.once('close', closed);
+      server.listen(this.socketPath, () => {
+        cleanup();
         resolve();
       });
     });
+    if (this._closed) { if (this.server.listening) this.server.close(); return; }
 
     // Register process termination handlers to guarantee socket hygiene
     this._exitHandler = () => this._unlinkSocket();
     this._sigintHandler = () => {
       this._unlinkSocket();
-      process.exit(0);
     };
     this._sigtermHandler = () => {
       this._unlinkSocket();
-      process.exit(0);
     };
 
     process.once('exit', this._exitHandler);
@@ -198,6 +223,7 @@ export class IpcTelemetryServer {
   private _unlinkSocket(): void {
     if (this._closed) return;
     this._closed = true;
+    for (const socket of this.sockets) socket.destroy();
     try {
       this.server?.close();
     } catch {
@@ -218,6 +244,8 @@ export class IpcTelemetryServer {
    * Gracefully close the IPC telemetry server and clean up handlers and sockets.
    */
   async close(): Promise<void> {
+    this._unlinkSocket();
+    await this._starting?.catch(() => {});
     if (this._exitHandler) {
       process.removeListener('exit', this._exitHandler);
       this._exitHandler = null;
@@ -230,8 +258,6 @@ export class IpcTelemetryServer {
       process.removeListener('SIGTERM', this._sigtermHandler);
       this._sigtermHandler = null;
     }
-
-    this._unlinkSocket();
 
     return new Promise<void>((resolve) => {
       if (!this.server || !this.server.listening) {

@@ -4,9 +4,9 @@ const nextConfig: NextConfig = {
     cacheHandlers: {
         default: require.resolve("./cache-handler.ts"),
     },
-    cacheMaxMemorySize: 0,
     reactCompiler: true,
     cacheComponents: true,
+    partialPrefetching: true,
 };
 
 export default nextConfig;

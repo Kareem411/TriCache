@@ -40,9 +40,14 @@ interface BloomWasmExports {
 
 import { base64ToUint8Array } from '../edge/utils/base64';
 
-const BLOOM_WASM_MODULE = new WebAssembly.Module(
-  base64ToUint8Array(BLOOM_WASM_BASE64) as unknown as BufferSource,
-);
+let bloomWasmModule: WebAssembly.Module | undefined;
+
+function getBloomWasmModule(): WebAssembly.Module {
+  // Compile lazily so importing an edge bundle does not bypass the JS fallback.
+  return bloomWasmModule ??= new WebAssembly.Module(
+    base64ToUint8Array(BLOOM_WASM_BASE64) as unknown as BufferSource,
+  );
+}
 
 // NOTE: WasmBloomFilter initializes 100% synchronously in its constructor from
 // pre-compiled WebAssembly bytecode (BLOOM_WASM_MODULE). There is no async init() promise,
@@ -59,7 +64,7 @@ export class WasmBloomFilter {
   private _insertionCount = 0;
 
   constructor() {
-    const instance = new WebAssembly.Instance(BLOOM_WASM_MODULE, {});
+    const instance = new WebAssembly.Instance(getBloomWasmModule(), {});
     this.exports = instance.exports as unknown as BloomWasmExports;
     this.mem = new Uint8Array(this.exports.memory.buffer);
     this.stagingTarget = new Uint8Array(this.exports.memory.buffer, KEY_STAGING_OFFSET, MAX_KEY_BYTES);

@@ -33,7 +33,7 @@ static createAsync(
 ```
 
 ### `CacheService.reset(options?)`
-Gracefully closes connections on the existing singleton and initializes a completely fresh instance. Indispensable for clean unit and integration test teardown.
+Starts teardown of the matching singleton and replaces it synchronously. Use `new CacheService(options)` for independent instances; explicitly `await oldCache.destroy()` when teardown must finish before replacement.
 
 ```typescript
 static reset(options?: CacheOptions): CacheService
@@ -64,7 +64,7 @@ wrap<T>(
 **`WrapOptions` Schema:**
 ```typescript
 interface WrapOptions {
-  ttl?: number;             // Hard TTL in seconds (default: 300)
+  ttl?: number;             // Fresh TTL in seconds (default: 300); hard expiry includes SWR
   swr?: number;             // Stale-While-Revalidate window in seconds
   priority?: CachePriority; // LOW, NORMAL, HIGH, CRITICAL
   tags?: string[];          // Semantic tags for O(1) invalidation
@@ -90,12 +90,13 @@ async get<T>(
     xfetchBeta?: number;
     notFoundTtl?: number;
     tags?: string[];
+    dependsOn?: string[];
   }
 ): Promise<T>
 ```
 
 ### `cache.set<T>(key, data, ttlSeconds?, priority?, opts?)`
-Explicitly writes an entry across L1 RAM, spills to L1.5 disk (if enabled), and publishes to L2 Redis.
+Writes to L1 RAM and writable L2 Redis. Disk is an eviction tier, not an unconditional write-through tier. L1 admission limits can reject a value.
 
 ```typescript
 async set<T>(
@@ -118,7 +119,7 @@ getIfFresh<T = unknown>(cacheKey: string): T | null
 ```
 
 ### `cache.peek<T>(key)`
-Inspects a cached value across tiers without updating LRU/LFU frequency counters, resetting CMS decay, or triggering bloom filter state.
+Reads through existing L1/disk/Redis entries without invoking a fetcher or storing a dummy miss. Valid lower-tier hits may promote to L1, and reads update cache counters.
 
 ```typescript
 async peek<T = unknown>(cacheKey: string): Promise<T | null>
@@ -137,7 +138,7 @@ async setIfAbsent<T>(
 ```
 
 ### `cache.touch(key, newTtlSeconds)`
-Updates the TTL of an existing entry across all active tiers without reading or re-serializing the underlying payload.
+Updates an existing L1 entry's hard TTL and attempts a matching Redis TTL/expiry-metadata update. Does not search disk for absent L1 entries. TTL must be finite and positive.
 
 ```typescript
 async touch(cacheKey: string, newTtlSeconds: number): Promise<boolean>
@@ -148,7 +149,7 @@ async touch(cacheKey: string, newTtlSeconds: number): Promise<boolean>
 ## 3. Distributed Primitives & Batch Operations
 
 ### `cache.lock<T>(resourceKey, fn, options?)`
-Distributed mutex with Redlock-style safety. Uses UUID ownership tokens, exponential backoff retries, and atomic Lua verification on release. Automatically falls back to an in-process mutex when Redis is disabled.
+Single-Redis lease with ownership tokens, bounded retries, and atomic Lua verification on release. It is not Redlock and does not renew the lease: work must finish within `ttl`. Redis-disabled/read-only mode uses a local mutex; configure fail-closed behavior for Redis outages when local fallback would be unsafe.
 
 ```typescript
 async lock<T>(
@@ -176,7 +177,7 @@ async increment(cacheKey: string, ttlSeconds?: number): Promise<number>
 ```
 
 ### `cache.mget<T>(keys, fetchFn?, ttl?, priority?)`
-Differential multi-tier batch retrieval. Cascades through L1 RAM, L2 Redis (pipelined `MULTI`), and L1.5 disk spill, invoking `fetchFn(missKeys)` **only for the true remainder of unfulfilled keys**.
+Differential multi-tier batch retrieval. Cascades through L1 RAM, bounded L2 Redis pipelines, and L1.5 disk spill. Lua reads atomically capture each value/type/remaining TTL where supported. Only remaining misses reach `fetchFn`, and concurrent fetches coalesce by key.
 
 ```typescript
 async mget<T>(
@@ -305,7 +306,7 @@ getWTinyLfuStats(): WTinyLfuStats | undefined
 ## 5. Cache Management, Warmup & Snapshots
 
 ### `cache.ready()`
-Returns a promise that resolves once the Redis backplane is established, cold-start snapshots have hydrated, and initial `warmKeys` have populated.
+Waits for initial hydration, warming, and the first backplane setup attempt. Optional transport failures may resolve in degraded mode; inspect `cache.health()` when readiness must reflect them.
 
 ```typescript
 ready(): Promise<void>
@@ -322,7 +323,7 @@ async warmFromL2(
 ```
 
 ### `cache.drainToL2()`
-Asynchronously flushes all dirty in-memory L1 entries to Redis.
+Writes eligible live L1 entries to writable Redis, preserving decoded values and expiry/tag metadata. Returns `0` in Redis-disabled or read-only mode.
 
 ```typescript
 async drainToL2(): Promise<number>
@@ -396,7 +397,7 @@ static toPrometheusText(
 ```
 
 ### Operational Telemetry Callbacks
-To guarantee zero GC allocation and avoid the listener leak hazards of `EventEmitter` under million-ops/sec load, `CacheService` exposes direct lifecycle callback hooks in `CacheOptions`:
+`CacheService` exposes direct lifecycle callback hooks in `CacheOptions` instead of a per-operation `EventEmitter`:
 
 * **`onHit: (key: string, tier: 'l1' | 'disk' | 'l2') => void`**: Invoked on every successful cache read.
 * **`onMiss: (key: string) => void`**: Invoked when a key is exhausted across all tiers.
@@ -491,29 +492,30 @@ The TriCache engine honors the following environment variables across all enviro
 
 ## 9. HTTP & Framework Middlewares (`tricache/http`, `tricache/hono` & `tricache/edge`)
 
-### `createExpressMiddleware(cache, options?)`
+### `createExpressMiddleware(options?)`
 Creates an Express/Connect route middleware with deterministic query sorting, weak ETag calculation, and RFC 7232 `304 Not Modified` short-circuiting.
 
 ```typescript
 import { createExpressMiddleware } from 'tricache/http';
 
-app.get('/api/users', createExpressMiddleware(cache, {
-  ttlSeconds: 300,
+app.get('/api/users', createExpressMiddleware({
+  cache,
+  ttl: 300,
   headerWhitelist: ['accept-language'],
 }), handler);
 ```
 
-### `createFastifyPlugin(cache, options?)`
+### `createFastifyPlugin(options?)`
 Creates an encapsulation-safe Fastify plugin (`[Symbol.for('skip-override')] = true`) intercepting requests early in `onRequest` and caching responses in `onSend`.
 
 ```typescript
 import { createFastifyPlugin } from 'tricache/http';
 
-await fastify.register(createFastifyPlugin(cache, { ttlSeconds: 120 }));
+await fastify.register(createFastifyPlugin({ cache, ttl: 120 }));
 ```
 
 ### `cacheMiddleware(options?)` (`tricache/hono`)
-Creates Node Hono middleware on `CacheService` with Express-aligned ttl/tags/SWR, weak ETags, and RFC 7232 `304 Not Modified`. Non-2xx responses are not cached.
+Creates Node Hono response caching on `CacheService` with TTL/tags, privacy checks, weak ETags, and conditional `304` responses. Refresh is request-bound; use independent data fetchers for SWR.
 
 ```typescript
 import { cacheMiddleware } from 'tricache/hono';
@@ -523,18 +525,18 @@ app.get('/api/posts', cacheMiddleware({ ttl: 300, tags: ['posts'] }), (c) => {
 });
 ```
 
-### `createHonoEdgeMiddleware(edgeCache, options?)`
+### `honoEdgeCache(options?)`
 Creates a decoupled Hono edge middleware using pure Web Standards (`Request`, `Response`, `crypto.subtle`) with zero Node native dependencies.
 
 ```typescript
-import { createHonoEdgeMiddleware } from 'tricache/edge';
+import { honoEdgeCache } from 'tricache/edge';
 
-app.get('/api/items', createHonoEdgeMiddleware(edgeCache, { ttlSeconds: 180 }), handler);
+app.get('/api/items', honoEdgeCache({ cache: edgeCache, ttl: 180 }), handler);
 ```
 
 ---
 
-## 10. IPC Telemetry Bridge (`tricache/ipc`)
+## 10. IPC Telemetry Bridge (`tricache`)
 
 ### `IpcTelemetryServer`
 Lightweight, non-blocking IPC server running on Unix domain sockets or Windows Named Pipes that exposes metrics snapshots to external CLI monitors.
@@ -563,4 +565,3 @@ const latencyMs = await client.ping();
 Resolves platform-agnostic socket/pipe paths:
 * POSIX (`linux`, `darwin`): `/tmp/tricache-<id>.sock` (or `$TMPDIR/...`)
 * Windows (`win32`): `\\.\pipe\tricache-<id>`
-

@@ -4,6 +4,8 @@ import {
   buildDeterministicKey,
   generateETag,
   shouldSkipCache,
+  isCacheableHttpResponse,
+  matchesETag,
   type KeyDerivationOptions,
 } from './utils.js';
 
@@ -16,6 +18,8 @@ export interface FastifyCacheOptions extends Omit<WrapOptions, 'tags'>, KeyDeriv
   skipCache?: (req: any) => boolean;
   /** Dynamic tags derivation from request. */
   tags?: string[] | ((req: any) => string[]);
+  /** @deprecated Response refreshes run on live requests. Use data-level cache.get()/wrap() for SWR. */
+  swr?: number;
 }
 
 export interface CachedFastifyResponse {
@@ -23,6 +27,12 @@ export interface CachedFastifyResponse {
   contentType?: string;
   etag?: string;
   status: number;
+  binary?: boolean;
+  headers?: Record<string, string | string[]>;
+}
+
+function responseBody(entry: CachedFastifyResponse): unknown {
+  return entry.binary && !Buffer.isBuffer(entry.body) ? Buffer.from((entry.body as { data: number[] }).data) : entry.body;
 }
 
 /**
@@ -58,7 +68,7 @@ export function createFastifyPlugin(options: FastifyCacheOptions = {}) {
         return;
       }
 
-      if (shouldSkipCache(req, mergedOpts.skipCache)) {
+      if (shouldSkipCache(req, mergedOpts.skipCache, mergedOpts)) {
         return;
       }
 
@@ -75,9 +85,10 @@ export function createFastifyPlugin(options: FastifyCacheOptions = {}) {
       const cached = await activeCache!.peek<CachedFastifyResponse>(key);
 
       if (cached && typeof cached === 'object' && cached.body !== null) {
+        for (const [name, value] of Object.entries(cached.headers ?? {})) reply.header(name, value);
         if (cached.etag) {
           reply.header('ETag', cached.etag);
-          if (ifNoneMatch === cached.etag) {
+          if (matchesETag(ifNoneMatch, cached.etag)) {
             reply.code(304);
             return reply.send();
           }
@@ -88,11 +99,12 @@ export function createFastifyPlugin(options: FastifyCacheOptions = {}) {
         }
 
         reply.code(cached.status ?? 200);
-        return reply.send(cached.body);
+        return reply.send(req.method === 'HEAD' ? undefined : responseBody(cached));
       }
 
       // Mark request for response capture in onSend
       req._tricacheKey = key;
+      req._tricacheCanCommit = activeCache!.captureMutationFence(key);
       const resolvedTags = typeof mergedOpts.tags === 'function'
         ? mergedOpts.tags(req)
         : mergedOpts.tags;
@@ -108,7 +120,8 @@ export function createFastifyPlugin(options: FastifyCacheOptions = {}) {
       const statusCode = reply.statusCode ?? reply.raw?.statusCode ?? 200;
 
       // Status gate: only cache 2xx successful responses
-      if (statusCode >= 200 && statusCode < 300 && payload !== undefined && payload !== null) {
+      if (req._tricacheCanCommit?.() && isCacheableHttpResponse(statusCode, name => reply.getHeader(name), mergedOpts) && payload !== undefined && payload !== null &&
+          !(typeof payload === 'object' && typeof (payload as { pipe?: unknown }).pipe === 'function')) {
         const payloadEtag = etag ? generateETag(payload) : undefined;
         const contentType = reply.getHeader('content-type')
           || (typeof payload === 'object' ? 'application/json' : 'text/plain');
@@ -121,22 +134,24 @@ export function createFastifyPlugin(options: FastifyCacheOptions = {}) {
           ? (req.headers['if-none-match'] || req.headers['If-None-Match'])
           : undefined;
 
-        if (ifNoneMatch && payloadEtag && ifNoneMatch === payloadEtag) {
-          reply.code(304);
-          return '';
-        }
-
         // Asynchronously persist to cache without delaying current onSend pipeline
         const entry: CachedFastifyResponse = {
           body: payload,
           contentType,
           etag: payloadEtag,
           status: statusCode,
+          binary: Buffer.isBuffer(payload),
+          headers: reply.getHeaders ? Object.fromEntries(Object.entries(reply.getHeaders()).filter(([name]) =>
+            !['content-length', 'transfer-encoding', 'connection', 'set-cookie', 'content-type', 'etag'].includes(name.toLowerCase()))) as Record<string, string | string[]> : undefined,
         };
 
         void activeCache!.set(key, entry, mergedOpts.ttl ?? ttl, undefined, {
           tags: req._tricacheTags,
         }).catch(() => {});
+        if (payloadEtag && matchesETag(ifNoneMatch, payloadEtag)) {
+          reply.code(304);
+          return '';
+        }
       }
 
       return payload;
@@ -169,7 +184,7 @@ export function fastifyCache(options: FastifyCacheOptions = {}) {
     const reply = second;
 
     if (req.method !== 'GET' && req.method !== 'HEAD') return;
-    if (shouldSkipCache(req, options.skipCache)) return;
+    if (shouldSkipCache(req, options.skipCache, options)) return;
 
     let activeCache = options.cache;
     if (!activeCache) {
@@ -187,16 +202,13 @@ export function fastifyCache(options: FastifyCacheOptions = {}) {
       : undefined;
 
     // Fast-path probe
-    const cached = await activeCache.get<CachedFastifyResponse | null>(
-      key,
-      async () => null,
-      0
-    );
+    const cached = await activeCache.peek<CachedFastifyResponse>(key);
 
     if (cached && typeof cached === 'object' && cached.body !== null) {
+      for (const [name, value] of Object.entries(cached.headers ?? {})) reply.header?.(name, value);
       if (cached.etag) {
         if (reply.header) reply.header('ETag', cached.etag);
-        if (ifNoneMatch === cached.etag) {
+        if (matchesETag(ifNoneMatch, cached.etag)) {
           if (reply.code) reply.code(304);
           else if (reply.status) reply.status(304);
           if (reply.send) return reply.send();
@@ -213,11 +225,12 @@ export function fastifyCache(options: FastifyCacheOptions = {}) {
         else if (reply.status) reply.status(cached.status);
       }
 
-      if (reply.send) return reply.send(cached.body);
+      if (reply.send) return reply.send(req.method === 'HEAD' ? undefined : responseBody(cached));
       return;
     }
 
     // Miss path: intercept reply.send on completion
+    const canCommit = activeCache.captureMutationFence(key);
     const origSend = reply.send?.bind(reply);
     if (origSend) {
       reply.send = function (resPayload: any) {
@@ -227,18 +240,19 @@ export function fastifyCache(options: FastifyCacheOptions = {}) {
             || (typeof resPayload === 'object' ? 'application/json' : 'text/plain');
 
           const respStatus = reply.statusCode ?? reply.raw?.statusCode ?? 200;
-          if (respStatus >= 200 && respStatus < 300) {
+          const cacheable = isCacheableHttpResponse(respStatus, name => reply.getHeader?.(name), options);
+          if (cacheable && canCommit() && !(typeof resPayload === 'object' && typeof resPayload.pipe === 'function')) {
             const resolvedTags = typeof options.tags === 'function' ? options.tags(req) : options.tags;
             void activeCache!.set(
               key,
-              { body: resPayload, contentType, etag: payloadEtag, status: respStatus },
+              { body: resPayload, contentType, etag: payloadEtag, status: respStatus, binary: Buffer.isBuffer(resPayload) },
               options.ttl ?? 300,
               undefined,
               { tags: resolvedTags }
-            );
+            ).catch(() => {});
           }
 
-          if (ifNoneMatch && ifNoneMatch === payloadEtag) {
+          if (cacheable && payloadEtag && matchesETag(ifNoneMatch, payloadEtag)) {
             if (reply.code) reply.code(304);
             else if (reply.status) reply.status(304);
             return origSend();

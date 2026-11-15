@@ -1,8 +1,8 @@
-# Next.js 16 & 15 App Router Integration
+# Next.js Cache Components & Legacy ISR
 
 > Package entry: `tricache/next`
 
-TriCache provides a drop-in cache handler for Next.js 16 & 15 App Router with native support for React 19 Server Components (RSC) binary streams, dynamic soft tags, Next.js 16 Cache Components (`'use cache'`), and generational tag versions.
+`TriCacheHandler` implements the native Next.js 16 `cacheHandlers` contract for Cache Components. Its types are checked against Next.js 16.4.6, including RSC streams, timing fields, soft tags, and delayed tag expiration. `TriCacheISRHandler` is a separate legacy incremental-cache adapter; do not interchange these exports.
 
 ---
 
@@ -10,13 +10,16 @@ TriCache provides a drop-in cache handler for Next.js 16 & 15 App Router with na
 
 A complete, production-ready demo application is available in the repository at [`examples/nextjs`](https://github.com/Kareem411/TriCache/tree/main/examples/nextjs):
 
-- **Next.js 16.3+ & React 19.2+** App Router architecture.
+- **Next.js 16.4.6 & React 19.3.1** App Router architecture (16.4.6 is the latest stable checked 2026-11-15; 16.5 remains canary).
 - **Cache Components (`'use cache'`)** with `cacheTag('products')` backed by TriCache.
 - **Side-by-Side Comparison UI**: Live metrics comparing uncached requests (~1000ms simulated latency) against TriCache hits (~1ms).
 - **On-Demand Revalidation**: Instant cache revalidation via Server Actions using `updateTag()`.
 
+The linked-package example builds with `next build --webpack`: Next 16.4.6's Turbopack trace follows the package's CommonJS declaration files even for this ESM handler. This is a bundler trace limitation, not a CacheHandler runtime requirement.
+
 ```bash
 cd examples/nextjs
+pnpm --dir ../.. build
 pnpm install
 pnpm dev
 ```
@@ -27,7 +30,7 @@ Open `http://localhost:3000` to see TriCache in action.
 
 ## Next.js 16 Configuration (`cacheHandlers`)
 
-Next.js 16 introduces the `'use cache'` directive (Cache Components) and transitions from the legacy singular `incrementalCacheHandlerPath` to the plural `cacheHandlers` configuration.
+Use plural `cacheHandlers` for `'use cache'`/`'use cache: remote'`. Singular `cacheHandler` configures the separate legacy ISR cache; it is not a replacement name for the same interface.
 
 ### 1. Configure `next.config.ts`
 
@@ -39,34 +42,26 @@ const nextConfig: NextConfig = {
   cacheHandlers: {
     default: require.resolve('./cache-handler.ts'),
   },
-  cacheMaxMemorySize: 0, // Delegate all in-memory caching to TriCache L1
   cacheComponents: true,
 };
 
 export default nextConfig;
 ```
 
-> **Note for Next.js 15**: If using legacy ISR in Next.js 15, specify `experimental: { incrementalCacheHandlerPath: require.resolve('./cache-handler.ts') }`.
+> **Legacy ISR**: Use a module exporting a configured `TriCacheISRHandler` class with singular `cacheHandler`. Check the documentation of your installed Next.js version; the modern handler instance below must not be passed to the legacy API.
 
 ### 2. Implement `cache-handler.ts`
 
 ```typescript
-import { createNextCacheHandler } from 'tricache/next';
+import { TriCacheHandler } from 'tricache/next';
+import type { CacheHandler } from 'next/cache';
 
-const Handler = createNextCacheHandler({
+export default new TriCacheHandler({
   namespace: 'my-nextjs-app',
-});
-
-const handler = new Handler();
-
-export default {
-  // Conforms strictly to Next.js 16 cacheHandlers interface (returns undefined on miss)
-  get: (key: string, softTags?: string[]) => handler.get(key, { softTags }),
-  set: (key: string, entry: any) => handler.set(key, entry),
-  refreshTags: () => handler.refreshTags(),
-  getExpiration: (tags: string[]) => handler.getExpiration(tags),
-  updateTags: (tags: string[]) => handler.updateTags(tags),
-};
+  redisHost: process.env.REDIS_HOST,
+  backplaneMode: 'stream',
+  maxStreamBytes: 16 * 1024 * 1024,
+}) satisfies CacheHandler;
 ```
 
 ---
@@ -74,16 +69,18 @@ export default {
 ## Key Architectural Highlights
 
 ### Strict Next.js 16 Spec Alignment
-In accordance with the Next.js 16 `cacheHandlers` specification, `TriCacheHandler.get()` returns `undefined` (rather than `null`) when an entry is not found or when soft tags have expired, preventing cache engine mismatches in Next.js 16 runtimes.
+The handler is typechecked against `CacheHandler` from `next/cache`: `get(key, softTags)` and `set(key, Promise<CacheEntry>)` use the native method contract, and entries preserve all six fields. Each hit gets a new readable stream. `getExpiration(nonEmptyTags)` delegates soft-tag checks to `get` with Next's documented `Infinity` sentinel.
 
 ### Binary Stream Safety (`cloneStrategy: 'none'`)
-React 19 Server Component (RSC) payloads and flight data streams contain binary buffer chunks. TriCache preserves stream buffer references with zero mutation overhead, eliminating the serialization corruption common in generic key-value caches.
+RSC bytes are buffered with a configurable bound (`maxStreamBytes`, default 16 MiB), stored as base64 for Redis JSON safety, and restored as a new unlocked stream on every read. Failed/oversized streams are discarded. A read waits for a pending write without retaining the request's stream after the write resolves.
 
-### Cluster-Wide Instant Revalidation
-When you invoke Next.js `revalidateTag('products')` or Server Actions calling `updateTag()`, TriCache increments the tag's atomic generational version counter in Redis. All container pods across your fleet immediately treat existing entries as expired without scanning or deleting keys in Redis.
+### Timing and Tag Revalidation
+The handler preserves `timestamp`, `stale`, `revalidate`, and `expire`. `updateTags(tags)` expires prior entries immediately; `updateTags(tags, { expire: seconds })` first returns them with `revalidate: -1`, then expires them after the grace period. `getExpiration(nonEmptyTags)` returns `Infinity` to delegate soft-tag checking to `get(key, softTags)`.
+
+Next's tag-expiration state is separate from the backing cache: raw entries may remain until replacement/TTL even after the handler reports a miss. Use the handler, not `cache.peek()`, to evaluate framework validity. Shared tag state and backplane replay coordinate instances, subject to transport delay and stream retention.
 
 ### `/dev/shm` Off-Heap Memory
-In Linux container runtimes (Docker, Kubernetes), TriCache automatically mounts `/dev/shm` for L1.5 storage. Multi-megabyte RSC flight payloads are cached in POSIX shared memory, keeping Node.js V8 heap usage low and eliminating garbage collection pauses.
+TriCache can select an existing writable `/dev/shm` mount for L1.5 spill; it does not mount volumes itself. tmpfs counts against container memory, and buffering/encoding still allocates on the Node heap.
 
 ---
 
@@ -94,14 +91,11 @@ For advanced enterprise setups needing custom telemetry, clustering, or Redis cr
 ```typescript
 import { createNextCacheHandler } from 'tricache/next';
 
-export default createNextCacheHandler({
-  preset: 'nextjs',
-  options: {
-    redisHost: process.env.REDIS_HOST,
-    redisPort: Number(process.env.REDIS_PORT ?? 6379),
-    maxMemoryBytes: 512 * 1024 * 1024, // 512MB RAM
-    ttlJitterFactor: 0.15,             // 15% jitter to prevent stampedes
-    staleIfError: 300,                 // Serve stale for 5m during upstream outages
-  },
+const Handler = createNextCacheHandler({
+  redisHost: process.env.REDIS_HOST,
+  redisPort: Number(process.env.REDIS_PORT ?? 6379),
+  l1MaxBytes: 512 * 1024 * 1024,
+  maxStreamBytes: 16 * 1024 * 1024,
 });
+export default new Handler(); // Plural cacheHandlers requires an instance.
 ```

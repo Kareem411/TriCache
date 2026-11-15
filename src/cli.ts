@@ -11,6 +11,7 @@
 import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { CacheService } from './cache-service.js';
+import { Redis } from 'ioredis';
 import {
   IpcTelemetryClient,
   resolveIpcSocketPath,
@@ -60,7 +61,7 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
   // (bin/tricache.js). Output must go directly to process stdout without logger prefixes
   // to support UNIX pipes, terminal formatting, and automated tooling.
   if (values.version || command === 'version') {
-    let version = '1.0.1';
+    let version = '1.0.2';
     try {
       const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
       if (pkg?.version) version = pkg.version;
@@ -178,19 +179,35 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
   }
 
   const redisStr = typeof values.redis === 'string' ? values.redis : undefined;
-  const redisHost = redisStr ? redisStr.replace(/^redis:\/\//, '').split(':')[0] : undefined;
-  const redisPort = typeof values.port === 'string'
-    ? parseInt(values.port, 10)
-    : (redisStr && redisStr.includes(':') ? parseInt(redisStr.split(':')[1], 10) : 6379);
+  let redisHost: string | undefined;
+  let redisPort = 6379;
+  let redisClient: Redis | undefined;
+  if (redisStr) {
+    try {
+      const url = new URL(redisStr.includes('://') ? redisStr : `redis://${redisStr}`);
+      if (url.protocol !== 'redis:' && url.protocol !== 'rediss:') throw new Error('Unsupported Redis URL scheme');
+      redisPort = Number(typeof values.port === 'string' ? values.port : url.port || 6379);
+      if (!Number.isInteger(redisPort) || redisPort < 1 || redisPort > 65535) throw new Error('Invalid Redis port');
+      url.port = String(redisPort);
+      redisHost = url.hostname;
+      redisClient = new Redis(url.toString(), { lazyConnect: true, commandTimeout: 2500, maxRetriesPerRequest: 1 });
+      redisClient.on('error', () => {}); // CacheService reports operation failures without exposing credentials.
+    } catch {
+      console.error('Invalid Redis host, URL, or port');
+      process.exitCode = 1;
+      return;
+    }
+  }
   const namespace = typeof values.namespace === 'string' ? values.namespace : undefined;
   const diskCacheDir = typeof values.disk === 'string' ? values.disk : undefined;
 
   const cache = new CacheService({
     redisHost,
     redisPort,
+    redisClient,
     namespace,
     diskCacheDir,
-    disableRedis: !redisHost,
+    disableRedis: !redisClient,
   });
 
   try {
@@ -245,6 +262,7 @@ export async function runCli(args: string[] = process.argv.slice(2)): Promise<vo
     }
   } finally {
     await cache.destroy();
+    redisClient?.disconnect();
   }
 }
 

@@ -6,6 +6,19 @@
  * active-active Redis Enterprise licenses.
  */
 
+import { createHash, timingSafeEqual } from 'node:crypto';
+
+export function isCrossRegionInvalidationEvent(value: unknown): value is CrossRegionInvalidationEvent {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const event = value as Record<string, unknown>;
+  const text = (key: string, max: number) => typeof event[key] === 'string' && (event[key] as string).length > 0 && (event[key] as string).length <= max;
+  return text('id', 256) && text('originRegion', 128) && text('originInstanceId', 256) && text('key', 8192) &&
+    typeof event.op === 'string' && ['del', 'del-glob', 'tag_incr', 'tag_pattern_incr', 'tag_pattern_del'].includes(event.op) &&
+    typeof event.timestamp === 'number' && Number.isFinite(event.timestamp) && event.timestamp >= 0 &&
+    (event.namespace === undefined || typeof event.namespace === 'string') &&
+    (event.tagVersion === undefined || Number.isSafeInteger(event.tagVersion) && Number(event.tagVersion) >= 0);
+}
+
 export interface CrossRegionInvalidationEvent {
   /** Unique ID of this invalidation event (UUIDv4) */
   id: string;
@@ -109,7 +122,7 @@ export function createHttpMeshRelay(options: HttpMeshRelayOptions): ICrossRegion
       if (!peerUrls.length) return;
 
       const body = JSON.stringify(event);
-      await Promise.allSettled(
+      const results = await Promise.allSettled(
         peerUrls.map(async (url) => {
           const res = await fetcher(url, {
             method: 'POST',
@@ -122,6 +135,8 @@ export function createHttpMeshRelay(options: HttpMeshRelayOptions): ICrossRegion
           }
         }),
       );
+      const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+      if (failures.length) throw new AggregateError(failures.map(result => result.reason), `Cross-region delivery failed for ${failures.length} peer(s)`);
     },
   };
 }
@@ -156,7 +171,9 @@ export function createMemoryCrossRegionRelay(): ICrossRegionRelay & {
           }
         }
       }
-      await Promise.allSettled(promises);
+      const results = await Promise.allSettled(promises);
+      const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+      if (failures.length) throw new AggregateError(failures.map(result => result.reason), 'Cross-region handler failed');
     },
 
     register(region: string, handler: (event: CrossRegionInvalidationEvent) => Promise<unknown> | unknown): () => void {
@@ -209,7 +226,7 @@ export function createCrossRegionWebhookHandler(
 
       const provided = (typeof customHeader === 'string' ? customHeader : bearer);
 
-      if (!provided || provided !== options.authSecret) {
+      if (typeof provided !== 'string' || !timingSafeEqual(createHash('sha256').update(provided).digest(), createHash('sha256').update(options.authSecret).digest())) {
         return {
           status: 401,
           body: { ok: false, message: 'Unauthorized: invalid or missing auth secret' },
@@ -230,6 +247,7 @@ export function createCrossRegionWebhookHandler(
         };
       }
 
+      if (!isCrossRegionInvalidationEvent(event)) return { status: 400, body: { ok: false, message: 'Invalid invalidation event' } };
       const accepted = await cache.receiveCrossRegionInvalidation(event);
       return {
         status: 200,

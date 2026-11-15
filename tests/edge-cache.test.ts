@@ -224,8 +224,8 @@ describe('Universal Edge Portability: EdgeCacheService', () => {
     expect(await tenantA.get('shared-key')).toBe('Data A');
     expect(await tenantB.get('shared-key')).toBe('Data B');
 
-    expect(remoteStore.get('tenant_a:shared-key')).toBe('"Data A"');
-    expect(remoteStore.get('tenant_b:shared-key')).toBe('"Data B"');
+    expect(JSON.parse(remoteStore.get('tenant_a:shared-key')!).__t_val).toBe('Data A');
+    expect(JSON.parse(remoteStore.get('tenant_b:shared-key')!).__t_val).toBe('Data B');
   });
 
   it('performs batch mget with miss fetching for absent keys', async () => {

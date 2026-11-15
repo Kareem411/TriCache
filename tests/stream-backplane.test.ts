@@ -200,7 +200,7 @@ describe('Redis Streams Invalidation Backplane (backplaneMode: stream)', () => {
     // L1 should be cleared on gap detection
     expect(svc.getIfFresh('stale:key')).toBeNull();
     expect(svc.metrics().backplane.streamGaps).toBeGreaterThanOrEqual(1);
-    expect((svc as any)._lastStreamId).toBe('$');
+    expect((svc as any)._lastStreamId).toBe('0-0');
 
     await svc.destroy();
     svc = null;

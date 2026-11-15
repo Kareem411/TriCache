@@ -8,14 +8,14 @@ const asciiSpec = `                           [Incoming Read Request]
                                       │
                                       ▼
              ┌──────────────────────────────────────────────────┐
-             │       L1: Smart Memory (W-TinyLFU + CMS)         │  ~350 ns (2.81M ops/s)
-             │   Window LRU (1%) + Segmented Main SLRU (99%)    │  Zero V8 allocation
+             │       L1: Smart Memory (W-TinyLFU + CMS)         │  Bounded packed data
+             │   Window LRU (1%) + Segmented Main SLRU (99%)    │  Workload-dependent latency
              └────────────────────────┬─────────────────────────┘
                                       │ Miss / Eviction Spill
                                       ▼
              ┌──────────────────────────────────────────────────┐
-             │    L1.5: Off-Heap /dev/shm & NVMe Spill Tier     │  ~20 µs (RAM speed)
-             │   POSIX tmpfs bypasses V8 GC & cloud EBS IOPS    │  readOnlyRootFilesystem
+             │    L1.5: Off-Heap /dev/shm & NVMe Spill Tier     │  Bounded write concurrency
+             │   tmpfs counts against container memory usage  │  Writable mount required
              └────────────────────────┬─────────────────────────┘
                                       │ Miss
                                       ▼
@@ -26,8 +26,8 @@ const asciiSpec = `                           [Incoming Read Request]
                                       │ Complete Cache Miss
                                       ▼
              ┌──────────────────────────────────────────────────┐
-             │   Upstream Database / API (Singleflight Lock)    │  Exactly 1 execution
-             │   Inflight Promise Map coalesces 10,000 callers  │  Zero stampedes
+             │   Upstream Database / API (Singleflight)         │  Per process/key
+             │   Inflight Promise Map coalesces concurrent work│  Not a fleet-wide lock
              └──────────────────────────────────────────────────┘`;
 
 async function copyRaw() {

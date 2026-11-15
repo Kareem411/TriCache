@@ -253,6 +253,7 @@ describe('Generational Tag Invalidation (tagStrategy: generational)', () => {
             return this;
           },
           hset(k: string, data: any) { ops.push(() => { redisStore.set(k, data); return [null, 1]; }); return this; },
+          del(k: string) { ops.push(() => { redisStore.delete(k); return [null, 1]; }); return this; },
           expire() { ops.push(() => [null, 1]); return this; },
           async exec() { return ops.map(fn => fn()); },
         };
@@ -319,6 +320,7 @@ describe('Generational Tag Invalidation (tagStrategy: generational)', () => {
         const ops: Array<() => [Error | null, any]> = [];
         return {
           hset(k: string, data: any) { ops.push(() => { redisStore.set(k, data); return [null, 1]; }); return this; },
+          del(k: string) { ops.push(() => { redisStore.delete(k); return [null, 1]; }); return this; },
           expire() { ops.push(() => [null, 1]); return this; },
           async exec() { return ops.map(fn => fn()); },
         };

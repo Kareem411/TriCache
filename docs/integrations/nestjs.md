@@ -4,9 +4,9 @@
 
 TriCache provides an official NestJS dynamic module (`TriCacheModule`) and declarative method decorators (`@Cacheable`, `@CacheEvict`) for high-concurrency NestJS microservices.
 
-### Ready-to-run NestJS 11 demo
+### Ready-to-run NestJS 12.5 demo
 
-A self-contained microservice lives at [`examples/nestjs-microservice`](https://github.com/Kareem411/TriCache/tree/main/examples/nestjs-microservice). It exercises `TriCacheModule.register()`, `@Cacheable({ ttl, tags })`, `@CacheEvict({ tags })`, and the exported `CACHE_MANAGER` / `TriCacheStore` cache-manager adapter.
+A self-contained NestJS 12.5 microservice lives at [`examples/nestjs-microservice`](https://github.com/Kareem411/TriCache/tree/main/examples/nestjs-microservice). It exercises `TriCacheModule.register()`, `registerAsync()`, `@Cacheable({ ttl, tags })`, `@CacheEvict({ tags })`, Nest's native `CacheInterceptor`, and the Keyv/cache-manager 7 bridge.
 
 ```bash
 pnpm install && pnpm build
@@ -17,11 +17,13 @@ pnpm dev
 
 Then follow the curl walkthrough in that README (`GET /items/:id` hit vs `PATCH` eviction, plus `PUT`/`GET /store/notes/:id`).
 
+The module accepts Nest 10, 11, and 12 dynamic module/factory shapes without casting. CI compiles and boots the example against Nest 12.5.
+
 ---
 
 ## Installation & Module Registration
 
-`TriCacheModule.register(options)` forwards `options` to `CacheService.create()` (`CacheOptions`). The dynamic module is always registered as `global: true` and exports `TRICACHE_SERVICE` (`CacheService`) plus `CACHE_MANAGER` (`TriCacheStore`). There is no `preset` or `isGlobal` field on this options object.
+`TriCacheModule.register(options)` forwards `options` to `CacheService.create()` (`CacheOptions`). The dynamic module is global and exports `TRICACHE_SERVICE` (`CacheService`) plus `CACHE_MANAGER` (`TriCacheStore`) by default. Use `{ provideCacheManager: false }` when combining it with Nest's own `CacheModule`. There is no `preset` or `isGlobal` field on the cache options object.
 
 ### Synchronous Registration
 
@@ -153,9 +155,34 @@ export class OrderService {
 }
 ```
 
-## `@nestjs/cache-manager` store (`CACHE_MANAGER`)
+## Legacy `CACHE_MANAGER` facade and modern `CacheModule`
 
-`TriCacheModule` also exports `CACHE_MANAGER` bound to `TriCacheStore`. That adapter implements the cache-manager v5/v6 `CacheStore` contract (`get` / `set` / `del` / `reset`, plus `mget` / `mset` / `mdel` / `keys` / `ttl`). `set(key, value, ttl)` and `ttl(key)` use **milliseconds**.
+`TriCacheModule` exports the standard `'CACHE_MANAGER'` token bound to `TriCacheStore`. Its direct facade methods (`get` / `set` / `del` / `reset`, plus batches, `keys`, and `ttl`) use **milliseconds** for TTL inputs; `ttl()` returns remaining milliseconds.
+
+Nest 12's `@nestjs/cache-manager` 12 uses cache-manager 7 with Keyv 5. To use Nest's `CacheModule`, wrap a `TriCacheKeyvAdapter` in Keyv and pass that instance to `CacheModule.register()` or `.registerAsync()`:
+
+```typescript
+import Keyv from 'keyv';
+import { Module } from '@nestjs/common';
+import { CacheModule } from '@nestjs/cache-manager';
+import { CacheService } from 'tricache';
+import { TriCacheKeyvAdapter, TriCacheModule, TRICACHE_SERVICE } from 'tricache/nestjs';
+
+@Module({
+  imports: [
+    TriCacheModule.register({ namespace: 'sessions' }, { provideCacheManager: false }),
+    CacheModule.registerAsync({
+      inject: [TRICACHE_SERVICE],
+      useFactory: (cache: CacheService) => ({
+        stores: [new Keyv({ store: new TriCacheKeyvAdapter(cache), namespace: 'sessions' })],
+      }),
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+The bridge's `disconnect()` intentionally does not destroy the injected shared `CacheService`; application shutdown remains its owner's responsibility. Use Nest's `CacheInterceptor` for cache-manager's normal GET-response caching. TriCache's custom decorators remain independently available. `TriCacheModule` binds the standard `CACHE_MANAGER` token to its direct facade by default. Set `provideCacheManager: false` when registering it alongside Nest's `CacheModule` to avoid binding the same token twice.
 
 ```typescript
 import { Inject, Injectable } from '@nestjs/common';

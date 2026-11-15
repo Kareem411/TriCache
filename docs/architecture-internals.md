@@ -270,10 +270,8 @@ For zero-trust multi-cloud deployments and compliance with SOC2/PCI-DSS, TriCach
 ```typescript
 import { EnvelopeEncryption } from 'tricache';
 
-const envelope = new EnvelopeEncryption({
-  publicKey: rsaPublicKeyPem, // For encrypting ephemeral DEKs
-  privateKey: rsaPrivateKeyPem, // For decrypting DEKs on hydration
-});
+const encrypted = await EnvelopeEncryption.encrypt(snapshotBuffer, { publicKey: rsaPublicKeyPem });
+const restored = await EnvelopeEncryption.decrypt(encrypted, { privateKey: rsaPrivateKeyPem });
 ```
 
 ### Binary Header Specification (`TRICENV1`):
@@ -286,7 +284,7 @@ const envelope = new EnvelopeEncryption({
 ```
 
 * **Tamper Rejection**: Any alteration to the header, IV, tag, or encrypted DEK fails authentication before memory allocation.
-* **KMS Extensibility**: Supports custom `kmsWrapKey` and `kmsUnwrapKey` hooks for direct integration with AWS KMS, Google Cloud KMS, or HashiCorp Vault.
+* **KMS Extensibility**: Supports `kmsEncrypt` and `kmsDecrypt` hooks for direct integration with AWS KMS, Google Cloud KMS, or HashiCorp Vault.
 
 ---
 
@@ -337,6 +335,5 @@ Most caching systems implement batch lookups as naive loops over single-key `get
    - `fetchFn` may return either a `Record<string, T>` or a `Map<string, T>`.
 5. **Deterministic Order & Concurrent Backfill**:
    The returned array `(T | undefined)[]` strictly preserves the original index ordering (`result[i]` corresponds to `keys[i]`). Newly fetched values are concurrently backfilled across tiers using `Promise.all` with optional dynamic per-key TTLs `(key: string) => number`.
-
 
 

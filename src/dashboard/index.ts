@@ -10,7 +10,7 @@ export { DASHBOARD_HTML, DASHBOARD_GZIP_BUFFER } from './html.js';
 /**
  * Convert a Node.js IncomingMessage into a Web Standards Request.
  */
-async function nodeToWebRequest(req: IncomingMessage): Promise<Request> {
+async function nodeToWebRequest(req: IncomingMessage, res: ServerResponse, maxBytes: number): Promise<Request> {
   const protocol = (req.socket as { encrypted?: boolean }).encrypted ? 'https' : 'http';
   const host = req.headers.host || 'localhost';
   const url = new URL(req.url || '/', `${protocol}://${host}`);
@@ -28,20 +28,24 @@ async function nodeToWebRequest(req: IncomingMessage): Promise<Request> {
   let body: Uint8Array | null = null;
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+    let size = 0;
+    const parsed = (req as IncomingMessage & { body?: unknown }).body;
+    if (req.readableEnded && parsed !== undefined) chunks.push(Buffer.from(JSON.stringify(parsed)));
+    else for await (const chunk of req) {
+      const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+      size += bytes.length;
+      if (size > maxBytes) throw Object.assign(new Error('Request body exceeds dashboard limit'), { status: 413 });
+      chunks.push(bytes);
     }
     if (chunks.length > 0) {
       body = Buffer.concat(chunks);
+      if (body.length > maxBytes) throw Object.assign(new Error('Request body exceeds dashboard limit'), { status: 413 });
     }
   }
 
   const controller = new AbortController();
-  req.on('close', () => {
-    if (req.destroyed || !req.complete) {
-      controller.abort();
-    }
-  });
+  req.once('aborted', () => controller.abort());
+  res.once('close', () => controller.abort());
 
   const init: RequestInit & { duplex?: string } = {
     method: req.method,
@@ -71,14 +75,26 @@ async function pipeWebResponseToNode(webRes: Response, nodeRes: ServerResponse):
   }
 
   const reader = webRes.body.getReader();
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  nodeRes.once('close', cancel);
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      nodeRes.write(value);
+      if (nodeRes.destroyed) break;
+      if (!nodeRes.write(value)) await new Promise<void>((resolve, reject) => {
+        const cleanup = () => { nodeRes.off('drain', onDrain); nodeRes.off('close', onClose); };
+        const onDrain = () => { cleanup(); resolve(); };
+        const onClose = () => { cleanup(); reject(new Error('Dashboard response closed')); };
+        nodeRes.once('drain', onDrain);
+        nodeRes.once('close', onClose);
+      });
     }
   } finally {
-    nodeRes.end();
+    nodeRes.off('close', cancel);
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+    if (!nodeRes.destroyed) nodeRes.end();
   }
 }
 
@@ -99,11 +115,16 @@ async function pipeWebResponseToNode(webRes: Response, nodeRes: ServerResponse):
 export function tricacheDashboard(options: DashboardOptions) {
   return async (req: IncomingMessage, res: ServerResponse, next?: (err?: unknown) => void): Promise<void> => {
     try {
-      const webReq = await nodeToWebRequest(req);
+      const webReq = await nodeToWebRequest(req, res, options.maxRequestBytes ?? 65536);
       const webRes = await handleDashboardRequest(webReq, options);
       await pipeWebResponseToNode(webRes, res);
     } catch (err) {
-      if (typeof next === 'function') {
+      if (res.destroyed) return;
+      if ((err as { status?: number }).status === 413) {
+        res.statusCode = 413;
+        res.setHeader('Connection', 'close');
+        res.end(JSON.stringify({ error: 'Request body too large' }));
+      } else if (typeof next === 'function') {
         next(err);
       } else {
         res.statusCode = 500;
@@ -162,7 +183,7 @@ export async function startDashboardServer(options: StandaloneDashboardOptions):
   host: string;
   close: () => Promise<void>;
 }> {
-  const port = options.port || 9090;
+  const port = options.port ?? 9090;
   const host = options.host || '127.0.0.1';
 
   const middleware = tricacheDashboard(options);
@@ -190,6 +211,7 @@ export async function startDashboardServer(options: StandaloneDashboardOptions):
     host,
     close: () => new Promise<void>((resolve, reject) => {
       server.close(err => (err ? reject(err) : resolve()));
+      server.closeAllConnections();
     }),
   };
 }

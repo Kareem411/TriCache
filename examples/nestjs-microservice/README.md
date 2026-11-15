@@ -1,6 +1,6 @@
 # TriCache NestJS Microservice Demo
 
-Minimal NestJS 11 TypeScript app that uses the official [`tricache/nestjs`](https://kareem411.github.io/TriCache/integrations/nestjs) entry:
+Minimal NestJS 12.5 TypeScript app that uses the official [`tricache/nestjs`](https://kareem411.github.io/TriCache/integrations/nestjs) entry:
 
 | Surface | What to look for |
 |---|---|
@@ -8,6 +8,8 @@ Minimal NestJS 11 TypeScript app that uses the official [`tricache/nestjs`](http
 | `@Cacheable({ ttl: 120, tags: ['items'] })` | `GET /items` and `GET /items/:id` reuse `computedAt` + `originReads` |
 | `@CacheEvict({ tags: ['items'] })` | `POST` / `PATCH` / `DELETE` invalidate the `items` tag |
 | `CACHE_MANAGER` / `TriCacheStore` | `PUT`/`GET`/`DELETE /store/notes/:id` — Nest cache-manager store contract |
+
+Also validated: Nest 12 `registerAsync` dependency injection, the native `CacheInterceptor`, and `@nestjs/cache-manager` 12 / cache-manager 7 through Keyv 5. When importing both `TriCacheModule` and `CacheModule`, disable the direct token binding with `{ provideCacheManager: false }` to prevent `CACHE_MANAGER` collisions.
 
 The published decorator option is **`ttl` (seconds by default)**, plus optional `ttlUnit`. It is not `ttlSeconds` / `ttlSec`. Decorators resolve the engine from `this.cacheService` / `this.cache` / `this.cacheStore.cache`, so `ItemsService` injects `TRICACHE_SERVICE` onto `cacheService`.
 
@@ -84,7 +86,7 @@ Expect a **new** `computedAt`, `originReads: 2` (or higher if you also fetched t
 
 ### 5. `@nestjs/cache-manager` store (`CACHE_MANAGER` → `TriCacheStore`)
 
-`set` / `ttl` use **milliseconds**, matching cache-manager v5/v6:
+`set` / `ttl` use **milliseconds**. The direct `TriCacheStore` facade is a supported subset of the `CACHE_MANAGER` token API; a full cache-manager 7 / Keyv adapter is available as `TriCacheKeyvAdapter` for `CacheModule`:
 
 ```bash
 curl -s 'http://127.0.0.1:3000/store/notes/n1'
@@ -141,7 +143,7 @@ export class AppModule {}
 
 `register()` accepts `CacheOptions` and calls `CacheService.create(options)`. The dynamic module is always `global: true` and exports:
 
-`tricache/nestjs` types a structural `DynamicModule` so `@nestjs/common` can stay an optional peer. The example casts that object to Nest's `DynamicModule` at the `AppModule` boundary — runtime shape is unchanged.
+The module uses structural Nest-compatible types so `@nestjs/common` stays optional for core TriCache users; the Nest 12 example compiles and runs without a `DynamicModule` cast.
 
 - `TRICACHE_SERVICE` — `CacheService` instance
 - `CACHE_MANAGER` — `TriCacheStore` (same token string as `@nestjs/cache-manager`)

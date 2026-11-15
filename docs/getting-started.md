@@ -69,7 +69,7 @@ const cache = CacheService.preset('nextjs', { redisHost: 'redis.internal' });
 
 | Preset | Target Environment | Key Behaviors |
 |:---|:---|:---|
-| `'nextjs'` | Next.js 16 & 15 App Router, React 19 RSC | `cloneStrategy: 'none'` (optimized for stream buffers), W-TinyLFU, `tagStrategy: 'generational'`, Redis Streams backplane, 300s `staleIfError`. |
+| `'nextjs'` | Next.js 16 Cache Components, React 19 RSC | `cloneStrategy: 'none'`, W-TinyLFU, `tagStrategy: 'generational'`, Redis Streams backplane, 300s `staleIfError`. |
 | `'microservice'` | Express, Fastify, NestJS, gRPC | W-TinyLFU, Redis Streams backplane, `ttlJitterFactor: 0.15` (anti-synchronicity), L2 circuit breaker (5 failures $\rightarrow$ 15s cooldown). |
 | `'serverless'` | AWS Lambda, Cloud Run, Vercel Serverless | `disableDisk: true` (memory-only), 1,000ms Redis command timeouts, ephemeral Pub/Sub backplane. |
 | `'enterprise-hardened'` | Financial, High-Security, Strict SLA | Generational tags, `strictSingleton: true`, `failClosed: true`, `oomProtection: true` (80% heap threshold emergency shed). |
@@ -78,7 +78,7 @@ All preset configurations can be selectively customized by passing an overrides 
 
 ```typescript
 const cache = CacheService.preset('microservice', {
-  maxMemoryBytes: 512 * 1024 * 1024, // 512MB RAM
+  l1MaxBytes: 512 * 1024 * 1024, // 512MB packed L1 byte budget
   ttlJitterFactor: 0.20,             // 20% jitter
 });
 ```
@@ -110,18 +110,17 @@ const product = await cache.get(
 
 ### 2. Manual Set (`cache.set`)
 
-Explicitly writes to L1 RAM, spills to `/dev/shm`, and replicates to L2 Redis:
+Writes to L1 RAM and writable L2 Redis. Eligible L1 evictions may spill to disk; oversized entries can be rejected from L1.
 
 ```typescript
-await cache.set('config:rate-limits', rateLimits, 3600, {
-  priority: CachePriority.CRITICAL, // Never evict unless expired
+await cache.set('config:rate-limits', rateLimits, 3600, CachePriority.CRITICAL, {
   tags: ['config'],
 });
 ```
 
 ### 3. Cluster-Wide Tag Invalidation (`cache.invalidateTag` & `cache.invalidateTags`)
 
-Invalidates all keys associated with tags across the entire cluster. Under `tagStrategy: 'generational'`, invalidations execute in $O(1)$ time via atomic version counters.
+Invalidates tagged entries through shared metadata and the configured backplane. A concrete tag under `tagStrategy: 'generational'` uses an atomic version bump; wildcards and cascades resolve matching metadata first. Delivery is asynchronous unless publication is explicitly awaited, and publication does not acknowledge every peer.
 
 #### Discrete Tags & Batch Invalidation:
 ```typescript
@@ -161,7 +160,7 @@ const cache = CacheService.create({
 
 // Tagging with 'org:123:dept:456' automatically expands to:
 // ['org', 'org:123', 'org:123:dept', 'org:123:dept:456']
-await cache.set('payroll', data, 3600, { tags: ['org:123:dept:456'] });
+await cache.set('payroll', data, 3600, undefined, { tags: ['org:123:dept:456'] });
 
 // Invalidating any parent tag now automatically purges the entry:
 await cache.invalidateTag('org:123'); // Or await cache.invalidateTag('org');
@@ -180,7 +179,7 @@ await cache.delete(`user:${userId}`);
 TriCache provides enterprise-grade batch operations with **differential multi-tier waterfall resolution**, eliminating the classic $N+1$ query problem across distributed cache tiers.
 
 #### Cascading Batch Read (`cache.mget`)
-`cache.mget` queries L1 RAM first. Unresolved keys fall through to a pipelined Redis `MULTI` call, then to L1.5 disk spill. **Only the remaining unfulfilled keys** are passed to `fetchFn(missKeys)`:
+`cache.mget` queries L1 RAM first. Unresolved keys fall through to bounded Redis pipelines, then L1.5 disk spill. **Only remaining unfulfilled keys** are passed to `fetchFn(missKeys)`, with per-key coalescing and mutation fencing.
 
 ```typescript
 // Solve N+1 database queries in high-throughput endpoints

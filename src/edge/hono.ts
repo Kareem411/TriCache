@@ -11,12 +11,14 @@ export interface HonoEdgeCacheOptions {
   etag?: boolean;
   /** TTL in seconds. Default: 300. */
   ttl?: number;
-  /** Stale-While-Revalidate window in seconds. Default: undefined. */
-  swr?: number;
   /** Cache tags for invalidation. */
   tags?: string[] | ((c: any) => string[]);
   /** Predicate to skip caching dynamically. */
   skipCache?: (c: any) => boolean;
+  /** Authenticated responses require explicit opt-in and an identity-aware key. */
+  cacheAuthenticated?: boolean;
+  /** @deprecated Response refreshes run on live requests. Use EdgeCacheService.get() for data-level SWR. */
+  swr?: number;
 }
 
 export interface CachedEdgeHttpResponse {
@@ -125,7 +127,6 @@ export function honoEdgeCache(options: HonoEdgeCacheOptions = {}) {
     cache,
     etag = true,
     ttl = 300,
-    swr,
     tags,
     skipCache,
     keyGenerator,
@@ -141,6 +142,9 @@ export function honoEdgeCache(options: HonoEdgeCacheOptions = {}) {
     if (skipCache && skipCache(c)) {
       return await next();
     }
+    const credentials = ['authorization', 'cookie', 'x-api-key', 'x-auth-token'].filter(name => c.req.header?.(name));
+    if (c.req.header?.('range') || credentials.length > 0 && (!options.cacheAuthenticated ||
+        !keyGenerator && !credentials.every(name => headerWhitelist?.some(header => header.toLowerCase() === name)))) return await next();
 
     const cc = c.req.header?.('cache-control') || c.req.header?.('Cache-Control');
     if (typeof cc === 'string') {
@@ -155,7 +159,12 @@ export function honoEdgeCache(options: HonoEdgeCacheOptions = {}) {
       return await next();
     }
 
-    const key = buildEdgeDeterministicKey(c, { keyGenerator, headerWhitelist });
+    let key = buildEdgeDeterministicKey(c, { keyGenerator, headerWhitelist });
+    if (credentials.length) {
+      if (!globalThis.crypto?.subtle) return await next();
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(key));
+      key = `edge:http:identity:${Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')}`;
+    }
     const ifNoneMatch = c.req.header?.('if-none-match') || c.req.header?.('If-None-Match');
     const resolvedTags = typeof tags === 'function' ? tags(c) : tags;
 
@@ -181,6 +190,10 @@ export function honoEdgeCache(options: HonoEdgeCacheOptions = {}) {
           }
 
           const cc = res.headers?.get?.('cache-control');
+          const vary = String(res.headers?.get?.('vary') ?? '').split(',').map(name => name.trim().toLowerCase()).filter(Boolean);
+          if (res.headers?.get?.('set-cookie') || vary.includes('*') || !keyGenerator && vary.some(name => !headerWhitelist?.some(header => header.toLowerCase() === name))) {
+            throw new NonCacheableEdgeResponseError({ body: '', contentType, status: 0 });
+          }
           if (cc) {
             const lowerCc = cc.toLowerCase();
             if (lowerCc.includes('no-store') || lowerCc.includes('no-cache') || lowerCc.includes('private')) {
@@ -233,9 +246,9 @@ export function honoEdgeCache(options: HonoEdgeCacheOptions = {}) {
         },
         ttl,
         {
-          swr,
+          swr: 0,
           tags: resolvedTags,
-          ctx: c.executionCtx,
+          ctx: readExecutionContext(c),
         }
       );
 
@@ -265,6 +278,10 @@ export function honoEdgeCache(options: HonoEdgeCacheOptions = {}) {
       throw err;
     }
   };
+}
+
+function readExecutionContext(c: any): { waitUntil(promise: Promise<unknown>): void } | undefined {
+  try { return c.executionCtx; } catch { return undefined; }
 }
 
 /**

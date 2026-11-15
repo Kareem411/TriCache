@@ -7,6 +7,7 @@ export {
 export { TriCacheISRHandler } from './isr-handler';
 export type {
   CacheHandlerValue,
+  NextCacheEntry,
   StoredNextCacheEntry,
   CacheHandlerContext,
   NextCacheHandlerOptions,

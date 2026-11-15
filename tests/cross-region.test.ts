@@ -428,6 +428,7 @@ describe('Multi-Cluster / Cross-Region Invalidation Relay (Gap 4)', () => {
     const cacheAP = track(new CacheService({
       disableRedis: true,
       disableDisk: true,
+      awaitInvalidationBackplane: true,
       crossRegion: { currentRegion: 'ap-southeast-1', relay: memoryRelay },
     }));
 

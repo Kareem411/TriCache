@@ -460,6 +460,7 @@ export class WTinyLfuPolicy {
     private readonly sketch: { estimate(key: string): number; increment(key: string): void },
     windowPercent = 0.01,
     protectedPercent = 0.80,
+    private readonly canEvict?: (key: string) => boolean,
   ) {
     this.maxTotal = Math.max(2, capacity);
     this.maxWindow = Math.max(1, Math.floor(this.maxTotal * windowPercent));
@@ -549,20 +550,33 @@ export class WTinyLfuPolicy {
     }
 
     // Main space full: TinyLFU gate
-    let victimKey: string;
+    let victimKey: string | undefined;
     let victimIsProbation = true;
 
-    if (this.probation.size > 0) {
-      victimKey = this.probation.values().next().value!;
-    } else {
-      victimKey = this.protected_.values().next().value!;
+    for (const candidate of this.probation) {
+      if (!this.canEvict || this.canEvict(candidate)) { victimKey = candidate; break; }
+    }
+    if (victimKey === undefined) {
+      for (const candidate of this.protected_) {
+        if (!this.canEvict || this.canEvict(candidate)) { victimKey = candidate; break; }
+      }
       victimIsProbation = false;
+    }
+
+    if (victimKey === undefined) {
+      if (this.canEvict && !this.canEvict(candKey)) {
+        this.window.delete(key);
+        this.window.add(candKey);
+        return { admit: false, candidateKey: key };
+      }
+      this.rejectionCount++;
+      return { admit: false, candidateKey: candKey };
     }
 
     const candFreq = this.sketch.estimate(candKey);
     const victimFreq = this.sketch.estimate(victimKey);
 
-    if (candFreq > victimFreq) {
+    if ((this.canEvict && !this.canEvict(candKey)) || candFreq > victimFreq) {
       // Candidate wins: evict victim, admit candidate to Probation
       if (victimIsProbation) {
         this.probation.delete(victimKey);

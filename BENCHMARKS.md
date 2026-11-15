@@ -4,7 +4,7 @@
 > **Date:** 2026-05-31  
 > **Source:** [`bench/benchmark.ts`](bench/benchmark.ts)
 
-All numbers are from one live run on the same machine. Throughput varies ±5–10 % across runs due to JIT warmth and OS scheduling. Re-run with `pnpm bench` to reproduce on your hardware.
+The tables below are historical measurements, not guarantees for the current implementation. The runner now uses independent cache instances and verifies that the SWR scenario is actually stale with one pending refresh; older SWR and cross-instance measurements are not reliable baselines. Re-run `pnpm bench` on your hardware and compare the same settings and package versions.
 
 > **v0.7.0 additions:** $O(1)$ Generational Tag Invalidation (**1.65 M/s / 605 ns**), Distributed Mutex Lock (`cache.lock()`, **341.3 K/s**), `cache.wrap()` primitive (**851.5 K/s**, +120 ns overhead), and ORM Query Key Hashing (**490.8 K/s**). See §20–§23 below.
 

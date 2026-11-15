@@ -81,7 +81,7 @@ export function Cacheable(options: CacheableOptions = {}): MethodDecorator {
       const rawTtl = options.ttl;
       if (typeof rawTtl === 'number') {
         if (options.ttlUnit === 'milliseconds' || (rawTtl >= 1000 && rawTtl % 1000 === 0 && options.ttlUnit !== 'seconds')) {
-          ttlSeconds = Math.round(rawTtl / 1000);
+          ttlSeconds = rawTtl / 1000;
         }
       }
 

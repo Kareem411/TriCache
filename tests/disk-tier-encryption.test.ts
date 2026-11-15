@@ -54,7 +54,7 @@ function makeDiskTier(mode: EncryptionMode): { tier: DiskTier; dir: string } {
 
 async function roundTrip(tier: DiskTier, key: string, value: unknown): Promise<unknown> {
   await tier.save(key, {
-    value: Buffer.from(JSON.stringify(value)),
+    data: JSON.stringify(value),
     isCompressed: false,
     expiresAt: Date.now() + 60_000,
     size: 100,
@@ -64,7 +64,7 @@ async function roundTrip(tier: DiskTier, key: string, value: unknown): Promise<u
   } as any);
   const loaded = tier.load(key);
   if (!loaded) return undefined;
-  return JSON.parse((loaded as any).value.toString('utf8'));
+  return JSON.parse(loaded.data.toString());
 }
 
 describe('DiskTier encryption mode support (was: hardcoded aes-256-gcm, silent no-op on other modes)', () => {

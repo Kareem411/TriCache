@@ -229,8 +229,10 @@ describe('End-to-End Tag Invalidation, Stream Backplane & Churn Verification', (
     expect(watchdogFired).toBe(true);
     expect(await handlerB.get('profile:42')).toBeUndefined();
     expect(await handlerB.get('org:view')).toBeUndefined();
-    expect(await cacheB.peek('profile:42')).toBeNull();
-    expect(await cacheB.mget(['profile:42', 'org:view'])).toEqual([undefined, undefined]);
+    // Next owns the tag grace period; raw backing entries may remain until replacement/TTL.
+    // Consumers must read through the native handler to apply Next's expiration contract.
+    expect(await handlerB.get('profile:42', { softTags: [] })).toBeUndefined();
+    expect(await handlerB.get('org:view', { softTags: [] })).toBeUndefined();
   });
 
   it('maintains bounded indices under high-cardinality hierarchical churn and edge isolation', async () => {
@@ -291,4 +293,3 @@ describe('End-to-End Tag Invalidation, Stream Backplane & Churn Verification', (
     expect(await edge.get('e:1')).toBeNull();
   });
 });
-

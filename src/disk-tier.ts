@@ -39,7 +39,7 @@ export type { DiskBackpressureStats };
  */
 export class BoundedDiskQueue {
   private active = 0;
-  private queue: Array<() => void> = [];
+  private queue: Array<(admitted: boolean) => void> = [];
   private spillsDropped = 0;
   private consecutiveFailures = 0;
   private circuitState: 'closed' | 'open' | 'half-open' = 'closed';
@@ -51,7 +51,27 @@ export class BoundedDiskQueue {
     private readonly writeTimeoutMs: number = 500,
     private readonly failureThreshold: number = 5,
     private readonly cooldownMs: number = 5000,
-  ) {}
+  ) {
+    if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1 || !Number.isInteger(maxPending) || maxPending < 0 ||
+        !Number.isFinite(writeTimeoutMs) || writeTimeoutMs <= 0 || !Number.isInteger(failureThreshold) || failureThreshold < 1 ||
+        !Number.isFinite(cooldownMs) || cooldownMs < 0) {
+      throw new Error('Disk queue limits and timeout must be finite positive values (pending/cooldown may be zero)');
+    }
+  }
+
+  get isSaturated(): boolean {
+    return this.active >= this.maxConcurrent && this.queue.length >= this.maxPending;
+  }
+
+  private releaseSlot(): void {
+    if (this.circuitState === 'open') {
+      for (const next of this.queue.splice(0)) next(false);
+    }
+    const next = this.queue.shift();
+    // Transfer the reservation so newly arriving calls cannot steal a queued slot.
+    if (next) next(true);
+    else this.active--;
+  }
 
   public async schedule<T>(task: () => Promise<T>): Promise<T | null> {
     const now = performance.now();
@@ -73,22 +93,30 @@ export class BoundedDiskQueue {
       return null;
     }
 
-    if (this.queue.length >= this.maxPending) {
+    if (this.isSaturated) {
       this.spillsDropped++;
       return null; // Bounded memory queue: drop spill to preserve main thread
     }
 
     // Wait for slot in concurrency pool
     if (this.active >= this.maxConcurrent) {
-      await new Promise<void>((resolve) => this.queue.push(resolve));
+      const admitted = await new Promise<boolean>((resolve) => this.queue.push(resolve));
+      if (!admitted) {
+        this.spillsDropped++;
+        return null;
+      }
+    } else {
+      this.active++;
     }
-
-    this.active++;
     let timeoutId: NodeJS.Timeout | null = null;
+    const work = Promise.resolve().then(task);
+    // A caller timeout does not cancel filesystem I/O. Release its physical slot
+    // only when the underlying operation settles, including on late failure.
+    void work.then(() => this.releaseSlot(), () => this.releaseSlot());
 
     try {
       const result = await Promise.race([
-        task(),
+        work,
         new Promise<never>((_, reject) => {
           timeoutId = setTimeout(
             () => reject(new Error(`Disk write exceeded timeout of ${this.writeTimeoutMs}ms`)),
@@ -110,14 +138,12 @@ export class BoundedDiskQueue {
       if (this.consecutiveFailures >= this.failureThreshold || this.circuitState === 'half-open') {
         this.circuitState = 'open';
         this.lastStateChangeMonotonic = performance.now();
+        for (const next of this.queue.splice(0)) next(false);
       }
       this.spillsDropped++;
       return null;
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
-      this.active--;
-      const next = this.queue.shift();
-      if (next) next();
     }
   }
 
@@ -267,6 +293,13 @@ export class DiskTier {
   private diskUsageBytes    = 0;
   private usageCounted      = false;
   private fileCount         = 0;   // maintained in-memory; avoids walkCacheFiles() in stats
+  private reservedBytes = 0;
+  private reservedFiles = 0;
+  private saveSequence = 0;
+  private epoch = 0;
+  private readonly pendingSaves = new Map<string, { token: symbol; setAt: number }>();
+  private closed = false;
+  private readonly invalidatedKeys = new Set<string>();
   /** Next bucket index (0–255) for the staggered janitor wheel. */
   private _nextJanitorBucket = 0;
 
@@ -305,6 +338,7 @@ export class DiskTier {
   // ── Helpers ───────────────────────────────────────────────────────────────
 
   private ensureDir(): void {
+    if (this.closed) return;
     if (this.dirReady) return;
     try {
       fs.mkdirSync(this.opts.dir, { recursive: true, mode: 0o700 });
@@ -427,8 +461,25 @@ export class DiskTier {
    *
    * 12 hex digits ≈ 6 bytes ≈ year 10889 max.  Padded so length is always 77 chars.
    */
-  private hashToWritePath(hash: string, expiresAt: number): string {
-    return path.join(this.opts.dir, hash.slice(0, 2), `${hash}_${expiresAt.toString(16).padStart(12, '0')}`);
+  private hashToWritePath(hash: string, expiresAt: number, setAt?: number): string {
+    const expiry = Math.floor(expiresAt).toString(16).padStart(12, '0');
+    if (setAt === undefined) return path.join(this.opts.dir, hash.slice(0, 2), `${hash}_${expiry}`);
+    const written = Math.floor(setAt).toString(16).padStart(12, '0');
+    const sequence = (++this.saveSequence).toString(16).padStart(12, '0');
+    return path.join(this.opts.dir, hash.slice(0, 2), `${hash}_${expiry}_${written}_${sequence}_${crypto.randomBytes(6).toString('hex')}`);
+  }
+
+  private findFilePaths(hash: string): string[] {
+    const bucket = path.join(this.opts.dir, hash.slice(0, 2));
+    try {
+      return fs.readdirSync(bucket).filter(file => !file.endsWith('.tmp') && (file === hash || file.startsWith(hash + '_')))
+        .map(file => path.join(bucket, file));
+    } catch { return []; }
+  }
+
+  private fileWrittenAt(file: string): number {
+    const parts = path.basename(file).split('_');
+    return parts.length >= 4 ? parseInt(parts[2], 16) : fs.statSync(file).mtimeMs;
   }
 
   /**
@@ -438,20 +489,30 @@ export class DiskTier {
    * Returns null when the bucket dir does not exist or the key is absent.
    */
   private findFilePath(hash: string): string | null {
-    const bucketPath = path.join(this.opts.dir, hash.slice(0, 2));
-    let files: string[];
-    try { files = fs.readdirSync(bucketPath); } catch { return null; }
-    // Return the lexicographically largest match: V3 filenames are
-    // "{hash}_{expiresHex12}", so lex-max = largest timestamp = newest entry.
-    // If the same key was evicted to disk twice (different TTLs → different names),
-    // this ensures we always serve and delete the freshest copy; the janitor cleans
-    // up the stale one when its encoded timestamp expires.
-    let match: string | undefined;
-    for (const f of files) {
-      if ((f === hash || f.startsWith(hash + '_')) && (!match || f > match)) match = f;
+    let match: string | null = null;
+    let newest = -Infinity;
+    let sequence = -1;
+    for (const file of this.findFilePaths(hash)) {
+      try {
+        const written = this.fileWrittenAt(file);
+        const order = parseInt(path.basename(file).split('_')[3] ?? '0', 16);
+        if (written > newest || (written === newest && order > sequence)) {
+          match = file;
+          newest = written;
+          sequence = order;
+        }
+      } catch { /* raced with deletion */ }
     }
-    if (!match) return null;
-    return path.join(bucketPath, match);
+    return match;
+  }
+
+  private removeFile(filePath: string): void {
+    try {
+      const size = fs.statSync(filePath).size;
+      fs.unlinkSync(filePath);
+      this.diskUsageBytes = Math.max(0, this.diskUsageBytes - size);
+      this.fileCount = Math.max(0, this.fileCount - 1);
+    } catch { /* already gone or locked */ }
   }
 
   /**
@@ -530,6 +591,7 @@ export class DiskTier {
    *    so the Node.js event loop is never stalled waiting for disk I/O.
    */
   async save(key: string, entry: DiskCacheEntry): Promise<void> {
+    if (this.closed || this.diskQueue.isSaturated) return;
     if (this.isForbidden(key)) return;
     if (entry.expiresAt <= Date.now()) return;
 
@@ -543,7 +605,7 @@ export class DiskTier {
     }
 
     // Fast-shed incoming spills while host volume is low (<10%), pruning is active, or quota is reached
-    if (this._hostVolumeLowSpace || this._isPruning || this.diskUsageBytes >= this.opts.maxBytes) {
+    if (this._hostVolumeLowSpace || this._isPruning || this.diskUsageBytes + this.reservedBytes >= this.opts.maxBytes) {
       this._spillsShedTotal++;
       return;
     }
@@ -556,11 +618,12 @@ export class DiskTier {
     // ── Synchronous phase: pack + encrypt (CPU-only, no I/O) ─────────────
     let final: Buffer;
     try {
+      const { value: _value, ...storedEntry } = entry as DiskCacheEntry & { value?: unknown };
       const payload: DiskPayload = {
         version: DISK_TIER_VERSION,
         key,
         entry: {
-          ...entry,
+          ...storedEntry,
           data: entry.data instanceof Uint8Array
             ? Buffer.from(entry.data)
             : entry.data,
@@ -578,8 +641,9 @@ export class DiskTier {
       // to check expiry with a 16-byte partial read — no decrypt or unpack needed.
       const header = Buffer.allocUnsafe(V2_HEADER_LEN);
       DISK_MAGIC_V2.copy(header, 0);
-      header.writeBigUInt64LE(BigInt(entry.expiresAt), 8);
+      header.writeBigUInt64LE(BigInt(Math.floor(entry.expiresAt)), 8);
       final = Buffer.concat([header, this.encryptV2(toEncrypt)]);
+      if (final.length > this.opts.entryMaxBytes || this.diskUsageBytes + this.reservedBytes + final.length > this.opts.maxBytes) return;
     } catch (err) {
       this.opts.logger.debug('DiskTier: pack/encrypt failed', { key: key.slice(0, 50), error: (err as Error).message });
       return;
@@ -587,21 +651,42 @@ export class DiskTier {
 
     // ── Async phase: mkdir + write to same-dir tmp + atomic rename ────
     const hash     = this.keyToHash(key);
-    const filePath = this.hashToWritePath(hash, entry.expiresAt);
+    const setAt = entry.setAt ?? Date.now();
+    if ((this.pendingSaves.get(key)?.setAt ?? 0) > setAt) return;
+    const filePath = this.hashToWritePath(hash, entry.expiresAt, setAt);
     const tmpPath  = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    const token = Symbol(key);
+    const epoch = this.epoch;
+    this.pendingSaves.set(key, { token, setAt });
+    const current = () => !this.closed && this.epoch === epoch && this.pendingSaves.get(key)?.token === token;
+    let started = false;
+    let released = false;
+    let accounted = false;
+    const releaseReservation = () => {
+      if (released) return;
+      released = true;
+      this.reservedBytes = Math.max(0, this.reservedBytes - final.length);
+      this.reservedFiles = Math.max(0, this.reservedFiles - 1);
+      if (this.pendingSaves.get(key)?.token === token) this.pendingSaves.delete(key);
+    };
 
     // Optimistically reserve quota before queuing so concurrent spills respect the cap
-    this.diskUsageBytes += final.length;
-    this.fileCount++;
+    this.reservedBytes += final.length;
+    this.reservedFiles++;
 
     if (this.diskUsageBytes >= this.opts.maxBytes * 0.80 && !this._isPruning) {
       void this.triggerChunkedPrune();
     }
 
     const result = await this.diskQueue.schedule(async () => {
+      started = true;
       try {
+        if (!current()) return false;
+        const previous = this.findFilePath(hash);
+        if (previous && this.fileWrittenAt(previous) > setAt) return false;
         await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
         await fs.promises.writeFile(tmpPath, final, { mode: 0o600 });
+        if (!current()) return false;
 
         // Atomic rename with micro-retry loop for Windows NTFS handle release
         try {
@@ -616,6 +701,20 @@ export class DiskTier {
           }
         }
 
+        if (!current()) {
+          try { await fs.promises.unlink(filePath); } catch { /* already removed */ }
+          return false;
+        }
+
+        // Remove all superseded versions, not just the one with the largest TTL.
+        for (const previousPath of this.findFilePaths(hash)) {
+          if (previousPath !== filePath) this.removeFile(previousPath);
+        }
+        this.diskUsageBytes += final.length;
+        this.fileCount++;
+        accounted = true;
+        this.invalidatedKeys.delete(key);
+
         if (this._db) {
           const priority = typeof entry.priority === 'number' ? entry.priority : 2;
           const lastAccess = typeof entry.lastAccess === 'number' ? entry.lastAccess : Date.now();
@@ -625,23 +724,25 @@ export class DiskTier {
         return true;
       } catch (err) {
         try { await fs.promises.unlink(tmpPath); } catch { /* ignore if already gone/failed */ }
-        this.diskUsageBytes -= Math.min(this.diskUsageBytes, final.length); // rollback
-        this.fileCount = Math.max(0, this.fileCount - 1);
-        if (this._db) try { this._stmtDelete!.run(hash); } catch { /* ok */ }
+        if (accounted) this.removeFile(filePath);
         this.opts.logger.debug('DiskTier: save failed', { key: key.slice(0, 50), error: (err as Error).message });
         throw err;
+      } finally {
+        try { await fs.promises.unlink(tmpPath); } catch { /* renamed, removed, or never created */ }
+        releaseReservation();
+        if (this.invalidatedKeys.has(key) && !this.pendingSaves.has(key)) this.delete(key, true);
       }
     });
 
-    if (result === null) {
+    if (result === null && !started) {
       // Fast-dropped by BoundedDiskQueue backpressure / circuit breaker: rollback reservation
-      this.diskUsageBytes -= Math.min(this.diskUsageBytes, final.length);
-      this.fileCount = Math.max(0, this.fileCount - 1);
+      releaseReservation();
     }
   }
 
   /** Load a key from disk, or return null on miss/expiry/corruption. */
   load(key: string): DiskCacheEntry | null {
+    if (this.invalidatedKeys.has(key) || this.closed) return null;
     if (this.isForbidden(key)) return null;
     this.ensureDir();
     if (!this.dirReady) return null;
@@ -674,8 +775,8 @@ export class DiskTier {
       // opening the file when the entry is already stale.
       if (!this._db) {
         const filename = path.basename(filePath);
-        if (filename.length === 77 && filename[64] === '_') {
-          const expiresAt = parseInt(filename.slice(65), 16);
+        if (filename.length >= 77 && filename[64] === '_') {
+          const expiresAt = parseInt(filename.slice(65, 77), 16);
           if (expiresAt <= Date.now()) {
             try {
               const sz = fs.statSync(filePath).size;
@@ -698,11 +799,7 @@ export class DiskTier {
 
       const raw = fs.readFileSync(filePath);
       // Delete immediately — entry will be promoted back to L1
-      try {
-        fs.unlinkSync(filePath);
-        this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
-        this.fileCount = Math.max(0, this.fileCount - 1);
-      } catch { /* ok */ }
+      for (const storedPath of this.findFilePaths(hash)) this.removeFile(storedPath);
       if (this._db) this._stmtDelete!.run(hash);
 
       let decrypted: Buffer;
@@ -733,24 +830,25 @@ export class DiskTier {
     }
   }
 
-  /** Explicitly delete a key from disk (cache invalidation). */
-  delete(key: string): void {
+  /** Synchronously fence queued/running saves while leaving filesystem cleanup deferred. */
+  invalidate(key: string): void {
+    this.pendingSaves.delete(key);
+    this.invalidatedKeys.add(key);
+  }
+
+  /** Delete all versions; deferred cleanup must not cancel a newer save. */
+  delete(key: string, invalidatedOnly = false): void {
+    if (invalidatedOnly && (!this.invalidatedKeys.has(key) || this.pendingSaves.has(key))) return;
+    if (!invalidatedOnly) this.pendingSaves.delete(key);
     const hash = this.keyToHash(key);
-    let filePath: string | null;
+    const files = new Set(this.findFilePaths(hash));
     if (this._db) {
       const row = this._stmtSelect!.get(hash) as { file_path: string } | undefined;
-      filePath = row?.file_path ?? null;
+      if (row?.file_path) files.add(row.file_path);
       this._stmtDelete!.run(hash);
-    } else {
-      filePath = this.findFilePath(hash);
     }
-    if (!filePath) return;
-    try {
-      const stat = fs.statSync(filePath);
-      fs.unlinkSync(filePath);
-      this.diskUsageBytes -= Math.min(this.diskUsageBytes, stat.size);
-      this.fileCount = Math.max(0, this.fileCount - 1);
-    } catch { /* ok */ }
+    for (const file of files) this.removeFile(file);
+    this.invalidatedKeys.delete(key);
   }
 
   /** Purge all expired entries. Returns number deleted. */
@@ -793,8 +891,8 @@ export class DiskTier {
       }
 
       // ── V3 fast path: expiresAt encoded in filename, zero file I/O for live entries
-      if (filename.length === 77 && filename[64] === '_') {
-        const expiresAt = parseInt(filename.slice(65), 16);
+      if (filename.length >= 77 && filename[64] === '_') {
+        const expiresAt = parseInt(filename.slice(65, 77), 16);
         if (expiresAt <= now) {
           try {
             const sz = fs.statSync(filePath).size;
@@ -912,8 +1010,8 @@ export class DiskTier {
           continue;
         }
 
-        if (file.length === 77 && file[64] === '_') {
-          const expiresAt = parseInt(file.slice(65), 16);
+        if (file.length >= 77 && file[64] === '_') {
+          const expiresAt = parseInt(file.slice(65, 77), 16);
           if (expiresAt <= now) {
             const fp = path.join(orphanBucketP, file);
             try {
@@ -954,8 +1052,8 @@ export class DiskTier {
 
       // ── V3 fast path: expiresAt encoded in filename, zero file I/O for live entries
       // Filename format: {sha256-64-hex}_{expiresAt-12-hex} = 77 chars total.
-      if (file.length === 77 && file[64] === '_') {
-        const expiresAt = parseInt(file.slice(65), 16);
+      if (file.length >= 77 && file[64] === '_') {
+        const expiresAt = parseInt(file.slice(65, 77), 16);
         if (expiresAt <= now) {
           const filePath = path.join(bucketPath, file);
           try {
@@ -1019,6 +1117,9 @@ export class DiskTier {
 
   /** Delete every file in the disk cache. Returns the count deleted. */
   clear(): number {
+    this.epoch++;
+    this.pendingSaves.clear();
+    this.invalidatedKeys.clear();
     this.ensureDir();
     if (!this.dirReady) return 0;
     let cleared = 0;
@@ -1084,6 +1185,7 @@ export class DiskTier {
    * yielding to the event loop via setImmediate between chunks.
    */
   public async triggerChunkedPrune(): Promise<number> {
+    if (this.closed) return 0;
     if (this._isPruning) return 0;
     this._isPruning = true;
     this._pruneRounds++;
@@ -1094,7 +1196,7 @@ export class DiskTier {
       const targetBytes = Math.floor(this.opts.maxBytes * 0.60);
 
       if (this._db && this._stmtPruneChunk) {
-        while (this.diskUsageBytes > targetBytes) {
+        while (!this.closed && this.diskUsageBytes > targetBytes) {
           const rows = this._stmtPruneChunk.all() as Array<{ key_hash: string; file_path: string; size: number }>;
           if (!rows || rows.length === 0) break;
 
@@ -1116,7 +1218,7 @@ export class DiskTier {
           }
         }
       } else {
-        while (this.diskUsageBytes > targetBytes) {
+        while (!this.closed && this.diskUsageBytes > targetBytes) {
           const files = this.walkCacheFiles();
           if (files.length === 0) break;
           const chunk = files.slice(0, 500);
@@ -1214,6 +1316,10 @@ export class DiskTier {
 
   /** Release the SQLite connection (if open). Call during shutdown before deleting the cache directory. */
   close(): void {
+    this.closed = true;
+    this.epoch++;
+    this.pendingSaves.clear();
+    this.invalidatedKeys.clear();
     if (this._db) {
       try { this._db.close(); } catch { /* ok */ }
       this._db = this._stmtInsert = this._stmtSelect = this._stmtDelete =

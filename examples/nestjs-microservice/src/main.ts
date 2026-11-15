@@ -11,6 +11,7 @@ async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule, {
     logger: ['error', 'warn', 'log'],
   });
+  app.enableShutdownHooks();
 
   await app.listen(PORT, HOST);
   console.log(`TriCache NestJS demo listening on http://${HOST}:${PORT}`);
@@ -21,13 +22,12 @@ async function bootstrap(): Promise<void> {
     console.log(`\n${signal} received, shutting down`);
     await app.close().catch(() => {});
     await cache.destroy().catch(() => {});
-    process.exit(0);
   };
 
-  process.on('SIGINT', () => {
+  process.once('SIGINT', () => {
     void shutdown('SIGINT');
   });
-  process.on('SIGTERM', () => {
+  process.once('SIGTERM', () => {
     void shutdown('SIGTERM');
   });
 }

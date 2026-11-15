@@ -71,7 +71,7 @@ TriCache's **Cold-Start Cloud Hydration** enables stateless containers to serial
 ## 3. The Six Reliability Pillars
 
 ### Pillar 1: Kubernetes Readiness Probe Gating (`cache.ready()`)
-To prevent traffic from reaching an instance while it is hydrating, `CacheService` exposes `await cache.ready()`. When `remoteSnapshot` is configured, `ready()` returns a Promise that holds until the remote snapshot has been downloaded, decrypted, validated, and loaded into L1.
+To gate initial hydration and the first backplane setup attempt, use `await cache.ready()`. A failed optional snapshot/backplane attempt degrades safely rather than guaranteeing warm state. Inspect `cache.health()` if readiness must fail on degraded transport.
 
 ```typescript
 // server.ts
@@ -82,7 +82,8 @@ const cache = CacheService.create({
 // Gate Kubernetes readiness probe:
 app.get('/health/ready', async (_req, res) => {
   await cache.ready();
-  res.status(200).send({ status: 'ready', l1Keys: cache.stats().l1.keys });
+  const health = cache.health();
+  res.status(health.healthy ? 200 : 503).send(health);
 });
 ```
 
@@ -96,10 +97,10 @@ A snapshot captured 6 hours ago during low traffic could contain outdated cache 
 When Kubernetes, ECS, or Cloud Run drains a pod, it sends `SIGTERM`. TriCache automatically intercepts `SIGTERM` and `SIGINT`, serializes live L1 entries, and pushes the snapshot to object storage before the process exits.
 
 ### Pillar 4: Periodic Heartbeat Snapshotting (`intervalMs`)
-Containers do not always shut down gracefully (e.g. AWS EC2 spot termination with 2-minute warning, Kubernetes OOM kills, unhandled hardware failure). By configuring `intervalMs: 5 * 60 * 1000` (every 5 minutes), TriCache uploads a background snapshot on a timer, guaranteeing that a fresh snapshot is always available in object storage.
+Containers do not always shut down gracefully. `intervalMs: 5 * 60 * 1000` schedules periodic uploads, but failed writes, partitions, and process termination can leave no fresh snapshot. Monitor upload outcomes and enforce retention/age limits.
 
 ### Pillar 5: Security & Compliance (At-Rest AEAD Encryption)
-If `encryptionKey` is configured on `CacheService`, remote snapshots are encrypted using **AES-256-GCM** (or configured mode) with a cryptographically secure 12-byte IV and 16-byte authentication tag prior to transmission. Remote object storage never sees unencrypted application data, maintaining HIPAA/SOC2 compliance.
+With AES-GCM configured, snapshots are authenticated and encrypted before transmission. Other supported modes do not all provide authentication. Encryption is one control, not a certification of HIPAA/SOC2 compliance.
 
 ### Pillar 6: Resilience & Fail-Safe Cold Fallback
 If object storage returns HTTP 404 (first deployment), 500, or if data is truncated/corrupted:

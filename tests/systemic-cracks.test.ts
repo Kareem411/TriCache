@@ -456,7 +456,8 @@ describe('Systemic Invariant & Crack Hardening Audit Tests', () => {
         return 'fresh-order-data-from-client-c';
       }, 60);
 
-      // 4. Now Client A's slow fetch completes
+      // 4. Commit C before completing A. Do not rely on incidental Promise microtask ordering.
+      await clientCPromise;
       resolveSlowFetch('stale-pre-delete-order-data');
 
       const [clientAResult, clientCResult] = await Promise.all([clientAPromise, clientCPromise]);

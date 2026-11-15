@@ -16,7 +16,10 @@ Mount the real-time Server-Sent Events (SSE) administration dashboard into any N
 import { tricacheDashboard } from 'tricache/dashboard';
 import { cache } from './cache';
 
-// Express / Fastify / Connect
+const password = process.env.DASHBOARD_PASSWORD;
+if (!password) throw new Error('DASHBOARD_PASSWORD is required');
+
+// Express / Connect (for Fastify, wrap its raw request/response in a route)
 app.use(
   '/admin/cache',
   tricacheDashboard({
@@ -25,16 +28,16 @@ app.use(
     title: 'Fleet Cache Console',
     auth: {
       username: 'admin',
-      password: process.env.DASHBOARD_PASSWORD ?? 'secret',
+      password,
     },
-    readOnly: process.env.NODE_ENV === 'production',
+    readOnly: true, // Default. Set false only on an authenticated, private admin endpoint.
   })
 );
 ```
 
 ---
 
-## 2. Next.js 16 & 15 App Router
+## 2. Next.js 16 App Router
 
 Mount the dashboard inside a Next.js App Router project:
 
@@ -43,11 +46,14 @@ Mount the dashboard inside a Next.js App Router project:
 import { createNextDashboardHandlers } from 'tricache/dashboard';
 import { cache } from '@/lib/cache';
 
+const secret = process.env.MANAGEMENT_SECRET;
+if (!secret) throw new Error('MANAGEMENT_SECRET is required');
+
 export const { GET, POST } = createNextDashboardHandlers({
   cache,
   basePath: '/admin/cache',
-  authSecret: process.env.MANAGEMENT_SECRET,
-  readOnly: process.env.NODE_ENV === 'production',
+  authSecret: secret,
+  readOnly: true,
 });
 ```
 
@@ -84,15 +90,19 @@ kubectl port-forward pod/api-service-pod 9090:9090
 Manage and inspect active instances directly from your terminal:
 
 ```bash
-# Display live ASCII dashboard
-npx tricache inspect --redis redis://127.0.0.1:6379
+# Display the running process's live ASCII dashboard (requires enableIpc: true)
+npx tricache top --pid <pid>
 
-# Invalidate tags across all cluster nodes
-npx tricache invalidate --tag products --redis redis://127.0.0.1:6379
+# Export the running process's snapshot as JSON
+npx tricache top --pid <pid> --once --json
 
 # Measure 3-tier round-trip latency
 npx tricache ping --redis redis://127.0.0.1:6379
 
-# Export metrics
-npx tricache metrics --prometheus
+# Clear shared keys for an explicitly chosen namespace/prefix
+npx tricache clear --namespace my-app --prefix products: --redis redis://127.0.0.1:6379
 ```
+
+`inspect` creates a separate diagnostic cache instance; it does not inspect another process's L1. CLI tag invalidation and a `metrics --prometheus` command are not implemented. Use `cache.invalidateTag()` and `CacheService.toPrometheusText(cache.metrics())` in the application instead.
+
+The UI carries a URL token into its own API/SSE requests and suppresses referrers, but tokens can still appear in browser history and proxy logs. Prefer HTTP Basic auth or a protected reverse proxy. Request bodies default to a 64 KiB limit (`maxRequestBytes`). Slow/disconnected SSE readers do not accumulate unbounded snapshots.

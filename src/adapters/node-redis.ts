@@ -9,92 +9,127 @@ export type { IRedisDriver, IRedisPipeline };
  */
 export class NodeRedisPipelineAdapter implements IRedisPipeline {
   private readonly multiInstance: any;
+  private readonly operations: Array<() => Promise<unknown>> = [];
+  pttl?: (key: string) => this;
+  eval?: (script: string, numkeys: number, ...args: (string | number)[]) => this;
 
-  constructor(multiInstance: any) {
+  constructor(multiInstance: any, private readonly transactional = true) {
     this.multiInstance = multiInstance;
+    if (typeof multiInstance.pTTL === 'function' || typeof multiInstance.pttl === 'function') {
+      this.pttl = key => { this.queueCommand(typeof multiInstance.pTTL === 'function' ? 'pTTL' : 'pttl', [key]); return this; };
+    }
+    if (typeof multiInstance.eval === 'function' || typeof multiInstance.addCommand === 'function') {
+      this.eval = (script, numkeys, ...args) => {
+        if (typeof multiInstance.eval === 'function') {
+          this.queueCommand('eval', [script, { keys: args.slice(0, numkeys).map(String), arguments: args.slice(numkeys).map(String) }]);
+        } else this.queueCommand('addCommand', [['EVAL', script, String(numkeys), ...args.map(String)]]);
+        return this;
+      };
+    }
+  }
+
+  private queueCommand(method: string, args: unknown[]): void {
+    if (this.transactional) this.multiInstance[method](...args);
+    else this.operations.push(() => this.multiInstance[method](...args));
   }
 
   get(key: string): this {
-    this.multiInstance.get(key);
+    this.queueCommand('get', [key]);
     return this;
   }
 
   set(key: string, value: string, ...args: (string | number)[]): this {
     const opts = parseSetArgs(args);
     if (opts) {
-      this.multiInstance.set(key, value, opts);
+      this.queueCommand('set', [key, value, opts]);
     } else {
-      this.multiInstance.set(key, value);
+      this.queueCommand('set', [key, value]);
     }
     return this;
   }
 
   setex(key: string, seconds: number, value: string): this {
     if (typeof this.multiInstance.setEx === 'function') {
-      this.multiInstance.setEx(key, seconds, value);
+      this.queueCommand('setEx', [key, seconds, value]);
     } else if (typeof this.multiInstance.setex === 'function') {
-      this.multiInstance.setex(key, seconds, value);
+      this.queueCommand('setex', [key, seconds, value]);
     } else {
-      this.multiInstance.set(key, value, { EX: seconds });
+      this.queueCommand('set', [key, value, { EX: seconds }]);
     }
     return this;
   }
 
   del(...keys: string[]): this {
     if (keys.length === 0) return this;
-    this.multiInstance.del(keys.length === 1 ? keys[0] : keys);
+    this.queueCommand('del', [keys.length === 1 ? keys[0] : keys]);
     return this;
   }
 
   expire(key: string, seconds: number): this {
-    this.multiInstance.expire(key, seconds);
+    this.queueCommand('expire', [key, seconds]);
     return this;
   }
 
   incr(key: string): this {
-    this.multiInstance.incr(key);
+    this.queueCommand('incr', [key]);
     return this;
   }
 
   sadd(key: string, ...members: string[]): this {
     if (members.length === 0) return this;
     if (typeof this.multiInstance.sAdd === 'function') {
-      this.multiInstance.sAdd(key, members.length === 1 ? members[0] : members);
+      this.queueCommand('sAdd', [key, members.length === 1 ? members[0] : members]);
     } else {
-      this.multiInstance.sadd(key, ...members);
+      this.queueCommand('sadd', [key, ...members]);
     }
     return this;
   }
 
   smembers(key: string): this {
     if (typeof this.multiInstance.sMembers === 'function') {
-      this.multiInstance.sMembers(key);
+      this.queueCommand('sMembers', [key]);
     } else {
-      this.multiInstance.smembers(key);
+      this.queueCommand('smembers', [key]);
     }
     return this;
   }
 
   hset(key: string, value: Record<string, string>): this {
     if (typeof this.multiInstance.hSet === 'function') {
-      this.multiInstance.hSet(key, value);
+      this.queueCommand('hSet', [key, value]);
     } else {
-      this.multiInstance.hset(key, value);
+      this.queueCommand('hset', [key, value]);
     }
     return this;
   }
 
   hgetall(key: string): this {
     if (typeof this.multiInstance.hGetAll === 'function') {
-      this.multiInstance.hGetAll(key);
+      this.queueCommand('hGetAll', [key]);
     } else {
-      this.multiInstance.hgetall(key);
+      this.queueCommand('hgetall', [key]);
     }
     return this;
   }
 
   async exec(): Promise<Array<[Error | null, any]> | null> {
-    const raw = await this.multiInstance.exec();
+    let raw: any[] | null;
+    if (!this.transactional) {
+      // node-redis auto-pipelines same-tick commands. Observe every command
+      // separately: execAsPipeline() can reject at the first error and discard
+      // the successful replies, and retrying that pipeline could duplicate writes.
+      const results = await Promise.allSettled(this.operations.splice(0).map(operation => Promise.resolve().then(operation)));
+      return results.map(result => result.status === 'fulfilled' ? [null, result.value]
+        : [result.reason instanceof Error ? result.reason : new Error(String(result.reason)), null]);
+    }
+    try {
+      raw = await this.multiInstance.exec();
+    } catch (error) {
+      // node-redis rejects EXEC with MultiErrorReply, unlike ioredis tuples.
+      const replies = (error as { replies?: unknown[] }).replies;
+      if (!Array.isArray(replies)) throw error;
+      raw = replies;
+    }
     if (!raw) return null;
     return raw.map((item: any) => {
       if (item instanceof Error) {
@@ -109,14 +144,20 @@ export class NodeRedisPipelineAdapter implements IRedisPipeline {
  * Universal driver adapter wrapping `@redis/client` (node-redis) to satisfy TriCache's
  * `IRedisDriver` contract without adding runtime dependencies.
  */
-export class NodeRedisAdapter implements IRedisDriver {
+export class NodeRedisAdapter extends EventEmitter implements IRedisDriver {
   readonly client: any;
+  private connecting: Promise<unknown> | null = null;
+  pttl?: (key: string) => Promise<number>;
 
   constructor(client: any) {
+    super();
     if (!client) {
       throw new Error('NodeRedisAdapter requires an active @redis/client instance');
     }
     this.client = client;
+    if (typeof client.pTTL === 'function' || typeof client.pttl === 'function') {
+      this.pttl = key => (client.pTTL ?? client.pttl).call(client, key);
+    }
   }
 
   get isOpen(): boolean {
@@ -124,8 +165,11 @@ export class NodeRedisAdapter implements IRedisDriver {
   }
 
   async connect(): Promise<unknown> {
+    if (this.connecting) return this.connecting;
     if (typeof this.client.connect === 'function' && !this.client.isOpen) {
-      return await this.client.connect();
+      this.connecting = Promise.resolve(this.client.connect());
+      try { return await this.connecting; }
+      finally { this.connecting = null; }
     }
     return undefined;
   }
@@ -216,7 +260,7 @@ export class NodeRedisAdapter implements IRedisDriver {
   }
 
   pipeline(): IRedisPipeline {
-    return this.multi();
+    return new NodeRedisPipelineAdapter(this.client, false);
   }
 
   async smembers(key: string): Promise<string[]> {
@@ -277,7 +321,34 @@ export class NodeRedisAdapter implements IRedisDriver {
 
   async subscribe(...channels: string[]): Promise<unknown> {
     if (channels.length === 0) return undefined;
-    return await this.client.subscribe(channels);
+    await this.connect();
+    return await this.client.subscribe(channels, (message: string, channel: string) => this.emit('message', channel, message));
+  }
+
+  async unsubscribe(...channels: string[]): Promise<unknown> {
+    if (!channels.length || !this.isOpen) return undefined;
+    return this.client.unsubscribe(channels);
+  }
+
+  async xread(...args: (string | number)[]): Promise<Array<[string, Array<[string, string[]]>]> | null> {
+    await this.connect();
+    const raw = await this.client.sendCommand(['XREAD', ...args.map(String)]);
+    if (raw == null) return null;
+    if (raw instanceof Map) return [...raw.entries()];
+    if (!Array.isArray(raw) && typeof raw === 'object') return Object.entries(raw);
+    return raw;
+  }
+
+  async xadd(...args: (string | number)[]): Promise<unknown> {
+    return this.client.sendCommand(['XADD', ...args.map(String)]);
+  }
+
+  async xrange(...args: (string | number)[]): Promise<Array<[string, string[]]>> {
+    return this.client.sendCommand(['XRANGE', ...args.map(String)]);
+  }
+
+  async xrevrange(...args: (string | number)[]): Promise<Array<[string, string[]]>> {
+    return this.client.sendCommand(['XREVRANGE', ...args.map(String)]);
   }
 
   scanStream(options?: { match?: string; count?: number }): EventEmitter {
@@ -289,8 +360,8 @@ export class NodeRedisAdapter implements IRedisDriver {
       try {
         if (typeof this.client.scanIterator === 'function') {
           const batch: string[] = [];
-          for await (const key of this.client.scanIterator({ MATCH: pattern, COUNT: count })) {
-            batch.push(key);
+          for await (const keys of this.client.scanIterator({ MATCH: pattern, COUNT: count })) {
+            batch.push(...(Array.isArray(keys) ? keys : [keys]));
             if (batch.length >= count) {
               ee.emit('data', [...batch]);
               batch.length = 0;
@@ -337,16 +408,24 @@ export class NodeRedisAdapter implements IRedisDriver {
   }
 
   on(event: string, listener: (...args: any[]) => void): this {
+    if (event === 'message' || event === 'smessage') return super.on(event, listener);
     if (typeof this.client.on === 'function') {
-      this.client.on(event, listener);
+      this.client.on(event === 'close' ? 'end' : event, listener);
     }
     return this;
   }
 
   once(event: string, listener: (...args: any[]) => void): this {
+    if (event === 'message' || event === 'smessage') return super.once(event, listener);
     if (typeof this.client.once === 'function') {
-      this.client.once(event, listener);
+      this.client.once(event === 'close' ? 'end' : event, listener);
     }
+    return this;
+  }
+
+  removeListener(event: string, listener: (...args: any[]) => void): this {
+    super.removeListener(event, listener);
+    this.client.removeListener?.(event === 'close' ? 'end' : event, listener);
     return this;
   }
 }

@@ -67,8 +67,14 @@ const MUTATION_OPERATIONS = new Set([
 
 /** Recursively sorts object keys for deterministic serialization of nested query filters */
 function deterministicStringify(val: unknown): string {
+  if (val instanceof Date) return `date:${JSON.stringify(val.toISOString())}`;
+  if (typeof val === 'bigint') return `bigint:${val}`;
+  if (val instanceof Uint8Array) return `binary:${Buffer.from(val.buffer, val.byteOffset, val.byteLength).toString('base64')}`;
+  if (val && typeof val === 'object' && typeof (val as { toJSON?: unknown }).toJSON === 'function') {
+    return deterministicStringify((val as { toJSON(): unknown }).toJSON());
+  }
   if (val === null || typeof val !== 'object') {
-    return JSON.stringify(val);
+    return JSON.stringify(val) ?? 'undefined';
   }
   if (Array.isArray(val)) {
     return `[${val.map(deterministicStringify).join(',')}]`;
@@ -117,6 +123,11 @@ export function withTriCache(options: PrismaTriCacheOptions) {
           if (READ_OPERATIONS.has(operation)) {
             const queryArgs = args ?? {};
             const cacheConfig = (queryArgs as { cache?: PrismaCacheQueryOptions | boolean }).cache;
+
+            if (cacheConfig === false) {
+              const { cache: _c, ...cleanArgs } = queryArgs;
+              return query(cleanArgs);
+            }
 
             if (cacheConfig !== undefined || autoCache) {
               const opts: PrismaCacheQueryOptions = typeof cacheConfig === 'object' && cacheConfig !== null

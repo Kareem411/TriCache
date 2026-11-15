@@ -290,7 +290,7 @@ export const DASHBOARD_HTML: string = `<!DOCTYPE html>
         <span class="pulse-dot"></span>
         <span id="stream-text">SSE Live</span>
       </div>
-      <select id="peer-select" class="peer-select" style="display:none;" onchange="if(this.value) window.location.href=this.value;">
+      <select id="peer-select" aria-label="Switch cache instance" class="peer-select" style="display:none;" onchange="if(this.value) window.location.href=this.value;">
         <option value="">Switch Pod...</option>
       </select>
     </div>
@@ -350,9 +350,10 @@ export const DASHBOARD_HTML: string = `<!DOCTYPE html>
 
   <!-- Invalidate Modal -->
   <div class="dialog-overlay" id="invalidate-modal">
-    <div class="dialog">
-      <h3>Invalidate Tag</h3>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="invalidate-title">
+      <h3 id="invalidate-title">Invalidate Tag</h3>
       <p>Increments generational tag version across local tiers and broadcast backplane.</p>
+      <label for="tag-input">Tag name or pattern</label>
       <input type="text" id="tag-input" placeholder="e.g. products, tenant-123" />
       <div class="dialog-actions">
         <button class="btn" onclick="closeModals()">Cancel</button>
@@ -363,8 +364,8 @@ export const DASHBOARD_HTML: string = `<!DOCTYPE html>
 
   <!-- Clear Modal -->
   <div class="dialog-overlay" id="clear-modal">
-    <div class="dialog">
-      <h3>Clear Cache</h3>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="clear-title">
+      <h3 id="clear-title">Clear Cache</h3>
       <p>Evict all cached keys from the local L1 memory and NVMe disk tiers.</p>
       <div class="dialog-actions">
         <button class="btn" onclick="closeModals()">Cancel</button>
@@ -373,12 +374,20 @@ export const DASHBOARD_HTML: string = `<!DOCTYPE html>
     </div>
   </div>
 
-  <div id="toast"></div>
+  <div id="toast" role="status" aria-live="polite"></div>
 
   <script>
     (function() {
       let isReadOnly = false;
       let sseFailed = false;
+      let previousFocus = null;
+      const token = new URLSearchParams(window.location.search).get('token');
+      const basePath = window.location.pathname.replace(/\\/index\\.html$/, '').replace(/\\/+$/, '');
+      function apiURL(path) {
+        const url = new URL(basePath + '/' + path, window.location.origin);
+        if (token) url.searchParams.set('token', token);
+        return url.toString();
+      }
 
       function showToast(msg, duration = 3000) {
         const t = document.getElementById('toast');
@@ -485,7 +494,8 @@ export const DASHBOARD_HTML: string = `<!DOCTYPE html>
       }
 
       window.fetchMetricsSnapshot = function() {
-        fetch('api/metrics')
+        fetch(apiURL('api/metrics'))
+          .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r; })
           .then(r => r.json())
           .then(data => updateUI(data))
           .catch(err => showToast('Failed to fetch snapshot: ' + err.message));
@@ -496,7 +506,7 @@ export const DASHBOARD_HTML: string = `<!DOCTYPE html>
           fallbackPolling();
           return;
         }
-        const sse = new EventSource('api/stream');
+        const sse = new EventSource(apiURL('api/stream'));
         sse.onmessage = function(e) {
           try {
             const data = JSON.parse(e.data);
@@ -521,22 +531,37 @@ export const DASHBOARD_HTML: string = `<!DOCTYPE html>
 
       window.openInvalidateModal = function() {
         if (isReadOnly) return;
+        previousFocus = document.activeElement;
         document.getElementById('invalidate-modal').classList.add('active');
         document.getElementById('tag-input').focus();
       };
       window.openClearModal = function() {
         if (isReadOnly) return;
+        previousFocus = document.activeElement;
         document.getElementById('clear-modal').classList.add('active');
+        document.querySelector('#clear-modal button').focus();
       };
       window.closeModals = function() {
         document.getElementById('invalidate-modal').classList.remove('active');
         document.getElementById('clear-modal').classList.remove('active');
+        if (previousFocus) previousFocus.focus();
       };
+      document.addEventListener('keydown', function(event) {
+        const modal = document.querySelector('.dialog-overlay.active');
+        if (!modal) return;
+        if (event.key === 'Escape') { event.preventDefault(); closeModals(); }
+        if (event.key === 'Tab') {
+          const controls = modal.querySelectorAll('button, input, select, [tabindex="0"]');
+          const first = controls[0], last = controls[controls.length - 1];
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+          else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+        }
+      });
 
       window.submitTagInvalidation = function() {
         const tag = document.getElementById('tag-input').value.trim();
         if (!tag) return;
-        fetch('api/actions/invalidate-tag', {
+        fetch(apiURL('api/actions/invalidate-tag'), {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -559,7 +584,7 @@ export const DASHBOARD_HTML: string = `<!DOCTYPE html>
       };
 
       window.submitClear = function() {
-        fetch('api/actions/clear', {
+        fetch(apiURL('api/actions/clear'), {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',

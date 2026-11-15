@@ -243,9 +243,10 @@ describe('Next.js 16 Modern App Router CacheHandler (TriCacheHandler)', () => {
     await expect(handler.refreshTags()).resolves.not.toThrow();
   });
 
-  it('getExpiration() returns 0', async () => {
+  it('getExpiration() delegates soft tags explicitly and returns 0 for an empty set', async () => {
     const exp = await handler.getExpiration(['some-tag']);
-    expect(exp).toBe(0);
+    expect(exp).toBe(Infinity);
+    expect(await handler.getExpiration([])).toBe(0);
   });
 });
 

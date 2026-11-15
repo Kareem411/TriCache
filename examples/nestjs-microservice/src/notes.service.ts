@@ -11,7 +11,7 @@ export interface Note {
  * Official @nestjs/cache-manager store path.
  *
  * `TriCacheModule` exports `CACHE_MANAGER` (token string `'CACHE_MANAGER'`)
- * bound to `TriCacheStore`. That class is the cache-manager v5/v6 CacheStore:
+ * bound to `TriCacheStore`. That class is the direct cache-manager token facade;
  * `get` / `set` / `del` / `reset` / `mget` / `mset` / `mdel` / `keys` / `ttl`.
  * `set(key, value, ttl)` takes **milliseconds**, matching Nest's cache-manager.
  */
@@ -27,7 +27,8 @@ export class NotesService {
     if (!note) {
       return { key, note: null, cache: 'miss' as const };
     }
-    const ttlMs = await this.cacheStore.ttl(key);
+    const expiresAt = await this.cacheStore.ttl(key);
+    const ttlMs = expiresAt === undefined ? undefined : Math.max(0, expiresAt - Date.now());
     return { key, note, cache: 'hit' as const, ttlMs };
   }
 

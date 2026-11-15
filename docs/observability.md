@@ -33,6 +33,9 @@ Mount the dashboard inside your existing service with timing-safe authentication
 import { tricacheDashboard } from 'tricache/dashboard';
 import { cache } from './cache';
 
+const password = process.env.DASHBOARD_PASSWORD;
+if (!password) throw new Error('DASHBOARD_PASSWORD is required');
+
 // Express / Fastify / Connect
 app.use(
   '/admin/cache',
@@ -43,10 +46,10 @@ app.use(
     // 🔒 Timing-Safe Authentication (SHA-256 constant-time comparison)
     auth: {
       username: 'admin',
-      password: process.env.DASHBOARD_PASSWORD ?? 'super-secret',
+      password,
     },
     // 🛡️ Read-Only Mode (disables manual Clear/Invalidate buttons in production)
-    readOnly: process.env.NODE_ENV === 'production',
+    readOnly: true, // Default; writes require explicit opt-in on a protected endpoint.
     // 🏷️ Audit logging hook for enterprise compliance
     onAction: (event) => {
       console.log(`[AUDIT] Action: ${event.action}, Target: ${event.target}, User: ${event.user}`);
@@ -55,7 +58,7 @@ app.use(
 );
 ```
 
-### Next.js 16 & 15 App Router
+### Next.js 16 Cache Components
 
 Mount under the Next.js App Router via dynamic route handlers:
 
@@ -68,7 +71,7 @@ export const { GET, POST } = createNextDashboardHandlers({
   cache,
   basePath: '/admin/cache',
   authSecret: process.env.MANAGEMENT_SECRET,
-  readOnly: process.env.NODE_ENV === 'production',
+  readOnly: true,
 });
 ```
 
@@ -243,20 +246,19 @@ const cache = CacheService.create({
 
 * **Platform-Agnostic IPC**: Automatically resolves to Unix domain sockets on POSIX (`/tmp/tricache-<pid>.sock` or `$TMPDIR/...`) and Windows Named Pipes (`\\.\pipe\tricache-<pid>`) on `win32`.
 * **Non-Blocking Telemetry Pull**: Serialization and stats sampling run on tick boundaries via `setImmediate`, eliminating event-loop stalls in the monitored host application.
-* **POSIX Socket Hygiene**: Automatically registers `process.once('exit')`, `SIGINT`, and `SIGTERM` signal traps to clean up socket files on termination.
+* **POSIX Socket Hygiene**: Signal/exit hooks clean up socket files, but the host application owns process termination and graceful shutdown. The library does not call `process.exit()`.
 
 ---
 
 ## 5. Standalone Troubleshooting Commands
 
 ```bash
-# 1. Live cluster telemetry inspection
-npx tricache inspect --redis redis://127.0.0.1:6379
+# 1. Live telemetry from the running process (requires enableIpc: true)
+npx tricache top --pid <pid> --once --json
 
 # 2. Clear keys matching a prefix
-npx tricache clear --prefix user: --redis redis://127.0.0.1:6379
+npx tricache clear --namespace my-app --prefix user: --redis redis://127.0.0.1:6379
 
 # 3. Measure three-tier round-trip latency
 npx tricache ping --redis redis://127.0.0.1:6379
 ```
-
